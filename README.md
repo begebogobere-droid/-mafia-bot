@@ -1,1 +1,1 @@
-# -mafia-bot
+src/index.ts

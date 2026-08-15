@@ -95,6 +95,7 @@ export type RoleId =
   | "godfather"
   | "mafioso"
   | "natasha"
+  | "lecter"
   | "citizen"
   | "detective"
   | "doctor"
@@ -873,6 +874,31 @@ export function verdictKeyboard(dayNumber: number): InlineKeyboard {
   ];
 }
 
+/**
+ * فهرست اهداف مجاز برای هر اکشن شبانه — بر اساس نوع اکشن (و نقشِ انجام‌دهنده)
+ * لیست متفاوتی تولید می‌کند:
+ * - mafia_kill (پدرخوانده / مافیا / ناتاشا): فقط بازیکنان زندهٔ تیم Town در همان بازی
+ * - heal توسط lecter (دکتر لکتر): فقط بازیکنان زندهٔ تیم Mafia در همان بازی
+ * - heal توسط doctor (دکتر شهروند): همهٔ زنده‌ها (رفتار قبلی بدون تغییر)
+ * - سایر اکشن‌ها: همهٔ زنده‌ها
+ */
+export function nightTargetsFor(
+  players: Player[],
+  actorId: number,
+  action: string | NightActionType,
+  opts?: { includeSelf?: boolean },
+): Player[] {
+  const actor = findPlayer(players, actorId);
+  const type = mapAction(action);
+  return players.filter((p) => {
+    if (p.status !== "alive") return false;
+    if (!opts?.includeSelf && p.userId === actorId) return false;
+    if (type === "mafia_kill") return p.team === "town";
+    if (type === "heal" && actor?.role === "lecter") return p.team === "mafia";
+    return true;
+  });
+}
+
 export function nightTargetKeyboard(
   players: Player[],
   actorId: number,
@@ -880,11 +906,7 @@ export function nightTargetKeyboard(
   action: string,
   opts?: { includeSelf?: boolean; skipLabel?: string },
 ): InlineKeyboard {
-  const targets = players.filter((p) => {
-    if (p.status !== "alive") return false;
-    if (!opts?.includeSelf && p.userId === actorId) return false;
-    return true;
-  });
+  const targets = nightTargetsFor(players, actorId, action, opts);
   return playerButtons(targets, `N${nightNumber}:${action}:`, [
     { text: opts?.skipLabel ?? "⏭ رد کردن این شب", data: `N${nightNumber}:${action}:0` },
   ]);
@@ -924,6 +946,17 @@ export const ROLES: Record<RoleId, RoleDef> = {
       "عضو مافیا هستید. هر شب می‌توانید یک بازیکن را ساکت کنید تا روز بعد حرف نزند و رأی ندهد. در قتل شبانه هم شرکت می‌کنید.",
     nightAction: "silence",
     nightOptional: true,
+  },
+  lecter: {
+    id: "lecter",
+    team: "mafia",
+    name: "دکتر لکتر",
+    emoji: "🩺",
+    title: "دکتر لکتر",
+    description:
+      "پزشک تیم مافیا هستید. وظیفهٔ شلیک و قتل ندارید؛ هر شب فقط یکی از اعضای زندهٔ تیم مافیا را برای محافظت انتخاب می‌کنید.",
+    nightAction: "heal",
+    nightOptional: false,
   },
   citizen: {
     id: "citizen",
@@ -1012,7 +1045,8 @@ export function buildRoleList(playerCount: number): RoleId[] {
 
   if (mafiaN >= 3) {
     roles.push("natasha");
-    for (let i = 2; i < mafiaN; i++) roles.push("mafioso");
+    roles.push("lecter");
+    for (let i = 3; i < mafiaN; i++) roles.push("mafioso");
   } else if (playerCount >= 9) {
     roles.push("natasha");
   } else {
@@ -1091,6 +1125,8 @@ export function nightActionTypesFor(role: RoleId | null): NightActionType[] {
       return ["mafia_kill"];
     case "natasha":
       return ["mafia_kill", "silence"];
+    case "lecter":
+      return ["heal"];
     case "doctor":
       return ["heal"];
     case "detective":
@@ -1222,7 +1258,7 @@ export function resolveNight(game: GameState): NightResolution {
   for (const a of active) {
     if (a.type === "heal" && a.targetId && a.targetId > 0) {
       const actor = findPlayer(game.players, a.actorId);
-      if (actor?.status === "alive" && actor.role === "doctor") {
+      if (actor?.status === "alive" && (actor.role === "doctor" || actor.role === "lecter")) {
         protectedIds.add(a.targetId);
       }
     }
@@ -1524,11 +1560,26 @@ export const fa = {
   nightCitizenWait:
     "🌙 شب شده است. شما اقدام شبانه‌ای ندارید. تا صبح صبر کنید و نقش خود را فاش نکنید.",
 
+  lecterPrompt(seconds: number): string {
+    return [
+      "🩺 یکی از اعضای تیم مافیا را برای محافظت انتخاب کنید:",
+      `⏱ ${seconds} ثانیه فرصت دارید.`,
+      "تا پایان شب می‌توانید انتخاب را عوض کنید.",
+    ].join("\n");
+  },
+
   actionSaved(label: string): string {
     return `✅ اقدام ثبت شد: <b>${esc(label)}</b>\nتا پایان مرحله می‌توانید عوضش کنید.`;
   },
 
   actionForbidden: "الان اجازهٔ این اقدام را ندارید.",
+  cannotKillTeammate:
+    "این بازیکن هم‌تیمی شماست و امکان شلیک به او وجود ندارد.",
+  lecterTownTarget:
+    "این بازیکن شهروند است؛ دکتر لکتر فقط می‌تواند از اعضای تیم مافیا محافظت کند.",
+  lecterCannotSelf: "نمی‌توانید خودتان را برای محافظت انتخاب کنید.",
+  invalidTarget: "هدف انتخابی معتبر نیست.",
+  targetNotInGame: "هدف انتخابی عضو این بازی نیست.",
   deadCannotAct:
     "شما از بازی حذف شده‌اید. می‌توانید تماشا کنید، اما هیچ اقدامی در بازی ندارید.",
   silencedCannotVote: "شما امشب ساکت شده‌اید و امروز حق رأی ندارید.",
@@ -3250,10 +3301,38 @@ export class GameRoom extends DurableObject<Env> {
 
     if (targetId > 0) {
       const target = findPlayer(game.players, targetId);
-      if (!target || target.status !== "alive") {
+      if (!target) {
+        return { text: fa.targetNotInGame, alert: true };
+      }
+      if (target.status !== "alive") {
         return { text: "این بازیکن زنده نیست.", alert: true };
       }
-      if (action === "heal" && targetId === userId) {
+      // اعتبارسنجی سمت سرور — اعتماد به پنل کافی نیست.
+      // mafia_kill: هدف باید زنده، عضو همان بازی و از تیم Town باشد.
+      // اگر به هر دلیلی (دستکاری Callback، باگ، درخواست جعلی) تیم Mafia انتخاب شد،
+      // اکشن ثبت نمی‌شود و پیام خطا نمایش داده می‌شود.
+      if (action === "mafia_kill") {
+        if (target.team === "mafia") {
+          return { text: fa.cannotKillTeammate, alert: true };
+        }
+        if (target.team !== "town") {
+          return { text: fa.invalidTarget, alert: true };
+        }
+      }
+      // دکتر لکتر: هدف باید زنده، عضو همان بازی و از تیم Mafia باشد.
+      // اگر شهروند انتخاب شد، اکشن رد می‌شود و ذخیره نمی‌شود.
+      if (action === "heal" && player.role === "lecter") {
+        if (targetId === userId) {
+          return { text: fa.lecterCannotSelf, alert: true };
+        }
+        if (target.team === "town") {
+          return { text: fa.lecterTownTarget, alert: true };
+        }
+        if (target.team !== "mafia") {
+          return { text: fa.invalidTarget, alert: true };
+        }
+      }
+      if (action === "heal" && player.role === "doctor" && targetId === userId) {
         if (game.doctorSelfHealUsedBy.includes(userId)) {
           return { text: "نجات خودتان را قبلاً استفاده کرده‌اید.", alert: true };
         }
@@ -3283,7 +3362,7 @@ export class GameRoom extends DurableObject<Env> {
     await this.persist();
     await persistNightAction(this.env.DB, game.id, nightNumber, userId, action, targetId > 0 ? targetId : null);
 
-    const label = targetId > 0 ? targetLabel(game, targetId, action) : "رد کردن";
+    const label = targetId > 0 ? targetLabel(game, targetId, action, player) : "رد کردن";
     await this.pm(userId, fa.actionSaved(label));
 
     if (action === "mafia_kill" && targetId > 0) {
@@ -3394,6 +3473,11 @@ export class GameRoom extends DurableObject<Env> {
       const def = ROLES[p.role];
       if (p.role === "citizen" || p.role === "mayor") {
         await this.pm(p.userId, fa.nightCitizenWait);
+        continue;
+      }
+      if (p.role === "lecter") {
+        // پنل مستقل دکتر لکتر: فقط محافظت از اعضای زندهٔ تیم مافیا، بدون پنل شلیک
+        await this.pm(p.userId, fa.lecterPrompt(secs), nightKeyboardFor(game, p));
         continue;
       }
       await this.pm(p.userId, fa.nightPvPrompt(p.role, secs), nightKeyboardFor(game, p));
@@ -3921,6 +4005,8 @@ function allowedNightActions(player: Player): NightActionType[] {
       return ["mafia_kill"];
     case "natasha":
       return ["mafia_kill", "silence"];
+    case "lecter":
+      return ["heal"];
     case "doctor":
       return ["heal"];
     case "detective":
@@ -3943,6 +4029,11 @@ function nightKeyboardFor(game: GameState, player: Player): InlineKeyboard | und
       return nightTargetKeyboard(game.players, player.userId, n, "k");
     case "natasha":
       return nightTargetKeyboard(game.players, player.userId, n, "z");
+    case "lecter":
+      // پنل کاملاً مستقل دکتر لکتر: فقط اعضای زندهٔ تیم مافیا
+      return nightTargetKeyboard(game.players, player.userId, n, "h", {
+        skipLabel: "⏭ امشب محافظت نمی‌کنم",
+      });
     case "doctor":
       return nightTargetKeyboard(game.players, player.userId, n, "h", {
         includeSelf: true,
@@ -3980,13 +4071,18 @@ function inferChatId(update: TgUpdate): number | null {
   return null;
 }
 
-function targetLabel(game: GameState, targetId: number, action: NightActionType): string {
+function targetLabel(
+  game: GameState,
+  targetId: number,
+  action: NightActionType,
+  actor?: Player | null,
+): string {
   const name = findPlayer(game.players, targetId)?.displayName || "بازیکن";
   switch (action) {
     case "mafia_kill":
       return `قتل ${name}`;
     case "heal":
-      return `نجات ${name}`;
+      return actor?.role === "lecter" ? `محافظت از ${name}` : `نجات ${name}`;
     case "investigate":
       return `استعلام ${name}`;
     case "snipe":

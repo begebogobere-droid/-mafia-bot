@@ -1718,6 +1718,7 @@ export const fa = {
     "/help — راهنما",
     "",
     "اقدام‌ها با دکمه‌های همین چت انجام می‌شود.",
+    "در طول شب، مافیاهای زنده می‌توانند پیام متنی معمولی بفرستند تا فقط هم‌تیمی‌های زندهٔ همان بازی آن را ببینند.",
   ].join("\n"),
 
   myRoleDead(role: RoleId): string {
@@ -1725,6 +1726,20 @@ export const fa = {
   },
 
   notPlaying: "الان در هیچ بازی فعالی نیستید.",
+  mafiaChatNotInGame: "برای استفاده از چت شب باید در یک بازی فعال حضور داشته باشید.",
+  mafiaChatClosed: "🔒 چت خصوصی مافیا فقط در طول شب فعال است.",
+  mafiaChatForbidden: "⛔ این چت فقط برای اعضای زندهٔ تیم مافیا فعال است.",
+  mafiaChatDead: "💀 بازیکن حذف‌شده اجازهٔ استفاده از چت شب مافیا را ندارد.",
+  mafiaChatEmpty: "پیام متنی خالی قابل ارسال نیست.",
+  mafiaChatCommandsIgnored:
+    "دستورهای بات به چت مافیا ارسال نمی‌شوند. برای گفتگو، یک پیام متنی معمولی بفرستید.",
+  mafiaChatNoRecipients: "در حال حاضر مافیای زندهٔ دیگری برای دریافت پیام وجود ندارد.",
+  mafiaChatDelivered(count: number): string {
+    return `✅ پیام برای ${count} هم‌تیمی مافیا ارسال شد.`;
+  },
+  mafiaChatMessage(sender: string, text: string): string {
+    return [`👤 <b>${esc(sender)}</b>`, "", esc(text)].join("\n");
+  },
   investigation(target: string, isMafia: boolean): string {
     return isMafia
       ? `🔍 استعلام ${esc(target)}: <b>مافیا</b>`
@@ -2137,6 +2152,64 @@ export async function deleteLobbyPlayersNotIn(
     .run();
 }
 
+export interface MafiaNightChatMemberRow {
+  game_id: string;
+  user_id: number;
+  display_name: string;
+  team: string | null;
+  status: string;
+}
+
+/**
+ * Loads a night-chat sender and recipients using an explicit game id.
+ * The query intentionally never selects players merely by role/team, which
+ * prevents messages from crossing game boundaries when concurrent games are
+ * enabled in the future.
+ */
+export async function loadMafiaNightChatContext(
+  db: D1Database,
+  gameId: string,
+  senderId: number,
+): Promise<{
+  gameStatus: string;
+  sender: MafiaNightChatMemberRow | null;
+  recipients: MafiaNightChatMemberRow[];
+} | null> {
+  const game = await db
+    .prepare(`SELECT status FROM games WHERE id = ? LIMIT 1`)
+    .bind(gameId)
+    .first<{ status: string }>();
+  if (!game) return null;
+
+  const sender = await db
+    .prepare(
+      `SELECT game_id, user_id, display_name, team, status
+       FROM game_players
+       WHERE game_id = ? AND user_id = ?
+       LIMIT 1`,
+    )
+    .bind(gameId, senderId)
+    .first<MafiaNightChatMemberRow>();
+
+  const rows = await db
+    .prepare(
+      `SELECT game_id, user_id, display_name, team, status
+       FROM game_players
+       WHERE game_id = ?
+         AND team = 'mafia'
+         AND status = 'alive'
+         AND user_id <> ?`,
+    )
+    .bind(gameId, senderId)
+    .all<MafiaNightChatMemberRow>();
+
+  return {
+    gameStatus: game.status,
+    sender: sender ?? null,
+    recipients: rows.results ?? [],
+  };
+}
+
 const EXTEND_SECONDS = 60;
 const DEFENSE_SECONDS = 30;
 
@@ -2226,6 +2299,12 @@ export class GameRoom extends DurableObject<Env> {
         await this.sendMyRole(from.id);
         return;
       }
+      // Bot commands must never be relayed as mafia chat messages.
+      if (parsed) {
+        await this.tg.sendMessage(from.id, fa.mafiaChatCommandsIgnored);
+        return;
+      }
+      await this.handleMafiaNightChat(msg);
       return;
     }
 
@@ -2271,6 +2350,103 @@ export class GameRoom extends DurableObject<Env> {
       default:
         break;
     }
+  }
+
+  /**
+   * Stateless, private-only relay for the living mafia of this exact game.
+   * No chat body is persisted, so finishing/cancelling a game leaves no night
+   * chat state to clean up. Durable Object serialization also prevents a
+   * message from racing past a phase transition in this room.
+   */
+  private async handleMafiaNightChat(msg: TgMessage): Promise<void> {
+    const from = msg.from;
+    if (!from || msg.chat.type !== "private") return;
+
+    const game = this.game;
+    if (!game || !isActiveStatus(game.status)) {
+      await this.tg.sendMessage(from.id, fa.mafiaChatNotInGame);
+      return;
+    }
+
+    // Authoritative in-memory checks happen before touching recipient data.
+    const sender = findPlayer(game.players, from.id);
+    if (!sender) {
+      await this.tg.sendMessage(from.id, fa.mafiaChatNotInGame);
+      return;
+    }
+    if (game.status !== "night" || game.phase !== "night") {
+      await this.tg.sendMessage(from.id, fa.mafiaChatClosed);
+      return;
+    }
+    if (sender.status !== "alive") {
+      await this.tg.sendMessage(from.id, fa.mafiaChatDead);
+      return;
+    }
+    if (sender.team !== "mafia") {
+      await this.tg.sendMessage(from.id, fa.mafiaChatForbidden);
+      return;
+    }
+
+    const body = (msg.text ?? "").trim();
+    if (!body) {
+      await this.tg.sendMessage(from.id, fa.mafiaChatEmpty);
+      return;
+    }
+
+    // Re-read membership by the exact Game ID. This is deliberately additive:
+    // it uses the current schema and does not mutate the game/state machine.
+    const context = await loadMafiaNightChatContext(this.env.DB, game.id, from.id);
+    if (
+      !context ||
+      context.gameStatus !== "night" ||
+      !context.sender ||
+      context.sender.game_id !== game.id ||
+      context.sender.team !== "mafia" ||
+      context.sender.status !== "alive"
+    ) {
+      await this.tg.sendMessage(from.id, fa.mafiaChatClosed);
+      return;
+    }
+
+    // Keep enough room for the HTML sender header under Telegram's limit.
+    const relayText = fa.mafiaChatMessage(sender.displayName, body.slice(0, 3800));
+    let delivered = 0;
+
+    for (const row of context.recipients) {
+      // Re-check both sides immediately before every send. Besides defending
+      // against stale DB rows, this explicitly enforces same-game isolation.
+      const current = this.game;
+      const recipient = current ? findPlayer(current.players, row.user_id) : undefined;
+      const stillAllowed =
+        current === game &&
+        current.id === game.id &&
+        current.status === "night" &&
+        current.phase === "night" &&
+        row.game_id === game.id &&
+        row.team === "mafia" &&
+        row.status === "alive" &&
+        sender.userId === from.id &&
+        sender.team === "mafia" &&
+        sender.status === "alive" &&
+        !!recipient &&
+        recipient.team === "mafia" &&
+        recipient.status === "alive";
+      if (!stillAllowed) continue;
+
+      const result = await this.tg.callSafe("sendMessage", {
+        chat_id: recipient.userId,
+        text: relayText,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+      if (result.ok) delivered += 1;
+      else console.error("mafia night chat delivery failed", game.id, recipient.userId, result.error.description);
+    }
+
+    await this.tg.sendMessage(
+      from.id,
+      delivered > 0 ? fa.mafiaChatDelivered(delivered) : fa.mafiaChatNoRecipients,
+    );
   }
 
   private async onPrivateStart(msg: TgMessage, args: string): Promise<void> {
@@ -2772,6 +2948,7 @@ export class GameRoom extends DurableObject<Env> {
     game.phaseEndsAt = now() + ms;
     game.reminderAt = game.phaseEndsAt - game.config.reminderLeadSeconds * 1000;
     await this.lockGroup();
+    await this.relockAllPlayers();
     await this.persist(true);
     await this.schedulePhaseTimers();
     const sent = await this.group(fa.nightStart(game.nightNumber, game.config.nightSeconds));
@@ -2822,6 +2999,7 @@ export class GameRoom extends DurableObject<Env> {
     game.phaseEndsAt = now() + game.config.voteSeconds * 1000;
     game.reminderAt = game.phaseEndsAt - game.config.reminderLeadSeconds * 1000;
     await this.lockGroup();
+    await this.relockAllPlayers();
     await this.persist(true);
     await this.schedulePhaseTimers();
     const sent = await this.group(fa.nominationStart(game.dayNumber, game.config.voteSeconds));
@@ -2844,6 +3022,13 @@ export class GameRoom extends DurableObject<Env> {
     game.reminderAt = null;
     await this.persist(true);
     await this.schedulePhaseTimers();
+    // First guarantee every OTHER player is individually locked (clears any
+    // stale per-user "unlocked" override left over from the day phase), then
+    // unlock exactly the accused. This order matters: unlocking the accused
+    // before the relock pass could otherwise get clobbered, and skipping the
+    // relock pass is what let some other, already-unlocked player from the
+    // day phase keep chatting during someone else's defense.
+    await this.relockAllPlayers(accusedUserId);
     await this.unlockOne(accusedUserId);
     const sent = await this.group(fa.summonedToTrial(accused.displayName, accused.userId, DEFENSE_SECONDS));
     if (sent) await this.pin(sent.message_id);
@@ -3412,6 +3597,31 @@ export class GameRoom extends DurableObject<Env> {
     });
   }
 
+  // Telegram keeps a per-user permission override (set via restrictChatMember)
+  // in place even after the chat's default permissions are changed via
+  // setChatPermissions. Because unlockForDay() gives every alive/non-silenced
+  // player their own individual "unlocked" override, simply calling
+  // lockGroup()/setChatPermissions when moving into night/nomination/defense
+  // is NOT enough — those players stay individually unlocked and can still
+  // write in the group, which looks like "the wrong person's mute opened".
+  // This loops every player and explicitly re-locks them one by one (skipping
+  // real chat admins, who Telegram never restricts), guaranteeing a clean
+  // slate. Pass exceptUserId to leave exactly one player unlocked (defense).
+  private async relockAllPlayers(exceptUserId?: number): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    for (const p of game.players) {
+      if (p.originalMember?.isAdmin) continue;
+      if (exceptUserId && p.userId === exceptUserId) continue;
+      await this.tg.callSafe("restrictChatMember", {
+        chat_id: game.chatId,
+        user_id: p.userId,
+        permissions: LOCKED_PERMISSIONS,
+        use_independent_chat_permissions: true,
+      });
+    }
+  }
+
   private async mutePlayer(userId: number): Promise<void> {
     const game = this.game;
     if (!game) return;
@@ -3644,6 +3854,10 @@ export class GameRoom extends DurableObject<Env> {
         dayNumber: v.day_number,
         at: v.created_at,
       })),
+      // Verdict votes are only held in Durable Object state in the current
+      // schema; after a D1 recovery, start with a safe empty in-memory set.
+      verdictVotes: [],
+      accusedUserId: null,
       silencedUserIds: [],
       blockedUserIds: [],
       doctorSelfHealUsedBy: [],
@@ -3663,12 +3877,13 @@ export class GameRoom extends DurableObject<Env> {
       startedAt: snap.game.started_at,
       finishedAt: snap.game.finished_at,
     };
-    for (const p of this.game.players) {
+    const recovered = this.game;
+    for (const p of recovered.players) {
       if (p.role === "sniper") {
-        this.game.sniperShotsLeft[String(p.userId)] = sniperShotsFor(this.game.players.length);
+        recovered.sniperShotsLeft[String(p.userId)] = sniperShotsFor(recovered.players.length);
       }
     }
-    await this.ctx.storage.put("state", this.game);
+    await this.ctx.storage.put("state", recovered);
     await this.ensureAlarm();
   }
 }
@@ -3789,8 +4004,15 @@ function restorePermissionsFor(
   saved: SavedMember | null,
   defaults: ChatPermissions,
 ): ChatPermissions {
-  if (saved?.status === "restricted" && saved.permissions) return saved.permissions;
-  if (saved?.status === "member") return { ...OPEN_PERMISSIONS, ...defaults };
+  // NOTE: intentionally NOT preserving a pre-existing "restricted" status here.
+  // Any player who was part of the game (silenced by a night action, muted for
+  // being eliminated, etc.) must always end up fully unmuted when the game
+  // ends. Preserving "restricted" caused players who got stuck muted (e.g. by
+  // a crashed/abandoned earlier game, or a manual mute) to be treated as
+  // "originally muted" forever: every future game's snapshot would re-capture
+  // that stale muted state and re-apply it at the end, so they never got
+  // freed. Always restore to the open/group defaults instead.
+  void saved;
   return { ...OPEN_PERMISSIONS, ...defaults };
 }
 
@@ -3896,6 +4118,10 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   }
   if (parsed?.cmd === "myrole") {
     await tg.sendMessage(from.id, fa.notPlaying);
+    return;
+  }
+  if (msg && !parsed && text.trim()) {
+    await tg.sendMessage(from.id, fa.mafiaChatNotInGame);
     return;
   }
   await tg.sendMessage(from.id, fa.privateStart);

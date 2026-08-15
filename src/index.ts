@@ -1897,7 +1897,14 @@ export const fa = {
   },
 
   gameAlreadyRunning: "در این گروه الان یک بازی فعال است.",
+  lobbyCreateFailed: "⚠️ ساخت لابی به مشکل خورد. لطفاً دوباره /new را بزنید.",
   lobbyOnlyHere: "این دستور را در گروه بزنید.",
+  resetAdminOnly: "برای ریست کردن بات در این گروه باید ادمین باشید.",
+  resetDone: [
+    "♻️ <b>بات ریست شد</b>",
+    "همهٔ لابی‌ها و بازی‌های فعال این گروه غیرفعال شدند و بات دقیقاً مثل تازه اد شدن به گروه آماده است.",
+    "برای شروع دوباره /new را بزنید.",
+  ].join("\n"),
   hostOnly: "فقط میزبان یا ادمین گروه می‌تواند این کار را انجام دهد.",
   notEnough: "برای شروع حداقل ۶ بازیکن لازم است.",
   tooMany: "حداکثر ۱۲ بازیکن می‌توانند بازی کنند.",
@@ -2228,6 +2235,7 @@ export const fa = {
     "/players — لیست بازیکنان",
     "/extend — تمدید بحث (میزبان)",
     "/skip — پایان زودتر مرحله (میزبان)",
+    "/reset — ریست کامل بات در گروه (ادمین)",
     "/help — راهنما",
     "",
     "بحث فقط در گروه. نقش، شب و رأی فقط در پیوی.",
@@ -2424,6 +2432,14 @@ export async function findActiveGameForChat(db: D1Database, chatId: number): Pro
      WHERE chat_id = ? AND status NOT IN ('finished', 'cancelled', 'idle')
      ORDER BY updated_at DESC LIMIT 1`,
   ).bind(chatId).first()) ?? null;
+}
+
+export async function cancelActiveGamesForChat(db: D1Database, chatId: number): Promise<void> {
+  const ts = now();
+  await db.prepare(
+    `UPDATE games SET status = 'cancelled', finished_at = ?, updated_at = ?
+     WHERE chat_id = ? AND status NOT IN ('finished', 'cancelled', 'idle')`,
+  ).bind(ts, ts, chatId).run();
 }
 
 export async function persistGame(db: D1Database, game: GameState): Promise<void> {
@@ -2683,6 +2699,7 @@ export class GameRoom extends DurableObject<Env> {
 
     switch (parsed.cmd) {
       case "new": case "mafia": case "newgame": await this.cmdNew(msg); break;
+      case "reset": await this.cmdReset(msg); break;
       case "join": await this.cmdJoin(msg); break;
       case "leave": await this.cmdLeave(msg); break;
       case "startgame": case "begin": await this.cmdStartGame(msg.from!.id, msg.chat.id); break;
@@ -2884,7 +2901,7 @@ export class GameRoom extends DurableObject<Env> {
       status: "alive", originalMember: null, joinedAt: ts,
     };
 
-    this.game = {
+    const newGame: GameState = {
       id: randomId("g"), chatId: msg.chat.id, chatTitle: msg.chat.title || "گروه",
       hostId: from.id, status: "lobby", phase: "lobby", dayNumber: 0, nightNumber: 0,
       phaseEndsAt: ts + DEFAULT_CONFIG.lobbySeconds * 1000, dayPhaseMaxEndsAt: null, reminderAt: null, nextTickAt: null,
@@ -2898,17 +2915,68 @@ export class GameRoom extends DurableObject<Env> {
       createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
     };
 
+    // IMPORTANT: send the lobby announcement BEFORE committing anything to storage/D1.
+    // Previously the game state was persisted (making the chat "active") and only then
+    // was the announcement sent. If that send failed for any reason (network hiccup,
+    // a transient Telegram error, etc.) the exception unwound out of cmdNew and was
+    // silently swallowed by handleUpdate's catch-all: nothing appeared in the chat, yet
+    // the lobby was already saved as active. Every subsequent /new then hit the "game
+    // already active" guard above, with no visible lobby and no way out short of manual
+    // intervention. By sending first and only persisting on success, a failed send
+    // leaves no trace behind and /new can simply be retried.
+    let sent: TgMessage;
+    try {
+      sent = await this.tg.sendMessage(msg.chat.id, fa.lobbyCreated(mention(from.id, host.displayName)), {
+        reply_markup: { inline_keyboard: lobbyKeyboard(newGame.botUsername, msg.chat.id) },
+      });
+    } catch (err) {
+      console.error("cmdNew: failed to send lobby announcement", err);
+      await this.tg.sendMessage(msg.chat.id, fa.lobbyCreateFailed).catch(() => {});
+      return;
+    }
+
+    newGame.lastGroupMessageId = sent.message_id;
+    this.game = newGame;
+
     await upsertUser(this.env.DB, from, false);
     await this.persist(true);
     await this.scheduleAlarm(this.game.phaseEndsAt ?? ts + DEFAULT_CONFIG.lobbySeconds * 1000);
-
-    const sent = await this.tg.sendMessage(msg.chat.id, fa.lobbyCreated(mention(from.id, host.displayName)), {
-      reply_markup: { inline_keyboard: lobbyKeyboard(this.game.botUsername, msg.chat.id) },
-    });
-    this.game.lastGroupMessageId = sent.message_id;
     await this.pin(sent.message_id);
     await this.refreshLobbyMessage();
     await this.persist(true);
+  }
+
+  private async cmdReset(msg: TgMessage): Promise<void> {
+    if (msg.chat.type === "group") { await this.tg.sendMessage(msg.chat.id, fa.needSupergroup); return; }
+    if (msg.chat.type !== "supergroup") { await this.tg.sendMessage(msg.chat.id, fa.lobbyOnlyHere); return; }
+    const from = msg.from;
+    if (!from) return;
+    if (!(await this.isChatAdmin(from.id, msg.chat.id))) { await this.tg.sendMessage(msg.chat.id, fa.resetAdminOnly); return; }
+
+    const game = this.game;
+    if (game && game.chatId === msg.chat.id) {
+      if (game.temporaryCourtAdminUserId) await this.removeTemporaryCourtAdmin(game.temporaryCourtAdminUserId);
+      if (isPlayingStatus(game.status)) await this.restoreAllPermissions();
+      if (game.pinnedMessageId) await this.unpin();
+    }
+
+    // Wipe every trace of this room's state — Durable Object storage (including the
+    // scheduled alarm) as well as any leftover "active" rows in D1 for this chat — so
+    // the bot behaves exactly as if it had just been added to the group: no lobby, no
+    // game, and no stale record blocking a future /new or blocking players who were
+    // stuck "in" this game from joining a game elsewhere.
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    await cancelActiveGamesForChat(this.env.DB, msg.chat.id);
+    this.game = null;
+
+    await this.tg.sendMessage(msg.chat.id, fa.resetDone);
+  }
+
+  private async isChatAdmin(userId: number, chatId: number): Promise<boolean> {
+    const member = await this.tg.callSafe<TgChatMember>("getChatMember", { chat_id: chatId, user_id: userId });
+    if (!member.ok) return false;
+    return member.result.status === "administrator" || member.result.status === "creator";
   }
 
   private async cmdJoin(msg: TgMessage): Promise<void> {
@@ -4349,7 +4417,8 @@ async function setup(url: URL, env: Env): Promise<Response> {
   await tg.setMyCommands([
     { command: "new", description: "ساخت لابی مافیا" }, { command: "join", description: "ورود به لابی" },
     { command: "startgame", description: "شروع بازی" }, { command: "cancel", description: "لغو بازی" },
-    { command: "status", description: "وضعیت بازی" }, { command: "help", description: "راهنما" },
+    { command: "status", description: "وضعیت بازی" }, { command: "reset", description: "ریست کامل بات (ادمین)" },
+    { command: "help", description: "راهنما" },
   ], { type: "all_group_chats" });
   await tg.setMyCommands([{ command: "start", description: "فعال‌سازی بات" }, { command: "myrole", description: "مشاهده نقش" }, { command: "help", description: "راهنما" }], { type: "all_private_chats" });
   const me = await tg.getMe();

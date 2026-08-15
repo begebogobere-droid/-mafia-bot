@@ -3014,7 +3014,7 @@ export class GameRoom extends DurableObject<Env> {
     });
     await upsertUser(this.env.DB, from, notifyChatId === from.id);
     await this.persist(true);
-    await this.group(joinAnnounce(from.id, displayOf(from), game.players.length, game.config.maxPlayers));
+    await this.announce(joinAnnounce(from.id, displayOf(from), game.players.length, game.config.maxPlayers));
     await this.refreshLobbyMessage();
     return "ok";
   }
@@ -3034,7 +3034,7 @@ export class GameRoom extends DurableObject<Env> {
     if (game.players.length === 0 || userId === game.hostId) { await this.cancelInternal("میزبان لابی را ترک کرد."); return; }
     await this.persist(true);
     await deleteLobbyPlayersNotIn(this.env.DB, game.id, game.players.map((p) => p.userId));
-    await this.group(leaveAnnounce(leaving.userId, leaving.displayName, game.players.length, game.config.maxPlayers));
+    await this.announce(leaveAnnounce(leaving.userId, leaving.displayName, game.players.length, game.config.maxPlayers));
     await this.refreshLobbyMessage();
   }
 
@@ -4036,6 +4036,25 @@ export class GameRoom extends DurableObject<Env> {
     });
     if (!res.ok) { console.error("group send failed", res.error); return null; }
     game.lastGroupMessageId = res.result.message_id;
+    return res.result;
+  }
+
+  // Sends a plain, one-off announcement to the group (join/leave notices, etc.) WITHOUT
+  // touching game.lastGroupMessageId. That field is the pointer refreshLobbyMessage() (and
+  // the phase-transition flow) uses to know which message to edit. group() intentionally
+  // repoints it whenever it sends a message that should become the new "current" reference
+  // (e.g. the day/night phase message). Using group() for join/leave announcements was a
+  // bug: every join or leave silently hijacked lastGroupMessageId to point at the brand-new
+  // announcement instead of the pinned lobby card, so refreshLobbyMessage() ended up editing
+  // that announcement into a duplicate lobby card while the real pinned lobby message froze
+  // and never reflected new players — making it look like joining the lobby didn't work.
+  private async announce(text: string): Promise<TgMessage | null> {
+    const game = this.game;
+    if (!game) return null;
+    const res = await this.tg.callSafe<TgMessage>("sendMessage", {
+      chat_id: game.chatId, text, parse_mode: "HTML", disable_web_page_preview: true,
+    });
+    if (!res.ok) { console.error("announce send failed", res.error); return null; }
     return res.result;
   }
 

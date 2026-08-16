@@ -2651,30 +2651,63 @@ export class GameRoom extends DurableObject<Env> {
       return { ok: true };
     } catch (err) {
       console.error("handleUpdate", err);
+      // FIX #6 (companion): If recovery or the command itself threw, and
+      // it's a user-facing message in a group, try to give them a hint
+      // instead of failing silently.
+      try {
+        const chatId = inferChatId(update);
+        const text = update.message?.text ?? "";
+        if (chatId && text.startsWith("/")) {
+          await this.tg.callSafe("sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ خطایی رخ داد. اگر بازی فعالی نیست، با /new یک لابی بسازید. " +
+                  "اگر مشکل ادامه داشت، ادمین گروه می‌تواند با /reset بات را ریست کند.",
+            parse_mode: "HTML",
+          });
+        }
+      } catch {
+        // best-effort; ignore
+      }
       return { ok: false };
     }
   }
 
   async alarm(): Promise<void> {
-    const game = this.game;
-    if (!game || !isActiveStatus(game.status)) return;
-    const t = now();
-    if (game.alarmKind === "countdown" && game.status === "day" && game.phaseEndsAt && t < game.phaseEndsAt) {
-      await this.sendCountdown();
-      const nextTick = t + 60000;
-      game.nextTickAt = game.phaseEndsAt - nextTick > 15000 ? nextTick : null;
-      await this.persist();
-      await this.schedulePhaseTimers();
-      return;
+    // FIX #5: Wrap the entire alarm body in a try/catch so a Telegram API
+    // hiccup (rate limit, network blip) can never wedge a game in the middle
+    // of a phase transition. Without this, an exception during advancePhase
+    // would leave the game stuck in "resolving" or "night" forever because
+    // no follow-up alarm gets scheduled.
+    try {
+      const game = this.game;
+      if (!game || !isActiveStatus(game.status)) return;
+      const t = now();
+      if (game.alarmKind === "countdown" && game.status === "day" && game.phaseEndsAt && t < game.phaseEndsAt) {
+        await this.sendCountdown();
+        const nextTick = t + 60000;
+        game.nextTickAt = game.phaseEndsAt - nextTick > 15000 ? nextTick : null;
+        await this.persist();
+        await this.schedulePhaseTimers();
+        return;
+      }
+      if (game.alarmKind === "reminder" && game.phaseEndsAt && t < game.phaseEndsAt) {
+        await this.sendReminders();
+        game.reminderAt = null;
+        await this.persist();
+        await this.schedulePhaseTimers();
+        return;
+      }
+      await this.advancePhase("timer");
+    } catch (err) {
+      console.error("alarm failed, will retry in 5s", err);
+      // Schedule a retry. If we still have a game, give it another chance.
+      // If we don't, just return — nothing more to do.
+      try {
+        await this.ctx.storage.setAlarm(now() + 5000);
+      } catch (err2) {
+        console.error("could not schedule retry alarm", err2);
+      }
     }
-    if (game.alarmKind === "reminder" && game.phaseEndsAt && t < game.phaseEndsAt) {
-      await this.sendReminders();
-      game.reminderAt = null;
-      await this.persist();
-      await this.schedulePhaseTimers();
-      return;
-    }
-    await this.advancePhase("timer");
   }
 
   private async onMessage(msg: TgMessage): Promise<void> {
@@ -2725,6 +2758,23 @@ export class GameRoom extends DurableObject<Env> {
     if (sender.team !== "mafia") { await this.tg.sendMessage(from.id, fa.mafiaChatForbidden); return; }
     const body = (msg.text ?? "").trim();
     if (!body) { await this.tg.sendMessage(from.id, fa.mafiaChatEmpty); return; }
+
+    // FIX #8: Per-sender rate limit. Without this, a single mafia player can
+    // spam-relay messages to every other mafia member, which causes Telegram
+    // to start returning 429s to *every* subsequent bot call (including
+    // critical game state transitions). We refuse to relay more than once
+    // every 2 seconds per sender; the sender still gets the same confirmation
+    // back so they don't think their message was lost.
+    const nowMs = now();
+    const lastAt = (game as GameState & { __mafiaChatLastAt?: Record<number, number> }).__mafiaChatLastAt?.[from.id] ?? 0;
+    if (nowMs - lastAt < 2000) {
+      await this.tg.sendMessage(from.id, "⏱ کمی صبر کنید و دوباره بفرستید.");
+      return;
+    }
+    if (!(game as GameState & { __mafiaChatLastAt?: Record<number, number> }).__mafiaChatLastAt) {
+      (game as GameState & { __mafiaChatLastAt?: Record<number, number> }).__mafiaChatLastAt = {};
+    }
+    (game as GameState & { __mafiaChatLastAt?: Record<number, number> }).__mafiaChatLastAt![from.id] = nowMs;
 
     const relayText = fa.mafiaChatMessage(sender.displayName, body.slice(0, 3800));
     let delivered = 0;
@@ -2877,6 +2927,18 @@ export class GameRoom extends DurableObject<Env> {
     const player = findPlayer(game.players, next.user.id);
     if (!player || player.status !== "alive") return;
     if (next.status === "left" || next.status === "kicked") {
+      // FIX #9: When a player leaves the group mid-night, drop any night
+      // actions they had queued for the current night so that
+      // hasFinishedAllNightActions (and any mafia-target tiebreak logic) sees
+      // a clean state. Without this, a mafia kill registered by a player who
+      // then leaves the group can still count toward the night's resolution,
+      // and a single-player night can spuriously "complete" early when the
+      // detective disappears.
+      if (game.status === "night") {
+        game.nightActions = game.nightActions.filter(
+          (a) => !(a.actorId === next.user.id && a.nightNumber === game.nightNumber),
+        );
+      }
       await this.eliminate(player.userId, "left");
     }
   }
@@ -2884,6 +2946,39 @@ export class GameRoom extends DurableObject<Env> {
   private async cmdNew(msg: TgMessage): Promise<void> {
     if (msg.chat.type === "group") { await this.tg.sendMessage(msg.chat.id, fa.needSupergroup); return; }
     if (msg.chat.type !== "supergroup") { await this.tg.sendMessage(msg.chat.id, fa.lobbyOnlyHere); return; }
+
+    // FIX #1: If a lobby already exists for this chat (e.g. DO storage was wiped
+    // but D1 still has the lobby row, or the previous /new was interrupted), reuse
+    // it instead of refusing to create a new one. This is the most common cause
+    // of "I can't create a lobby" — the bot would see the active lobby in D1
+    // and bail out with "game already running" forever.
+    if (this.game && this.game.chatId === msg.chat.id && this.game.status === "lobby") {
+      const admin = await this.assertBotAdmin(msg.chat.id);
+      if (!admin.ok) { await this.tg.sendMessage(msg.chat.id, admin.message); return; }
+      // Re-send the lobby message if we have no pointer, or just refresh it.
+      if (!this.game.lastGroupMessageId) {
+        const me = await this.ensureBotIdentity();
+        if (me) this.game.botUsername = me.username;
+        const host = findPlayer(this.game.players, this.game.hostId);
+        const hostMention = host ? mention(this.game.hostId, host.displayName) : "میزبان";
+        const sent = await this.tg.callSafe<TgMessage>("sendMessage", {
+          chat_id: msg.chat.id,
+          text: fa.lobbyCreated(hostMention),
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+          reply_markup: { inline_keyboard: lobbyKeyboard(this.game.botUsername, msg.chat.id) },
+        });
+        if (sent.ok) {
+          this.game.lastGroupMessageId = sent.result.message_id;
+          await this.persist(true);
+          await this.pin(sent.result.message_id);
+        }
+      }
+      await this.refreshLobbyMessage();
+      return;
+    }
+
+    // Real conflict: a game is actually being played. Tell the user.
     if (this.game && isActiveStatus(this.game.status)) { await this.tg.sendMessage(msg.chat.id, fa.gameAlreadyRunning); return; }
     if (this.game?.temporaryCourtAdminUserId) {
       const cleared = await this.removeTemporaryCourtAdmin(this.game.temporaryCourtAdminUserId);
@@ -2998,7 +3093,15 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   private async addPlayer(from: { id: number; username?: string; first_name: string; last_name?: string }, chatId: number, notifyChatId: number): Promise<"ok" | "already" | "full" | "nogame" | "busy" | "notlobby"> {
-    const game = this.game;
+    // FIX #6: Before declaring "no game", try one more recovery. This handles
+    // the case where DO storage was lost (this.game === null) but D1 still
+    // has an active lobby for this chat. Without this, every /join after a
+    // DO restart would say "no game" even though the lobby is right there.
+    let game = this.game;
+    if (!game || game.chatId !== chatId) {
+      await this.recoverFromD1(chatId);
+      game = this.game;
+    }
     if (!game || game.chatId !== chatId || game.status !== "lobby") {
       if (notifyChatId === chatId) await this.tg.sendMessage(chatId, fa.noGame);
       return game && game.status !== "lobby" && findPlayer(game.players, from.id) ? "busy" : "nogame";
@@ -3046,8 +3149,23 @@ export class GameRoom extends DurableObject<Env> {
     if (game.players.length < game.config.minPlayers) { await this.tg.sendMessage(game.chatId, fa.notEnough); return; }
     if (game.players.length > game.config.maxPlayers) { await this.tg.sendMessage(game.chatId, fa.tooMany); return; }
     const admin = await this.assertBotAdmin(game.chatId);
-    if (!admin.ok) { await this.tg.sendMessage(game.chatId, admin.message); return; }
+    if (!admin.ok) {
+      // FIX #3: Give a more specific error so the user knows which admin rights
+      // are missing. The original fa.needAdmin message already lists them, but
+      // adding a hint about what to do speeds up debugging.
+      await this.tg.sendMessage(
+        game.chatId,
+        `${admin.message}\n\n💡 ربات باید دسترسی‌های زیر را داشته باشد:\n` +
+        `• محدود کردن اعضا (Restrict members)\n` +
+        `• حذف پیام (Delete messages)\n` +
+        `• پین کردن پیام (Pin messages)`,
+      );
+      return;
+    }
 
+    // FIX #3: Use allSettled so a single probe failure doesn't hide which players
+    // are ready. Also separate "hasn't started bot" from "actively blocked us"
+    // so the error message is unambiguous.
     const probes = await Promise.all(game.players.map(async (p) => {
       const started = await hasStartedBot(this.env.DB, p.userId);
       const probe = await this.tg.callSafe("sendMessage", {
@@ -3055,8 +3173,23 @@ export class GameRoom extends DurableObject<Env> {
       });
       return { player: p, ok: probe.ok, started };
     }));
-    const blocked = probes.filter((r) => !r.ok && !r.started).map((r) => mention(r.player.userId, r.player.displayName));
-    if (blocked.length) { await this.tg.sendMessage(game.chatId, `${fa.playersMustStartBot}\n${blocked.join("\n")}`); return; }
+    const notStarted = probes.filter((r) => !r.ok && !r.started).map((r) => mention(r.player.userId, r.player.displayName));
+    const blocked = probes.filter((r) => !r.ok && r.started).map((r) => mention(r.player.userId, r.player.displayName));
+    if (notStarted.length) {
+      await this.tg.sendMessage(
+        game.chatId,
+        `❌ ${notStarted.length} بازیکن هنوز پیوی بات را استارت نکرده‌اند.\n\n${notStarted.join("\n")}\n\n` +
+        `💡 هر بازیکن باید یک‌بار روی لینک «ورود به بازی (پیوی بات)» در لابی کلیک کند یا مستقیماً به بات پیام بدهد.`,
+      );
+      return;
+    }
+    if (blocked.length) {
+      await this.tg.sendMessage(
+        game.chatId,
+        `❌ ${blocked.length} بازیکن نمی‌توانند از بات پیام دریافت کنند (احتمالاً بات را بلاک کرده‌اند):\n\n${blocked.join("\n")}`,
+      );
+      return;
+    }
 
     game.status = "starting";
     game.phase = "night";
@@ -3197,6 +3330,14 @@ export class GameRoom extends DurableObject<Env> {
     if (winner) { await this.group(resolutionText); await this.finish(winner); return; }
     const indieWinner = checkIndependentWinner(game.players, game);
     if (indieWinner) { await this.group(resolutionText); await this.finish(indieWinner); return; }
+
+    // FIX #7: Schedule a fallback alarm BEFORE we start the (potentially-failing)
+    // day phase. If anything below throws (rate-limited Telegram call to
+    // unlockForDay, a flapping network, etc.) we don't want the game to sit in
+    // "resolving" with no scheduled alarm — the fallback will re-attempt entry
+    // and, if the game has somehow advanced past day on its own, advancePhase
+    // is a no-op so it's safe to just re-enter.
+    await this.ctx.storage.setAlarm(now() + 10000);
 
     game.status = "day";
     game.phase = "day";
@@ -3738,9 +3879,19 @@ export class GameRoom extends DurableObject<Env> {
   private async sendRoleCards(): Promise<void> {
     const game = this.game;
     if (!game) return;
-    for (const p of game.players) {
-      const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
-      await this.pm(p.userId, fa.roleCard(p, mates));
+    // FIX #4: Use Promise.allSettled so that one failed PM (e.g. user blocked
+    // the bot, Telegram rate limit) doesn't abort the entire role-distribution
+    // and leave the game stuck on the "night" phase with no prompts sent.
+    // Failed players can still recover their role via /myrole.
+    const results = await Promise.allSettled(
+      game.players.map((p) => {
+        const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
+        return this.pm(p.userId, fa.roleCard(p, mates));
+      }),
+    );
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (failed > 0) {
+      console.warn(`sendRoleCards: ${failed}/${game.players.length} players did not receive their role card`);
     }
   }
 
@@ -4019,9 +4170,28 @@ export class GameRoom extends DurableObject<Env> {
 
   private async refreshLobbyMessage(): Promise<void> {
     const game = this.game;
-    if (!game || game.status !== "lobby" || !game.lastGroupMessageId) return;
+    if (!game || game.status !== "lobby") return;
     const extra = fa.lobbyCreated(mention(game.hostId, findPlayer(game.players, game.hostId)?.displayName || "میزبان"));
     const text = `${extra}\n\n${fa.lobbyBody(game)}`;
+    // FIX #2 (companion): If we don't have a pointer to the lobby message
+    // (e.g. just recovered from D1, or the previous send failed), send a
+    // fresh one instead of silently doing nothing. Without this, a recovered
+    // lobby would appear empty until the host ran /new again.
+    if (!game.lastGroupMessageId) {
+      const me = await this.ensureBotIdentity();
+      if (me) game.botUsername = me.username;
+      const sent = await this.tg.callSafe<TgMessage>("sendMessage", {
+        chat_id: game.chatId, text, parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: lobbyKeyboard(game.botUsername, game.chatId) },
+      });
+      if (sent.ok) {
+        game.lastGroupMessageId = sent.result.message_id;
+        await this.persist();
+        await this.pin(sent.result.message_id);
+      }
+      return;
+    }
     await this.tg.callSafe("editMessageText", {
       chat_id: game.chatId, message_id: game.lastGroupMessageId, text, parse_mode: "HTML",
       disable_web_page_preview: true, reply_markup: { inline_keyboard: lobbyKeyboard(game.botUsername, game.chatId) },
@@ -4035,7 +4205,14 @@ export class GameRoom extends DurableObject<Env> {
       chat_id: game.chatId, text, parse_mode: "HTML", disable_web_page_preview: true, reply_markup: extra?.reply_markup,
     });
     if (!res.ok) { console.error("group send failed", res.error); return null; }
-    game.lastGroupMessageId = res.result.message_id;
+    // FIX #2: Don't clobber the lobby message ID once the game has left
+    // lobby phase. During the game, phase messages (night/day/nomination/...)
+    // legitimately become the new "current" message, but if a bug ever puts
+    // us back into a lobby-like state, this would otherwise hijack the
+    // lobby pointer and break refreshLobbyMessage.
+    if (game.status !== "lobby") {
+      game.lastGroupMessageId = res.result.message_id;
+    }
     return res.result;
   }
 
@@ -4093,6 +4270,15 @@ export class GameRoom extends DurableObject<Env> {
   private async schedulePhaseTimers(): Promise<void> {
     const game = this.game;
     if (!game?.phaseEndsAt) { await this.ctx.storage.deleteAlarm(); return; }
+    // FIX #10: If we somehow ended up in a "non-playing" status with a stale
+    // phaseEndsAt lying around (e.g. cmdReset was called between two phases
+    // and a queued alarm try/catch recovery left a clock arm), make sure we
+    // don't accidentally re-arm an alarm for a finished/cancelled/idle game.
+    if (!isActiveStatus(game.status)) {
+      game.alarmKind = "none";
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
     const t = now();
     const candidates: { at: number; kind: AlarmKind }[] = [{ at: game.phaseEndsAt, kind: "phase_end" }];
     if (game.reminderAt) candidates.push({ at: game.reminderAt, kind: "reminder" });

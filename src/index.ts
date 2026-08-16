@@ -184,6 +184,7 @@ export type GameStatus =
   | "lobby"
   | "starting"
   | "night"
+  | "inquiry"
   | "day"
   | "nomination"
   | "defense"
@@ -195,6 +196,7 @@ export type GameStatus =
 export type Phase =
   | "lobby"
   | "night"
+  | "inquiry"
   | "day"
   | "nomination"
   | "defense"
@@ -320,6 +322,13 @@ export interface VerdictVote {
   at: number;
 }
 
+export interface InquiryVote {
+  voterId: number;
+  choice: boolean;
+  dayNumber: number;
+  at: number;
+}
+
 export interface DeathRecord {
   userId: number;
   reason: DeathReason;
@@ -345,6 +354,9 @@ export interface GameState {
   nightActions: NightAction[];
   votes: Vote[];
   verdictVotes: VerdictVote[];
+  inquiryVotes: InquiryVote[];
+  cityInquiryCount: number;
+  pendingInquiryDeaths: DeathRecord[] | null;
   accusedUserId: number | null;
   temporaryCourtAdminUserId: number | null;
   silencedUserIds: number[];
@@ -426,6 +438,7 @@ export function isActiveStatus(status: GameStatus): boolean {
     status === "lobby" ||
     status === "starting" ||
     status === "night" ||
+    status === "inquiry" ||
     status === "day" ||
     status === "nomination" ||
     status === "defense" ||
@@ -438,6 +451,7 @@ export function isPlayingStatus(status: GameStatus): boolean {
   return (
     status === "starting" ||
     status === "night" ||
+    status === "inquiry" ||
     status === "day" ||
     status === "nomination" ||
     status === "defense" ||
@@ -999,6 +1013,15 @@ export function verdictKeyboard(dayNumber: number): InlineKeyboard {
     [
       { text: "⚖️ گناهکار", callback_data: `J${dayNumber}:1` },
       { text: "🕊 بی‌گناه", callback_data: `J${dayNumber}:0` },
+    ],
+  ];
+}
+
+export function inquiryKeyboard(dayNumber: number): InlineKeyboard {
+  return [
+    [
+      { text: "✅ بله", callback_data: `INQ${dayNumber}:1` },
+      { text: "❌ خیر", callback_data: `INQ${dayNumber}:0` },
     ],
   ];
 }
@@ -1898,6 +1921,35 @@ export function resolveVerdict(votes: VerdictVote[], dayNumber: number): Verdict
   return { guilty, innocent, result: guilty > innocent ? "guilty" : "innocent" };
 }
 
+export interface InquiryResolution {
+  yes: number;
+  no: number;
+  tied: boolean;
+  approved: boolean;
+}
+
+// The threshold is a majority of ALL living players, not just those who
+// bothered to vote. Comparing yes-votes to no-votes alone would let a
+// single voter (e.g. one mafia player deliberately spamming "بله" while
+// everyone else stays silent) force an approval and burn the town's
+// limited inquiry count for no reason. Requiring yes > half of the alive
+// roster means real turnout is needed before anything gets revealed.
+// An exact half (a genuine deadlock) is its own silent outcome — the
+// caller must not announce a tally when tied.
+export function resolveInquiry(votes: InquiryVote[], dayNumber: number, aliveCount: number): InquiryResolution {
+  const dayVotes = votes.filter((v) => v.dayNumber === dayNumber);
+  let yes = 0;
+  let no = 0;
+  for (const v of dayVotes) {
+    if (v.choice) yes += 1;
+    else no += 1;
+  }
+  const half = aliveCount / 2;
+  const tied = yes === half;
+  const approved = yes > half;
+  return { yes, no, tied, approved };
+}
+
 
 // =============================================================================
 // MESSAGES
@@ -2131,9 +2183,8 @@ export const fa = {
     return ["🌤 <b>صبح شد</b>", "", ...lines].join("\n");
   },
 
-  playerDied(name: string, userId: number, role: RoleId, indieRole: IndependentRoleId | null | undefined, reason: string): string {
-    const roleStr = indieRole ? `${INDEPENDENT_ROLES[indieRole].emoji} ${INDEPENDENT_ROLES[indieRole].name}` : roleLabel(role);
-    return `💀 ${mention(userId, name)} از بازی حذف شد.\nعلت: ${reason}\nنقش: <b>${roleStr}</b>`;
+  playerDied(name: string, userId: number, team: Team | null, reason: string): string {
+    return `💀 ${mention(userId, name)} از بازی حذف شد.\nعلت: ${reason}\nسمت: <b>${teamLabel(team)}</b>`;
   },
 
   reasonMafia: "حملهٔ مافیا",
@@ -2236,7 +2287,7 @@ export const fa = {
     return guilty ? "🗳 رأی شما ثبت شد: <b>گناهکار</b>" : "🗳 رأی شما ثبت شد: <b>بی‌گناه</b>";
   },
 
-  verdictResult(name: string, userId: number, res: VerdictResolution, role: RoleId): string {
+  verdictResult(name: string, userId: number, res: VerdictResolution, team: Team | null): string {
     const lines = [
       `⚖️ <b>نتیجهٔ دادگاه</b>`,
       "",
@@ -2245,7 +2296,7 @@ export const fa = {
     ];
     if (res.result === "guilty") {
       lines.push(`💀 ${mention(userId, name)} گناهکار شناخته شد و اعدام شد.`);
-      lines.push(`نقش: <b>${roleLabel(role)}</b>`);
+      lines.push(`سمت: <b>${teamLabel(team)}</b>`);
     } else {
       lines.push(`🕊 ${mention(userId, name)} تبرئه شد و به بازی برمی‌گردد.`);
     }
@@ -2445,12 +2496,51 @@ export const fa = {
   lonewolfResult(result: string): string {
     return `🔎 نتیجه استعلام:\n<b>${result}</b>`;
   },
+
+  cityInquiryPrompt(seconds: number, remaining: number, aliveCount: number): string {
+    const needed = Math.floor(aliveCount / 2) + 1;
+    return [
+      "🔎 <b>آیا می‌خواهید استعلام بگیرید؟</b>",
+      "",
+      "با موافقت شهر، نقش کسانی که امروز حذف شدند فاش می‌شود.",
+      "فقط بازیکنان زندهٔ بازی می‌توانند رأی بدهند.",
+      `برای تأیید، حداقل <b>${needed}</b> نفر از ${aliveCount} بازیکن زنده باید «بله» بزنند؛ فقط بله‌زدن یک یا چند نفر کافی نیست.`,
+      `تعداد استعلام باقی‌ماندهٔ شهر: <b>${remaining}</b>`,
+      "",
+      `⏱ ${seconds} ثانیه`,
+    ].join("\n");
+  },
+
+  cityInquiryNotAllowed: "شما نمی‌توانید در این رأی‌گیری نظر دهید.",
+
+  cityInquiryApproved(deaths: DeathRecord[], players: Player[], remaining: number): string {
+    const lines = deaths.map((d) => {
+      const p = findPlayer(players, d.userId);
+      const name = p ? p.displayName : "؟";
+      const roleStr = d.revealedIndependentRole
+        ? `${INDEPENDENT_ROLES[d.revealedIndependentRole].emoji} ${INDEPENDENT_ROLES[d.revealedIndependentRole].name}`
+        : roleLabel(d.revealedRole);
+      return `• ${mention(d.userId, name)} — <b>${roleStr}</b>`;
+    });
+    return [
+      "🔎 <b>نتیجهٔ استعلام</b>",
+      "",
+      "شهر رأی به استعلام داد. نقش بازیکنانی که امروز حذف شدند فاش شد:",
+      "",
+      ...lines,
+      "",
+      `استعلام باقی‌ماندهٔ شهر: ${remaining}`,
+    ].join("\n");
+  },
+
+  cityInquiryDeclined: "🔎 شهر رأی به استعلام نداد.",
 };
 
 export function phaseFa(phase: string): string {
   switch (phase) {
     case "lobby": return "لابی";
     case "night": return "شب";
+    case "inquiry": return "رأی‌گیری استعلام";
     case "day": return "روز / بحث";
     case "nomination": return "معرفی متهم";
     case "defense": return "دفاعیه دادگاه";
@@ -2690,6 +2780,8 @@ export async function deleteLobbyPlayersNotIn(db: D1Database, gameId: string, us
 
 const EXTEND_SECONDS = 60;
 const DEFENSE_SECONDS = 30;
+const INQUIRY_SECONDS = 15;
+const CITY_INQUIRY_TOTAL = 2;
 
 const COURT_ADMIN_MINIMAL_RIGHTS: Record<string, boolean> = {
   is_anonymous: false,
@@ -3023,6 +3115,16 @@ export class GameRoom extends DurableObject<Env> {
         return;
       }
 
+      // City inquiry callbacks
+      const inquiry = /^INQ(\d+):([01])$/.exec(data);
+      if (inquiry) {
+        const dayNumber = Number(inquiry[1]);
+        const choice = inquiry[2] === "1";
+        const result = await this.applyInquiryVote(user.id, dayNumber, choice);
+        await this.tg.answerCallbackQuery(cq.id, result.alert ? result.text : undefined, result.alert);
+        return;
+      }
+
       await this.tg.answerCallbackQuery(cq.id);
     } catch (err) {
       console.error("callback", err);
@@ -3143,6 +3245,7 @@ export class GameRoom extends DurableObject<Env> {
       hostId: from.id, status: "lobby", phase: "lobby", dayNumber: 0, nightNumber: 0,
       phaseEndsAt: ts + DEFAULT_CONFIG.lobbySeconds * 1000, dayPhaseMaxEndsAt: null, reminderAt: null, nextTickAt: null,
       alarmKind: "phase_end", players: [host], nightActions: [], votes: [], verdictVotes: [],
+      inquiryVotes: [], cityInquiryCount: CITY_INQUIRY_TOTAL, pendingInquiryDeaths: null,
       accusedUserId: null, temporaryCourtAdminUserId: null, silencedUserIds: [], blockedUserIds: [],
       escortBlockedUserIds: [], doctorSelfHealUsedBy: [], sniperShotsLeft: {}, detectiveChecked: {},
       natoChancesLeft: 3, paranoidAlertLeft: 2, bomberMarkedTargets: [], independentRoleType: null,
@@ -3533,7 +3636,7 @@ export class GameRoom extends DurableObject<Env> {
       const p = findPlayer(game.players, id);
       return p ? mention(p.userId, p.displayName) : null;
     }).filter(Boolean).join("، ");
-    const sent = await this.group(`${resolutionText}\n\n${fa.dayStart(game.dayNumber, secs, silenced || null)}`, { reply_markup: { inline_keyboard: dayHostKeyboard() } });
+    const sent = await this.group(resolutionText ? `${resolutionText}\n\n${fa.dayStart(game.dayNumber, secs, silenced || null)}` : fa.dayStart(game.dayNumber, secs, silenced || null), { reply_markup: { inline_keyboard: dayHostKeyboard() } });
     if (sent) await this.pin(sent.message_id);
     await this.sendGunnerPanels();
   }
@@ -3629,6 +3732,7 @@ export class GameRoom extends DurableObject<Env> {
     if (!game) return;
     if (game.status === "lobby") { await this.cancelInternal(fa.lobbyExpired); return; }
     if (game.status === "night") { await this.resolveNightPhase(); return; }
+    if (game.status === "inquiry") { await this.resolveInquiryPhase(); return; }
     if (game.status === "day") { await this.enterNomination(); return; }
     if (game.status === "nomination") { await this.resolveNominationPhase(); return; }
     if (game.status === "defense") { await this.resolveDefensePhase(); return; }
@@ -3727,10 +3831,82 @@ export class GameRoom extends DurableObject<Env> {
         const p = findPlayer(game.players, d.userId);
         if (!p) continue;
         const reason = this.getDeathReasonText(d.reason);
-        lines.push(fa.playerDied(p.displayName, p.userId, d.revealedRole, d.revealedIndependentRole, reason));
+        lines.push(fa.playerDied(p.displayName, p.userId, p.team, reason));
       }
     }
-    await this.enterDay(fa.nightReport(lines));
+    await this.group(fa.nightReport(lines));
+
+    // If the night's deaths already ended the game, skip the inquiry vote
+    // and finish directly — the morning report above already covers the
+    // "someone tell me who died" need, no point locking the group for a
+    // vote nobody will get to act on.
+    const winner = checkWinner(game.players);
+    if (winner) { await this.finish(winner); return; }
+    const indieWinner = checkIndependentWinner(game.players, game);
+    if (indieWinner) { await this.finish(indieWinner); return; }
+
+    if (res.deaths.length > 0 && game.cityInquiryCount > 0) {
+      await this.startInquiry(res.deaths, game.dayNumber);
+    } else {
+      await this.enterDay("");
+    }
+  }
+
+  private async startInquiry(deaths: DeathRecord[], dayNumber: number): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    game.status = "inquiry";
+    game.phase = "inquiry";
+    game.pendingInquiryDeaths = deaths;
+    game.inquiryVotes = game.inquiryVotes.filter((v) => v.dayNumber !== dayNumber);
+    game.phaseEndsAt = now() + INQUIRY_SECONDS * 1000;
+    game.reminderAt = null;
+    game.nextTickAt = null;
+    // Group stays locked from the night phase — we simply keep it that way
+    // for a few more seconds instead of unlocking early.
+    await this.persist(true);
+    await this.schedulePhaseTimers();
+    await this.group(fa.cityInquiryPrompt(INQUIRY_SECONDS, game.cityInquiryCount, living(game.players).length), {
+      reply_markup: { inline_keyboard: inquiryKeyboard(dayNumber) },
+    });
+  }
+
+  private async resolveInquiryPhase(): Promise<void> {
+    const game = this.game;
+    if (!game || game.status !== "inquiry") return;
+    game.status = "resolving";
+    game.phase = "resolving";
+    await this.persist();
+
+    const dayNumber = game.dayNumber;
+    const res = resolveInquiry(game.inquiryVotes, dayNumber, living(game.players).length);
+    const deaths = game.pendingInquiryDeaths ?? [];
+    game.pendingInquiryDeaths = null;
+    game.inquiryVotes = game.inquiryVotes.filter((v) => v.dayNumber !== dayNumber);
+
+    let resolutionText = "";
+    if (res.approved) {
+      game.cityInquiryCount = Math.max(0, game.cityInquiryCount - 1);
+      resolutionText = fa.cityInquiryApproved(deaths, game.players, game.cityInquiryCount);
+    } else if (!res.tied) {
+      resolutionText = fa.cityInquiryDeclined;
+    }
+    // A tie stays silent by design — no tally is announced either way.
+
+    await this.persist(true);
+    await addEvent(this.env.DB, game.id, "inquiry_resolved", res);
+    await this.enterDay(resolutionText);
+  }
+
+  private async applyInquiryVote(userId: number, dayNumber: number, choice: boolean): Promise<{ text: string; alert: boolean }> {
+    const game = this.game;
+    if (!game || game.status !== "inquiry" || game.dayNumber !== dayNumber) return { text: fa.staleAction, alert: true };
+    const player = findPlayer(game.players, userId);
+    if (!player || player.status !== "alive") return { text: fa.cityInquiryNotAllowed, alert: true };
+    game.inquiryVotes = game.inquiryVotes.filter((v) => !(v.voterId === userId && v.dayNumber === dayNumber));
+    game.inquiryVotes.push({ voterId: userId, choice, dayNumber, at: now() });
+    await this.persist();
+    return { text: choice ? "رأی شما ثبت شد: بله" : "رأی شما ثبت شد: خیر", alert: false };
   }
 
   private getDeathReasonText(reason: DeathReason): string {
@@ -3818,7 +3994,7 @@ export class GameRoom extends DurableObject<Env> {
     game.silencedUserIds = [];
     await this.persist(true);
     await addEvent(this.env.DB, game.id, "verdict_resolved", res);
-    if (accused && stillAlive) await this.group(fa.verdictResult(accused.displayName, accused.userId, res, accused.role!));
+    if (accused && stillAlive) await this.group(fa.verdictResult(accused.displayName, accused.userId, res, accused.team));
 
     let winner = checkWinner(game.players);
     if (winner) { await this.finish(winner); return; }
@@ -4017,7 +4193,7 @@ export class GameRoom extends DurableObject<Env> {
     game.players = applyDeaths(game.players, [{ userId: target.userId, reason: "gunner", revealedRole: target.role!, revealedIndependentRole: target.independentRole ?? undefined }], "day", game.dayNumber);
     await this.mutePlayer(target.userId);
     await this.persist(true);
-    await this.group(fa.playerDied(target.displayName, target.userId, target.role!, target.independentRole, fa.reasonGunner));
+    await this.group(fa.playerDied(target.displayName, target.userId, target.team, fa.reasonGunner));
 
     let winner = checkWinner(game.players);
     if (winner) { await this.finish(winner); return { text: "شلیک انجام شد", alert: false }; }
@@ -4269,7 +4445,7 @@ export class GameRoom extends DurableObject<Env> {
     game.players = applyDeaths(game.players, [{ userId, reason, revealedRole: p.role, revealedIndependentRole: p.independentRole }], game.phase, game.phase === "night" ? game.nightNumber : game.dayNumber);
     await this.mutePlayer(userId);
     await this.persist(true);
-    await this.group(fa.playerDied(p.displayName, p.userId, p.role, p.independentRole, reason === "left" ? fa.reasonLeft : fa.reasonLynch));
+    await this.group(fa.playerDied(p.displayName, p.userId, p.team, reason === "left" ? fa.reasonLeft : fa.reasonLynch));
     let winner = checkWinner(game.players);
     if (winner) await this.finish(winner);
   }
@@ -4737,6 +4913,9 @@ export class GameRoom extends DurableObject<Env> {
       nightActions,
       votes,
       verdictVotes: [], // not persisted to D1; unavoidable gap on cold recovery
+      inquiryVotes: [], // not persisted to D1; unavoidable gap on cold recovery
+      cityInquiryCount: CITY_INQUIRY_TOTAL,
+      pendingInquiryDeaths: null,
       accusedUserId: null,
       temporaryCourtAdminUserId: null,
       silencedUserIds: [],

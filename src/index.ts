@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS games (
   started_at INTEGER,
   finished_at INTEGER,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  state_json TEXT,
+  last_group_message_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_games_chat_status ON games(chat_id, status);
 CREATE TABLE IF NOT EXISTS game_players (
@@ -98,6 +100,24 @@ async function ensureSchema(db: D1Database): Promise<void> {
     .filter(Boolean)
     .map((s) => db.prepare(s));
   await db.batch(statements);
+  // FIX #2: `games` may already exist from before `state_json` /
+  // `last_group_message_id` were introduced. CREATE TABLE IF NOT EXISTS above
+  // won't add columns to an already-existing table, so migrate it explicitly.
+  // ALTER TABLE ... ADD COLUMN has no "IF NOT EXISTS" form in SQLite, so we
+  // probe for the column and swallow the "duplicate column" error if a
+  // concurrent DO instance already added it.
+  try {
+    const cols = await db.prepare(`PRAGMA table_info(games)`).all<{ name: string }>();
+    const names = new Set((cols.results ?? []).map((c) => c.name));
+    const migrations: string[] = [];
+    if (!names.has("state_json")) migrations.push(`ALTER TABLE games ADD COLUMN state_json TEXT`);
+    if (!names.has("last_group_message_id")) migrations.push(`ALTER TABLE games ADD COLUMN last_group_message_id INTEGER`);
+    for (const sql of migrations) {
+      try { await db.prepare(sql).run(); } catch (err) { console.error("ensureSchema: migration failed", sql, err); }
+    }
+  } catch (err) {
+    console.error("ensureSchema: column probe failed", err);
+  }
 }
 
 
@@ -1208,33 +1228,37 @@ export function assignRoles(players: Player[]): Player[] {
   const indieIndex = Math.floor(Math.random() * indieRoles.length);
   const indieRole = indieRoles[indieIndex];
 
-  // The independent player still needs *some* RoleId on their Player object (lots of the
-  // game logic, e.g. markDead/nightActionTypesFor, assumes role is non-null for anyone
-  // alive), but it must not silently duplicate a role that's already "live" for someone
-  // else in a way that affects composition — so we duplicate a random entry already in
-  // the pool purely as flavor, and separately force team below so it never counts toward
-  // mafia/town for win checks, teammate lists, etc.
-  const flavorRole = roleList[Math.floor(Math.random() * roleList.length)];
-  const fullRoleList = [...roleList, flavorRole];
-
-  // Shuffle players and roles
+  // BUGFIX: roleList (playerCount - 1 distinct roles) and the shuffled
+  // player order used to be paired up by shuffling BOTH a "roleList + one
+  // random duplicate" array and the players array independently, then
+  // assuming the duplicate would land on the last (independent) player.
+  // Since the two shuffles are independent, that's only true ~2/N of the
+  // time; the rest of the time some real town/mafia role went missing
+  // entirely (assigned to the independent slot) while a different role got
+  // duplicated onto two real players — breaking the intended composition
+  // (e.g. a game with no real Doctor, or two Detectives).
+  //
+  // Fix: assign roleList 1:1 to the first (playerCount - 1) shuffled
+  // players ONLY, so every intended role always exists exactly once among
+  // real town/mafia players. The last shuffled player always becomes the
+  // independent role; their `.role` field is purely cosmetic flavor text
+  // (night-action logic and win-checks key off `independentRole`/`team`,
+  // never off `.role` for independent players) and can't disturb the real
+  // composition since it never consumes a roleList slot.
   const shuffledPlayers = shuffle([...players]);
-  const shuffledRoles = shuffle(fullRoleList);
+  const shuffledRoles = shuffle([...roleList]);
+  const flavorRole = roleList[Math.floor(Math.random() * roleList.length)]!;
 
-  // Assign roles
   const assigned = shuffledPlayers.map((p, i) => {
-    const role = shuffledRoles[i];
-    const def = ROLES[role];
-
-    // Last player gets the independent role
     const isIndie = i === players.length - 1;
-    const actualIndieRole = isIndie ? indieRole : null;
+    const role = isIndie ? flavorRole : shuffledRoles[i]!;
+    const def = ROLES[role];
 
     return {
       ...p,
       role,
       team: isIndie ? "independent" : def.team,
-      independentRole: actualIndieRole,
+      independentRole: isIndie ? indieRole : null,
     };
   });
 
@@ -1325,6 +1349,27 @@ export function checkIndependentWinner(players: Player[], game: GameState): Team
   }
   
   return null;
+}
+
+// BUGFIX: Johnny ("survive until town wins") and Bomber ("survive until
+// town or mafia wins") both win by being alive when the OTHER team's
+// win is declared — a case distinct from the "last one standing" outright
+// independent win already handled by checkIndependentWinner. Because their
+// `team` is forced to "independent" (so they never count toward mafia/town
+// totals), a plain `p.team === winner` check never credits them even though
+// they met their own stated win condition. This returns the userIds of any
+// such players so callers (stats + the game-over announcement) can credit
+// and display them alongside the declared team winner instead of silently
+// leaving them out.
+export function getSharedWinnerIds(players: Player[], winner: Team): number[] {
+  return players
+    .filter((p) => p.status === "alive" && p.independentRole)
+    .filter((p) => {
+      if (p.independentRole === "johnny") return winner === "town";
+      if (p.independentRole === "bomber") return winner === "town" || winner === "mafia";
+      return false;
+    })
+    .map((p) => p.userId);
 }
 
 export function dayDurationSeconds(game: GameState): number {
@@ -1897,6 +1942,8 @@ export const fa = {
   },
 
   gameAlreadyRunning: "در این گروه الان یک بازی فعال است.",
+  startGameFailed: "شروع بازی با خطا مواجه شد و بازی به‌صورت خودکار لغو شد. لطفاً دوباره /startgame یا /new را امتحان کنید.",
+  joinFailedTransient: "⚠️ ورود شما به لابی با یک خطای موقت مواجه شد. لطفاً دوباره امتحان کنید.",
   lobbyCreateFailed: "⚠️ ساخت لابی به مشکل خورد. لطفاً دوباره /new را بزنید.",
   lobbyOnlyHere: "این دستور را در گروه بزنید.",
   resetAdminOnly: "برای ریست کردن بات در این گروه باید ادمین باشید.",
@@ -2172,13 +2219,22 @@ export const fa = {
     return lines.join("\n");
   },
 
-  gameOver(winner: Team, players: Player[], indieRole: IndependentRoleId | null): string {
+  gameOver(winner: Team, players: Player[], indieRole: IndependentRoleId | null, sharedWinnerIds: number[] = []): string {
     let title: string;
     if (winner === "town") title = "🏆 <b>شهروندان برنده شدند</b>";
     else if (winner === "mafia") title = "🏆 <b>مافیا برنده شد</b>";
     else title = "🏆 <b>نقش مستقل برنده شد</b>";
     
     const indieLine = indieRole ? `\n🎭 نقش مستقل: ${INDEPENDENT_ROLES[indieRole].emoji} ${INDEPENDENT_ROLES[indieRole].name}` : "";
+
+    // BUGFIX: Johnny/Bomber can win *alongside* the announced team winner by
+    // surviving to see it happen — call that out explicitly so it's not lost
+    // in the roster below.
+    const sharedSet = new Set(sharedWinnerIds);
+    const sharedNames = players.filter((p) => sharedSet.has(p.userId)).map((p) => esc(p.displayName));
+    const sharedLine = sharedNames.length
+      ? `\n🎉 ${sharedNames.join("، ")} هم با زنده ماندن تا این لحظه، در این برد سهیم است.`
+      : "";
     
     const list = players
       .map((p) => {
@@ -2186,7 +2242,8 @@ export const fa = {
         const roleStr = p.independentRole 
           ? `${INDEPENDENT_ROLES[p.independentRole].emoji} ${INDEPENDENT_ROLES[p.independentRole].name}`
           : roleLabel(p.role);
-        return `${mark} ${esc(p.displayName)} — ${roleStr}`;
+        const winTag = sharedSet.has(p.userId) ? " 🏆" : "";
+        return `${mark} ${esc(p.displayName)} — ${roleStr}${winTag}`;
       })
       .join("\n");
       
@@ -2194,6 +2251,7 @@ export const fa = {
       "🏁 <b>پایان بازی</b>",
       title,
       indieLine,
+      sharedLine,
       "",
       "<b>نقش همه بازیکنان:</b>",
       list,
@@ -2284,6 +2342,18 @@ export const fa = {
   restored: "وضعیت گروه بازیابی شد.",
   cannotMuteAdmin(name: string): string {
     return `⚠️ ${esc(name)} ادمین گروه است و بات نمی‌تواند او را میوت کند. بهتر است ادمین‌ها موقتاً دسترسی ادمین را کنار بگذارند.`;
+  },
+  restrictionsFailed(names: string[]): string {
+    return `⚠️ تنظیم دسترسی این بازیکن(ها) با خطا مواجه شد: ${names.map(esc).join("، ")}. لطفاً دسترسی ادمین بات را بررسی کنید.`;
+  },
+  roleCardsFailed(names: string[]): string {
+    return `⚠️ ارسال کارت نقش برای این بازیکن(ها) با خطا مواجه شد (احتمالاً بات را بلاک کرده‌اند): ${names.map(esc).join("، ")}.\nاین بازیکن‌ها می‌توانند با دستور /myrole در پیوی نقش خود را دریافت کنند.`;
+  },
+  defenseSkippedNoPromote(name: string, userId: number): string {
+    return `⚖️ ${mention(userId, name)} به دادگاه احضار شد، اما چون بات دسترسی «ارتقاء اعضا» ندارد، مرحله‌ی دفاعیه رد می‌شود و مستقیم به رأی‌گیری نهایی می‌رویم.`;
+  },
+  courtDemotionFailed(name: string): string {
+    return `⚠️ حذف دسترسی موقت دادگاه ${esc(name)} با خطا مواجه شد. بازی ادامه پیدا می‌کند، اما لطفاً دسترسی ادمین این کاربر را دستی بررسی کنید.`;
   },
 
   // Independent role prompts
@@ -2443,12 +2513,20 @@ export async function cancelActiveGamesForChat(db: D1Database, chatId: number): 
 }
 
 export async function persistGame(db: D1Database, game: GameState): Promise<void> {
+  // FIX #2: persist the *entire* GameState as a single JSON blob (state_json),
+  // in addition to the individual queryable columns. The individual columns
+  // remain for indexing/listing (idx_games_chat_status, admin queries, stats),
+  // but recoverFromD1 now rehydrates from state_json so that fields like
+  // verdictVotes, sniperShotsLeft, natoChancesLeft, paranoidAlertLeft,
+  // invincibleShieldHits, gunnerGuns, doctorSelfHealUsedBy,
+  // bomberMarkedTargets, escortBlockedUserIds and blockedUserIds are never
+  // silently reset to defaults after a Durable Object eviction/restart.
   await db.prepare(
     `INSERT INTO games (
        id, chat_id, chat_title, host_id, status, phase, day_number, night_number,
        winner, player_count, config_json, saved_default_permissions, phase_ends_at,
-       started_at, finished_at, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       started_at, finished_at, created_at, updated_at, state_json, last_group_message_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        chat_title = excluded.chat_title,
        host_id = excluded.host_id,
@@ -2463,12 +2541,15 @@ export async function persistGame(db: D1Database, game: GameState): Promise<void
        phase_ends_at = excluded.phase_ends_at,
        started_at = excluded.started_at,
        finished_at = excluded.finished_at,
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at,
+       state_json = excluded.state_json,
+       last_group_message_id = excluded.last_group_message_id`,
   ).bind(
     game.id, game.chatId, game.chatTitle, game.hostId, game.status, game.phase, game.dayNumber, game.nightNumber,
     game.winner, game.players.length, JSON.stringify(game.config),
     game.savedDefaultPermissions ? JSON.stringify(game.savedDefaultPermissions) : null,
     game.phaseEndsAt, game.startedAt, game.finishedAt, game.createdAt, game.updatedAt,
+    JSON.stringify(game), game.lastGroupMessageId,
   ).run();
 }
 
@@ -2548,9 +2629,12 @@ export async function addEvent(db: D1Database, gameId: string, eventType: string
   ).bind(gameId, eventType, JSON.stringify(payload), Date.now()).run();
 }
 
-export async function recordFinishStats(db: D1Database, players: Player[], winner: Team | null): Promise<void> {
+export async function recordFinishStats(
+  db: D1Database, players: Player[], winner: Team | null, sharedWinnerIds: number[] = [],
+): Promise<void> {
+  const shared = new Set(sharedWinnerIds);
   for (const p of players) {
-    const won = winner && p.team === winner ? 1 : 0;
+    const won = (winner && p.team === winner) || shared.has(p.userId) ? 1 : 0;
     await db.prepare(
       `UPDATE users SET games_played = games_played + 1, games_won = games_won + ?, updated_at = ? WHERE telegram_id = ?`,
     ).bind(won, Date.now(), p.userId).run();
@@ -2637,7 +2721,21 @@ export class GameRoom extends DurableObject<Env> {
     try {
       if (!this.game) {
         const chatId = inferChatId(update);
-        if (chatId) await this.recoverFromD1(chatId);
+        if (chatId) {
+          await this.recoverFromD1(chatId);
+        } else {
+          // BUGFIX: inferChatId never resolves a group chat id for private
+          // (DM) updates, so a private message/callback arriving at a room
+          // whose own Durable Object storage came up empty (e.g. a brand
+          // new instance) previously never even attempted D1 recovery and
+          // would incorrectly report "no active game". Fall back to
+          // resolving the sender's active game via D1 directly.
+          const from = update.message?.from ?? update.callback_query?.from;
+          if (from) {
+            const active = await findActiveGameForUser(this.env.DB, from.id);
+            if (active) await this.recoverFromD1(active.chat_id);
+          }
+        }
       }
       if (update.callback_query) {
         await this.onCallback(update.callback_query);
@@ -2912,9 +3010,20 @@ export class GameRoom extends DurableObject<Env> {
       const me = await this.ensureBotIdentity();
       await this.tg.sendMessage(upd.chat.id, fa.botAdded(me?.username || "Mafia Bot"));
     }
-    if (this.game && isPlayingStatus(this.game.status) && next.user.id === this.game.botId &&
-        (next.status === "left" || next.status === "kicked" || next.status === "member")) {
-      await this.group("⚠️ دسترسی ادمین بات برداشته شد. مدیریت گروه متوقف می‌شود تا دوباره ادمین شوم.");
+    // FIX #6: previously this only warned when the bot lost admin/was removed
+    // mid-game, without actually cancelling the game. Since the bot can no
+    // longer manage permissions or send restricted-group messages once it's
+    // no longer in the chat (or lost admin), leaving the game "playing" just
+    // locks the group in whatever state it was in until someone manually
+    // resets it. Auto-cancel so the game's own bookkeeping is cleared and a
+    // fresh /new works once the bot is re-added/re-promoted.
+    if (this.game && isPlayingStatus(this.game.status) && next.user.id === this.game.botId) {
+      if (next.status === "left" || next.status === "kicked") {
+        await this.cancelInternal("بات از گروه حذف شد.");
+      } else if (next.status === "member") {
+        await this.group("⚠️ دسترسی ادمین بات برداشته شد. مدیریت گروه متوقف می‌شود تا دوباره ادمین شوم.");
+        await this.cancelInternal("دسترسی ادمین بات در حین بازی برداشته شد.");
+      }
     }
   }
 
@@ -3033,8 +3142,12 @@ export class GameRoom extends DurableObject<Env> {
     newGame.lastGroupMessageId = sent.message_id;
     this.game = newGame;
 
+    // FIX #6: this used to call persist(true) twice back-to-back (once right
+    // after creating the game, once again at the end) which double-writes D1
+    // on every /new for no benefit. pin() and refreshLobbyMessage() only
+    // mutate in-memory fields (pinnedMessageId / lastGroupMessageId) — a
+    // single persist(true) once everything is settled is enough.
     await upsertUser(this.env.DB, from, false);
-    await this.persist(true);
     await this.scheduleAlarm(this.game.phaseEndsAt ?? ts + DEFAULT_CONFIG.lobbySeconds * 1000);
     await this.pin(sent.message_id);
     await this.refreshLobbyMessage();
@@ -3110,13 +3223,25 @@ export class GameRoom extends DurableObject<Env> {
     const already = await findActiveGameForUser(this.env.DB, from.id);
     if (already && already.chat_id !== chatId) { await this.tg.sendMessage(chatId, fa.alreadyInGame(this.game?.chatTitle || "گروه دیگر")); return "busy"; }
     if (game.players.length >= game.config.maxPlayers) { await this.tg.sendMessage(chatId, fa.tooMany); return "full"; }
-    game.players.push({
+    const newPlayer: Player = {
       userId: from.id, username: from.username ?? null, firstName: from.first_name,
       displayName: displayOf(from), role: null, team: null, independentRole: null,
       status: "alive", originalMember: null, joinedAt: now(),
-    });
-    await upsertUser(this.env.DB, from, notifyChatId === from.id);
-    await this.persist(true);
+    };
+    game.players.push(newPlayer);
+    // FIX #1: if committing the new player fails partway (D1 write error),
+    // roll the in-memory player list back to what was last successfully
+    // persisted instead of leaving a "ghost" player that the lobby message,
+    // player count and D1 all disagree about.
+    try {
+      await upsertUser(this.env.DB, from, notifyChatId === from.id);
+      await this.persist(true);
+    } catch (err) {
+      console.error("addPlayer: failed to persist new player, rolling back", chatId, from.id, err);
+      game.players = game.players.filter((p) => p.userId !== from.id);
+      await this.tg.sendMessage(chatId, fa.joinFailedTransient).catch(() => {});
+      return "nogame";
+    }
     await this.announce(joinAnnounce(from.id, displayOf(from), game.players.length, game.config.maxPlayers));
     await this.refreshLobbyMessage();
     return "ok";
@@ -3195,39 +3320,54 @@ export class GameRoom extends DurableObject<Env> {
     game.phase = "night";
     await this.persist();
 
-    await this.snapshotPermissions();
-    game.players = assignRoles(game.players);
-    game.startedAt = now();
-    game.nightNumber = 0;
-    game.dayNumber = 0;
-    game.sniperShotsLeft = {};
-    game.natoChancesLeft = 3;
-    game.paranoidAlertLeft = 2;
-    game.bomberMarkedTargets = [];
-    game.invincibleShieldHits = {};
-    game.gunnerGuns = {};
+    // FIX #5: everything from role assignment through the end of the first
+    // night is wrapped in one try/catch. If any step throws (a D1 write
+    // failure, an unexpected error, etc.) the game would otherwise be left
+    // stuck in "starting"/"night" with the group never locked and roles
+    // never sent, with no way for players to recover except a manual /reset.
+    // On any failure here we immediately cancel the game, restore whatever
+    // permissions were already touched, and tell the group so they can just
+    // run /new again.
+    try {
+      await this.snapshotPermissions();
+      game.players = assignRoles(game.players);
+      game.startedAt = now();
+      game.nightNumber = 0;
+      game.dayNumber = 0;
+      game.sniperShotsLeft = {};
+      game.natoChancesLeft = 3;
+      game.paranoidAlertLeft = 2;
+      game.bomberMarkedTargets = [];
+      game.invincibleShieldHits = {};
+      game.gunnerGuns = {};
 
-    // Store independent role type
-    const indie = game.players.find(p => p.independentRole);
-    game.independentRoleType = indie?.independentRole ?? null;
+      // Store independent role type
+      const indie = game.players.find(p => p.independentRole);
+      game.independentRoleType = indie?.independentRole ?? null;
 
-    for (const p of game.players) {
-      if (p.role === "sniper") {
-        game.sniperShotsLeft[String(p.userId)] = sniperShotsFor(game.players.length);
+      for (const p of game.players) {
+        if (p.role === "sniper") {
+          game.sniperShotsLeft[String(p.userId)] = sniperShotsFor(game.players.length);
+        }
       }
+
+      await this.persist(true);
+      await addEvent(this.env.DB, game.id, "game_started", {
+        players: game.players.length,
+        mafia: mafiaCountFor(game.players.length),
+        independentRole: game.independentRoleType,
+      });
+
+      await this.lockGroup();
+      await this.group(fa.gameStarted(game.players.length, mafiaCountFor(game.players.length), game.independentRoleType));
+      await this.sendRoleCards();
+      await this.enterNight();
+    } catch (err) {
+      console.error("cmdStartGame: failed to start game, cancelling", game.id, err);
+      await this.cancelInternal(fa.startGameFailed).catch((cancelErr) => {
+        console.error("cmdStartGame: cancelInternal also failed", game.id, cancelErr);
+      });
     }
-
-    await this.persist(true);
-    await addEvent(this.env.DB, game.id, "game_started", {
-      players: game.players.length,
-      mafia: mafiaCountFor(game.players.length),
-      independentRole: game.independentRoleType,
-    });
-
-    await this.lockGroup();
-    await this.group(fa.gameStarted(game.players.length, mafiaCountFor(game.players.length), game.independentRoleType));
-    await this.sendRoleCards();
-    await this.enterNight();
   }
 
   private async cmdCancel(userId: number, chatId: number, force: boolean): Promise<void> {
@@ -3314,8 +3454,14 @@ export class GameRoom extends DurableObject<Env> {
     const ms = game.config.nightSeconds * 1000;
     game.phaseEndsAt = now() + ms;
     game.reminderAt = game.phaseEndsAt - game.config.reminderLeadSeconds * 1000;
-    await this.lockGroup();
+    // FIX #3: restrict every player individually BEFORE flipping the
+    // chat-wide default permissions. setChatPermissions only affects members
+    // who don't already have an individual permission override, so if the
+    // group-wide lock landed first, any player with a pre-existing override
+    // (e.g. from a previous phase) could still send messages during the gap
+    // between the two calls. Locking players first closes that window.
     await this.relockAllPlayers();
+    await this.lockGroup();
     await this.persist(true);
     await this.schedulePhaseTimers();
     const sent = await this.group(fa.nightStart(game.nightNumber, game.config.nightSeconds));
@@ -3385,8 +3531,11 @@ export class GameRoom extends DurableObject<Env> {
     game.votes = game.votes.filter((v) => v.dayNumber !== game.dayNumber);
     game.phaseEndsAt = now() + game.config.voteSeconds * 1000;
     game.reminderAt = game.phaseEndsAt - game.config.reminderLeadSeconds * 1000;
-    await this.lockGroup();
+    // FIX #3: same ordering fix as enterNight — restrict players first, then
+    // apply the chat-wide default lock, to avoid a gap where a player with an
+    // individual permission override can still post.
     await this.relockAllPlayers();
+    await this.lockGroup();
     await this.persist(true);
     await this.schedulePhaseTimers();
     const sent = await this.group(fa.nominationStart(game.dayNumber, game.config.voteSeconds));
@@ -3401,6 +3550,19 @@ export class GameRoom extends DurableObject<Env> {
     const previousAdminCleared = previousCourtAdminId ? await this.removeTemporaryCourtAdmin(previousCourtAdminId) : true;
     const accused = findPlayer(game.players, accusedUserId);
     if (!accused || accused.status !== "alive") { await this.enterNight(); return; }
+
+    // FIX #4: if the bot can't promote members at all, the whole point of the
+    // defense phase (letting a muted accused speak) can never work. Skip it
+    // and go straight to the verdict vote instead of parking the game in a
+    // "defense" phase nobody can meaningfully use.
+    if (!(await this.botCanPromoteChatMembers(game.chatId))) {
+      game.accusedUserId = accusedUserId;
+      await this.persist(true);
+      await this.group(fa.defenseSkippedNoPromote(accused.displayName, accused.userId));
+      await this.enterVerdict();
+      return;
+    }
+
     game.accusedUserId = accusedUserId;
     game.status = "defense";
     game.phase = "defense";
@@ -3470,12 +3632,17 @@ export class GameRoom extends DurableObject<Env> {
     }
 
 
-    // Bomber marks: clear exploded marks, then add any newly-placed ones
+    // Bomber marks: if the bomb went off this night, the marked targets were
+    // consumed by the explosion, so the list is cleared and NOT repopulated
+    // with same-night marks (a bomber who both marks and detonates in one
+    // night would otherwise have their fresh marks survive the blast).
+    // Only when there was no explosion do newly-placed marks carry forward.
     if (res.bomberExploded) {
       game.bomberMarkedTargets = [];
-    }
-    for (const targetId of res.bomberMarked) {
-      if (!game.bomberMarkedTargets.includes(targetId)) game.bomberMarkedTargets.push(targetId);
+    } else {
+      for (const targetId of res.bomberMarked) {
+        if (!game.bomberMarkedTargets.includes(targetId)) game.bomberMarkedTargets.push(targetId);
+      }
     }
 
     game.silencedUserIds = res.silenced;
@@ -3640,9 +3807,12 @@ export class GameRoom extends DurableObject<Env> {
     await this.ctx.storage.deleteAlarm();
     await this.restoreAllPermissions();
     await this.persist(true);
-    await recordFinishStats(this.env.DB, game.players, winner);
-    await addEvent(this.env.DB, game.id, "finished", { winner });
-    const sent = await this.group(fa.gameOver(winner, game.players, game.independentRoleType));
+    // BUGFIX: credit Johnny/Bomber players who survived to see their side's
+    // win, per their own stated win condition (see getSharedWinnerIds).
+    const sharedWinnerIds = getSharedWinnerIds(game.players, winner);
+    await recordFinishStats(this.env.DB, game.players, winner, sharedWinnerIds);
+    await addEvent(this.env.DB, game.id, "finished", { winner, sharedWinnerIds });
+    const sent = await this.group(fa.gameOver(winner, game.players, game.independentRoleType, sharedWinnerIds));
     if (sent) await this.pin(sent.message_id);
   }
 
@@ -3723,12 +3893,19 @@ export class GameRoom extends DurableObject<Env> {
     const target = findPlayer(game.players, targetId);
     if (!target || target.status !== "alive") return { text: fa.targetNotInGame, alert: true };
 
-    // Send role selection panel
+    // Send role selection panel. A "skip this night" button is included here
+    // too: without it, a player who backs out at the role-selection step
+    // never registers any night action at all (applyNatoRoleGuess is the
+    // only place that pushes one), so hasFinishedAllNightActions would never
+    // count NATO as done and the night would never end. The skip button
+    // reuses the generic N{night}:nato_guess:0 route handled by
+    // applyNightAction, which records a proper "skipped" action.
     const townRoles = getTownRoles();
     const keyboard: InlineKeyboard = townRoles.map((roleId) => {
       const roleDef = ROLES[roleId];
       return [{ text: `${roleDef.emoji} ${roleDef.name}`, callback_data: `NR${nightNumber}:${targetId}:${roleId}` }];
     });
+    keyboard.push([{ text: "⏭ رد کردن این شب", callback_data: `N${nightNumber}:nato_guess:0` }]);
 
     await this.pm(userId, fa.natoSelectRole(target.displayName), chunk(keyboard, 2) as InlineKeyboard);
     return { text: `بازیکن <b>${target.displayName}</b> انتخاب شد. حالا نقش او را حدس بزنید.`, alert: false };
@@ -3867,6 +4044,11 @@ export class GameRoom extends DurableObject<Env> {
     game.verdictVotes = game.verdictVotes.filter((v) => !(v.voterId === userId && v.dayNumber === dayNumber));
     game.verdictVotes.push({ voterId: userId, guilty, weight, dayNumber, at: now() });
     await this.persist();
+    // BUGFIX: this write to the dedicated verdict_votes table was missing,
+    // so verdict votes only ever lived inside the state_json snapshot. If
+    // that snapshot were ever unparseable, votes cast in the current
+    // verdict phase had nowhere else to be recovered from.
+    await persistVerdictVote(this.env.DB, game.id, dayNumber, userId, guilty, weight);
     await this.pm(userId, fa.verdictSaved(guilty));
     if (hasFinishedVerdict(game)) {
       game.phaseEndsAt = Math.min(game.phaseEndsAt ?? now() + 2000, now() + 2000);
@@ -3889,9 +4071,14 @@ export class GameRoom extends DurableObject<Env> {
         return this.pm(p.userId, fa.roleCard(p, mates));
       }),
     );
-    const failed = results.filter((r) => r.status === "rejected").length;
-    if (failed > 0) {
-      console.warn(`sendRoleCards: ${failed}/${game.players.length} players did not receive their role card`);
+    const failedPlayers = game.players.filter((_, i) => results[i]?.status === "rejected");
+    if (failedPlayers.length > 0) {
+      console.warn(`sendRoleCards: ${failedPlayers.length}/${game.players.length} players did not receive their role card`, failedPlayers.map((p) => p.userId));
+      // FIX #8: report the list of players who didn't get their role card to
+      // the group/host instead of only logging it, so the host knows who
+      // might need to run /myrole manually rather than silently wondering
+      // why someone never acted at night.
+      await this.group(fa.roleCardsFailed(failedPlayers.map((p) => p.displayName)));
     }
   }
 
@@ -4094,9 +4281,27 @@ export class GameRoom extends DurableObject<Env> {
     }
     if (membership.ok && membership.result.status === "creator") { console.error("court demotion refused for chat creator", game.id, temporaryId); return false; }
 
-    let demoted = await this.tg.callSafe("promoteChatMember", { chat_id: game.chatId, user_id: temporaryId, ...COURT_ADMIN_NO_RIGHTS });
-    if (!demoted.ok) { await sleep(200); demoted = await this.tg.callSafe("promoteChatMember", { chat_id: game.chatId, user_id: temporaryId, ...COURT_ADMIN_NO_RIGHTS }); }
-    if (!demoted.ok) { console.error("court temporary demotion failed", game.id, temporaryId, demoted.error.description); return false; }
+    // FIX #4: retry the demotion a few times with a short backoff before
+    // giving up. If it still fails (network hiccup, Telegram rate limit,
+    // etc.) don't leave the game stuck waiting on it forever — report the
+    // problem to the group and clear our own bookkeeping so play can
+    // continue. The user stays a Telegram admin until a host manually fixes
+    // it, but the *game* is never blocked by that.
+    let demotionError: string | null = null;
+    let demotedOk = false;
+    for (let attempt = 0; attempt < 3 && !demotedOk; attempt++) {
+      const demoted = await this.tg.callSafe("promoteChatMember", { chat_id: game.chatId, user_id: temporaryId, ...COURT_ADMIN_NO_RIGHTS });
+      demotedOk = demoted.ok;
+      demotionError = demoted.ok ? null : demoted.error.description;
+      if (!demotedOk && attempt < 2) await sleep(300 * (attempt + 1));
+    }
+    if (!demotedOk) {
+      console.error("court temporary demotion failed after retries", game.id, temporaryId, demotionError ?? "unknown");
+      game.temporaryCourtAdminUserId = null;
+      try { await this.persist(); } catch (err) { console.error("court demotion marker persist failed", game.id, temporaryId, err); }
+      await this.group(fa.courtDemotionFailed(findPlayer(game.players, temporaryId)?.displayName ?? String(temporaryId)));
+      return false;
+    }
 
     game.temporaryCourtAdminUserId = null;
     try { await this.persist(); } catch (err) { console.error("court demotion marker persist failed", game.id, temporaryId, err); }
@@ -4121,27 +4326,36 @@ export class GameRoom extends DurableObject<Env> {
     await this.tg.callSafe("setChatPermissions", { chat_id: game.chatId, permissions: LOCKED_PERMISSIONS, use_independent_chat_permissions: true });
   }
 
+  // FIX #3: unlockForDay/relockAllPlayers no longer let one failed
+  // restrictChatMember call (e.g. target is an admin the bot can't restrict)
+  // silently stop the loop partway through — every player is still attempted,
+  // failures are collected into failedRestrictions, logged, and reported once
+  // to the group at the end instead of leaving the rest of the players
+  // out of sync with the game's intended permission state.
   private async unlockForDay(): Promise<void> {
     const game = this.game;
     if (!game) return;
     await this.tg.callSafe("setChatPermissions", { chat_id: game.chatId, permissions: DAY_PERMISSIONS, use_independent_chat_permissions: true });
+    const failedRestrictions: string[] = [];
     for (const p of game.players) {
       if (p.originalMember?.isAdmin) continue;
-      if (p.status === "alive" && !game.silencedUserIds.includes(p.userId)) {
-        await this.tg.callSafe("restrictChatMember", { chat_id: game.chatId, user_id: p.userId, permissions: DAY_PERMISSIONS, use_independent_chat_permissions: true });
-      } else {
-        await this.mutePlayer(p.userId);
-      }
+      const permissions = p.status === "alive" && !game.silencedUserIds.includes(p.userId) ? DAY_PERMISSIONS : LOCKED_PERMISSIONS;
+      const res = await this.tg.callSafe("restrictChatMember", { chat_id: game.chatId, user_id: p.userId, permissions, use_independent_chat_permissions: true });
+      if (!res.ok) { console.error("unlockForDay: restrict failed", game.chatId, p.userId, res.error.description); failedRestrictions.push(p.displayName); }
     }
+    if (failedRestrictions.length) await this.group(fa.restrictionsFailed(failedRestrictions));
   }
 
   private async relockAllPlayers(): Promise<void> {
     const game = this.game;
     if (!game) return;
+    const failedRestrictions: string[] = [];
     for (const p of game.players) {
       if (p.originalMember?.isAdmin) continue;
-      await this.tg.callSafe("restrictChatMember", { chat_id: game.chatId, user_id: p.userId, permissions: LOCKED_PERMISSIONS, use_independent_chat_permissions: true });
+      const res = await this.tg.callSafe("restrictChatMember", { chat_id: game.chatId, user_id: p.userId, permissions: LOCKED_PERMISSIONS, use_independent_chat_permissions: true });
+      if (!res.ok) { console.error("relockAllPlayers: restrict failed", game.chatId, p.userId, res.error.description); failedRestrictions.push(p.displayName); }
     }
+    if (failedRestrictions.length) await this.group(fa.restrictionsFailed(failedRestrictions));
   }
 
   private async mutePlayer(userId: number): Promise<void> {
@@ -4156,16 +4370,24 @@ export class GameRoom extends DurableObject<Env> {
   private async restoreAllPermissions(): Promise<void> {
     const game = this.game;
     if (!game) return;
+    // FIX #3: Always fall back to a known-safe default (OPEN_PERMISSIONS) when
+    // a player's pre-game snapshot is missing (e.g. the game state was
+    // recovered from D1 after a Durable Object reset and per-player
+    // originalMember data wasn't available), instead of leaving that player
+    // with whatever restrictive permissions the game last set. Where a
+    // snapshot IS available, merge it on top of OPEN_PERMISSIONS so the
+    // player's actual prior permissions are respected rather than opened
+    // wider than they were before the game.
     const defaults = game.savedDefaultPermissions ?? OPEN_PERMISSIONS;
     await this.tg.callSafe("setChatPermissions", { chat_id: game.chatId, permissions: defaults, use_independent_chat_permissions: true });
+    const failedRestrictions: string[] = [];
     for (const p of game.players) {
       if (p.originalMember?.isAdmin) continue;
-      // Restore each player's own pre-game permissions (e.g. if they were individually
-      // restricted before the game started) instead of always falling back to the chat's
-      // default permissions for everyone.
       const perPlayerPermissions = p.originalMember?.permissions ?? defaults;
-      await this.tg.callSafe("restrictChatMember", { chat_id: game.chatId, user_id: p.userId, permissions: { ...OPEN_PERMISSIONS, ...perPlayerPermissions }, use_independent_chat_permissions: true });
+      const res = await this.tg.callSafe("restrictChatMember", { chat_id: game.chatId, user_id: p.userId, permissions: { ...OPEN_PERMISSIONS, ...perPlayerPermissions }, use_independent_chat_permissions: true });
+      if (!res.ok) { console.error("restoreAllPermissions: restrict failed", game.chatId, p.userId, res.error.description); failedRestrictions.push(p.displayName); }
     }
+    if (failedRestrictions.length) await this.group(fa.restrictionsFailed(failedRestrictions));
   }
 
   private async refreshLobbyMessage(): Promise<void> {
@@ -4314,6 +4536,16 @@ export class GameRoom extends DurableObject<Env> {
     return { ok: true };
   }
 
+  // FIX #4: check this up front so enterDefense can skip straight to voting
+  // instead of promoting the accused, discovering the bot can't, and leaving
+  // them stuck mute in a phase built around them being able to speak.
+  private async botCanPromoteChatMembers(chatId: number): Promise<boolean> {
+    const me = await this.ensureBotIdentity();
+    if (!me) return false;
+    const member = await this.tg.callSafe<TgChatMember>("getChatMember", { chat_id: chatId, user_id: me.id });
+    return member.ok && member.result.status === "administrator" && !!member.result.can_promote_members;
+  }
+
   private async isHostOrAdmin(userId: number): Promise<boolean> {
     const game = this.game;
     if (!game) return false;
@@ -4342,9 +4574,30 @@ export class GameRoom extends DurableObject<Env> {
       phase: string | null; day_number: number; night_number: number; winner: string | null;
       config_json: string | null; saved_default_permissions: string | null;
       phase_ends_at: number | null; started_at: number | null; finished_at: number | null;
-      created_at: number; updated_at: number;
+      created_at: number; updated_at: number; state_json: string | null; last_group_message_id: number | null;
     }>();
     if (!gameRow) return;
+
+    // FIX #2: if a full state snapshot was persisted (state_json), rehydrate
+    // from it directly instead of reconstructing from the lossy per-column
+    // fallback below. This is what preserves verdictVotes, ammo/charge
+    // counters, shield hits, gun inventories and the block/silence lists
+    // across a Durable Object reset. We still validate it's a sane object
+    // before trusting it, and fall through to the legacy reconstruction if
+    // parsing fails or the row predates this column.
+    if (gameRow.state_json) {
+      try {
+        const snapshot = JSON.parse(gameRow.state_json) as GameState;
+        if (snapshot && typeof snapshot === "object" && snapshot.id === gameRow.id) {
+          this.game = snapshot;
+          await this.persist();
+          if (isActiveStatus(this.game.status)) await this.ensureAlarm();
+          return;
+        }
+      } catch (err) {
+        console.error("recoverFromD1: failed to parse state_json, falling back to legacy reconstruction", gameRow.id, err);
+      }
+    }
 
     type PlayerRow = {
       user_id: number; username: string | null; first_name: string; display_name: string;
@@ -4466,7 +4719,10 @@ export class GameRoom extends DurableObject<Env> {
       gunnerGuns: {},
       independentRoleType,
       savedDefaultPermissions,
-      lastGroupMessageId: null,
+      // FIX #6: prefer the persisted pointer to the lobby/status card so
+      // refreshLobbyMessage() can keep editing it in place instead of
+      // silently starting a brand-new message thread after recovery.
+      lastGroupMessageId: gameRow.last_group_message_id,
       pinnedMessageId: null,
       winner: (gameRow.winner as Team | null) ?? null,
       botUsername: null,

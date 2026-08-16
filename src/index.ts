@@ -1928,15 +1928,9 @@ export interface InquiryResolution {
   approved: boolean;
 }
 
-// The threshold is a majority of ALL living players, not just those who
-// bothered to vote. Comparing yes-votes to no-votes alone would let a
-// single voter (e.g. one mafia player deliberately spamming "بله" while
-// everyone else stays silent) force an approval and burn the town's
-// limited inquiry count for no reason. Requiring yes > half of the alive
-// roster means real turnout is needed before anything gets revealed.
-// An exact half (a genuine deadlock) is its own silent outcome — the
-// caller must not announce a tally when tied.
-export function resolveInquiry(votes: InquiryVote[], dayNumber: number, aliveCount: number): InquiryResolution {
+// A tie is deliberately its own outcome (neither approved nor a clean
+// decline) — the caller must not announce a tally when tied.
+export function resolveInquiry(votes: InquiryVote[], dayNumber: number): InquiryResolution {
   const dayVotes = votes.filter((v) => v.dayNumber === dayNumber);
   let yes = 0;
   let no = 0;
@@ -1944,10 +1938,8 @@ export function resolveInquiry(votes: InquiryVote[], dayNumber: number, aliveCou
     if (v.choice) yes += 1;
     else no += 1;
   }
-  const half = aliveCount / 2;
-  const tied = yes === half;
-  const approved = yes > half;
-  return { yes, no, tied, approved };
+  const tied = yes === no;
+  return { yes, no, tied, approved: !tied && yes > no };
 }
 
 
@@ -2049,23 +2041,37 @@ export const fa = {
 
   roleCard(player: Player, teammates: Player[]): string {
     if (!player.role || !player.team) return "نقش شما هنوز مشخص نشده.";
+
+    // BUGFIX: independent players (johnny/joker/bomber/lonewolf) also carry
+    // a second, purely-cosmetic "flavor" role on player.role (assigned only
+    // so every Player object has *some* RoleId — see assignRoles). Their own
+    // role card was showing that decoy role's name/description ABOVE the
+    // real independent-role info, effectively handing them a role they
+    // don't actually have. An independent player should see ONLY their real
+    // (independent) role — never the flavor role.
+    if (player.independentRole) {
+      const indieDef = INDEPENDENT_ROLES[player.independentRole];
+      return [
+        `🎭 نقش شما: <b>${indieDef.emoji} ${indieDef.name}</b>`,
+        `تیم: <b>${teamLabel(player.team)}</b>`,
+        "",
+        indieDef.description,
+        `هدف: ${indieDef.winCondition}`,
+        "",
+        "این پیام محرمانه است. نقش خود را فاش نکنید مگر طبق قوانین بازی.",
+      ].join("\n");
+    }
+
     const def = ROLES[player.role];
     const teamLines = player.team === "mafia" && teammates.length
       ? ["", "<b>هم‌تیمی‌های مافیا:</b>", ...teammates.map((t) => `• ${esc(t.displayName)} — ${roleLabel(t.role)}`)]
       : [];
-    
-    let indieInfo: string[] = [];
-    if (player.independentRole) {
-      const indieDef = INDEPENDENT_ROLES[player.independentRole];
-      indieInfo = ["", `🎯 <b>نقش مستقل:</b> ${indieDef.emoji} ${indieDef.name}`, indieDef.description, `هدف: ${indieDef.winCondition}`];
-    }
-    
+
     return [
       `🎭 نقش شما: <b>${def.emoji} ${def.name}</b>`,
       `تیم: <b>${teamLabel(player.team)}</b>`,
       "",
       def.description,
-      ...indieInfo,
       ...teamLines,
       "",
       "این پیام محرمانه است. نقش خود را فاش نکنید مگر طبق قوانین بازی.",
@@ -2073,7 +2079,12 @@ export const fa = {
   },
 
   gameStarted(n: number, mafiaN: number, indieRole: IndependentRoleId | null): string {
-    const indieLine = indieRole ? `\n🎭 نقش مستقل فعال: ${INDEPENDENT_ROLES[indieRole].emoji} ${INDEPENDENT_ROLES[indieRole].name}` : "";
+    // BUGFIX: this used to name the independent role (e.g. "🧨 بمب‌گذار")
+    // directly in the GROUP announcement, in front of every player — instead
+    // of keeping it secret like every other role. Only the player count
+    // should be public here; the actual identity/role only goes out in the
+    // private role-card DM.
+    const indieLine = indieRole ? `\nتعداد مستقل: 1` : "";
     return [
       "🎬 <b>بازی شروع شد</b>",
       "",
@@ -2497,14 +2508,12 @@ export const fa = {
     return `🔎 نتیجه استعلام:\n<b>${result}</b>`;
   },
 
-  cityInquiryPrompt(seconds: number, remaining: number, aliveCount: number): string {
-    const needed = Math.floor(aliveCount / 2) + 1;
+  cityInquiryPrompt(seconds: number, remaining: number): string {
     return [
       "🔎 <b>آیا می‌خواهید استعلام بگیرید؟</b>",
       "",
       "با موافقت شهر، نقش کسانی که امروز حذف شدند فاش می‌شود.",
       "فقط بازیکنان زندهٔ بازی می‌توانند رأی بدهند.",
-      `برای تأیید، حداقل <b>${needed}</b> نفر از ${aliveCount} بازیکن زنده باید «بله» بزنند؛ فقط بله‌زدن یک یا چند نفر کافی نیست.`,
       `تعداد استعلام باقی‌ماندهٔ شهر: <b>${remaining}</b>`,
       "",
       `⏱ ${seconds} ثانیه`,
@@ -3355,9 +3364,18 @@ export class GameRoom extends DurableObject<Env> {
       if (notifyChatId === chatId) await this.tg.sendMessage(chatId, fa.noGame);
       return game && game.status !== "lobby" && findPlayer(game.players, from.id) ? "busy" : "nogame";
     }
+    // BUGFIX: rapid double /start (double-tap, or a duplicate webhook
+    // delivery) could fire two overlapping addPlayer calls for the same
+    // user. The old code checked findPlayer, then did an `await` (the
+    // findActiveGameForUser DB lookup) BEFORE pushing the new player — and
+    // Durable Objects only serialize execution between await points, so a
+    // second call could pass the same "not already in" check while the
+    // first was still awaiting, and both would push, adding the same human
+    // twice to game.players (corrupting player/role counts even though the
+    // DB's UNIQUE constraint would only ever keep one row). Fix: check and
+    // push in the same synchronous step, with no await in between, then run
+    // the remaining async validation (and roll back the push if it fails).
     if (findPlayer(game.players, from.id)) { await this.tg.sendMessage(chatId, fa.alreadyJoined); return "already"; }
-    const already = await findActiveGameForUser(this.env.DB, from.id);
-    if (already && already.chat_id !== chatId) { await this.tg.sendMessage(chatId, fa.alreadyInGame(this.game?.chatTitle || "گروه دیگر")); return "busy"; }
     if (game.players.length >= game.config.maxPlayers) { await this.tg.sendMessage(chatId, fa.tooMany); return "full"; }
     const newPlayer: Player = {
       userId: from.id, username: from.username ?? null, firstName: from.first_name,
@@ -3365,6 +3383,12 @@ export class GameRoom extends DurableObject<Env> {
       status: "alive", originalMember: null, joinedAt: now(),
     };
     game.players.push(newPlayer);
+    const already = await findActiveGameForUser(this.env.DB, from.id);
+    if (already && already.chat_id !== chatId) {
+      game.players = game.players.filter((p) => p.userId !== from.id);
+      await this.tg.sendMessage(chatId, fa.alreadyInGame(this.game?.chatTitle || "گروه دیگر"));
+      return "busy";
+    }
     // FIX #1: if committing the new player fails partway (D1 write error),
     // roll the in-memory player list back to what was last successfully
     // persisted instead of leaving a "ghost" player that the lobby message,
@@ -3866,7 +3890,7 @@ export class GameRoom extends DurableObject<Env> {
     // for a few more seconds instead of unlocking early.
     await this.persist(true);
     await this.schedulePhaseTimers();
-    await this.group(fa.cityInquiryPrompt(INQUIRY_SECONDS, game.cityInquiryCount, living(game.players).length), {
+    await this.group(fa.cityInquiryPrompt(INQUIRY_SECONDS, game.cityInquiryCount), {
       reply_markup: { inline_keyboard: inquiryKeyboard(dayNumber) },
     });
   }
@@ -3879,7 +3903,7 @@ export class GameRoom extends DurableObject<Env> {
     await this.persist();
 
     const dayNumber = game.dayNumber;
-    const res = resolveInquiry(game.inquiryVotes, dayNumber, living(game.players).length);
+    const res = resolveInquiry(game.inquiryVotes, dayNumber);
     const deaths = game.pendingInquiryDeaths ?? [];
     game.pendingInquiryDeaths = null;
     game.inquiryVotes = game.inquiryVotes.filter((v) => v.dayNumber !== dayNumber);

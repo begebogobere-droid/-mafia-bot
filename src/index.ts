@@ -100,23 +100,56 @@ async function ensureSchema(db: D1Database): Promise<void> {
     .filter(Boolean)
     .map((s) => db.prepare(s));
   await db.batch(statements);
-  // FIX #2: `games` may already exist from before `state_json` /
-  // `last_group_message_id` were introduced. CREATE TABLE IF NOT EXISTS above
-  // won't add columns to an already-existing table, so migrate it explicitly.
-  // ALTER TABLE ... ADD COLUMN has no "IF NOT EXISTS" form in SQLite, so we
-  // probe for the column and swallow the "duplicate column" error if a
-  // concurrent DO instance already added it.
-  try {
-    const cols = await db.prepare(`PRAGMA table_info(games)`).all<{ name: string }>();
-    const names = new Set((cols.results ?? []).map((c) => c.name));
-    const migrations: string[] = [];
-    if (!names.has("state_json")) migrations.push(`ALTER TABLE games ADD COLUMN state_json TEXT`);
-    if (!names.has("last_group_message_id")) migrations.push(`ALTER TABLE games ADD COLUMN last_group_message_id INTEGER`);
-    for (const sql of migrations) {
-      try { await db.prepare(sql).run(); } catch (err) { console.error("ensureSchema: migration failed", sql, err); }
+  // FIX #2 (+ follow-up): `games` and `game_players` may already exist from
+  // before some columns were introduced. CREATE TABLE IF NOT EXISTS above
+  // won't add columns to an already-existing table, so migrate both
+  // explicitly. ALTER TABLE ... ADD COLUMN has no "IF NOT EXISTS" form in
+  // SQLite, so we probe for each column and swallow the "duplicate column"
+  // error if a concurrent DO instance already added it. This is what was
+  // causing every join/persist to fail in production with
+  // "table game_players has no column named independent_role" — the table
+  // pre-dated that column being added to SCHEMA_SQL and was never migrated.
+  const tableMigrations: Record<string, Record<string, string>> = {
+    games: {
+      state_json: "TEXT",
+      last_group_message_id: "INTEGER",
+    },
+    game_players: {
+      role: "TEXT",
+      team: "TEXT",
+      independent_role: "TEXT",
+      status: "TEXT NOT NULL DEFAULT 'alive'",
+      death_reason: "TEXT",
+      death_phase: "TEXT",
+      death_round: "INTEGER",
+      original_member_json: "TEXT",
+    },
+    votes: {
+      weight: "INTEGER NOT NULL DEFAULT 1",
+    },
+    verdict_votes: {
+      guilty: "INTEGER NOT NULL DEFAULT 0",
+      weight: "INTEGER NOT NULL DEFAULT 1",
+    },
+    night_actions: {
+      target_role: "TEXT",
+    },
+  };
+  for (const [table, columns] of Object.entries(tableMigrations)) {
+    try {
+      const cols = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+      const names = new Set((cols.results ?? []).map((c) => c.name));
+      for (const [column, type] of Object.entries(columns)) {
+        if (names.has(column)) continue;
+        try {
+          await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`).run();
+        } catch (err) {
+          console.error("ensureSchema: migration failed", table, column, err);
+        }
+      }
+    } catch (err) {
+      console.error("ensureSchema: column probe failed", table, err);
     }
-  } catch (err) {
-    console.error("ensureSchema: column probe failed", err);
   }
 }
 

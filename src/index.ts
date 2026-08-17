@@ -1560,6 +1560,10 @@ export function hasFinishedAllNightActions(game: GameState): boolean {
       );
     }
 
+    // NATO out of chances counts as done immediately — same idea as gunner
+    // above, so an exhausted NATO never blocks the night from ending early.
+    if (p.role === "nato" && game.natoChancesLeft <= 0) return true;
+
     // Gunner's two-step give flow is all-or-nothing: out of chances counts
     // as done; an explicit skip (war action with a null target) counts as
     // done; otherwise both the war AND black picks must be present.
@@ -4644,7 +4648,11 @@ export class GameRoom extends DurableObject<Env> {
       }
 
       if (p.role === "nato") {
-        await this.pm(p.userId, fa.natoPrompt(secs, game.natoChancesLeft), natoTargetKeyboard(game.players, p.userId, game.nightNumber));
+        if (game.natoChancesLeft <= 0) {
+          await this.pm(p.userId, fa.nightCitizenWait);
+        } else {
+          await this.pm(p.userId, fa.natoPrompt(secs, game.natoChancesLeft), natoTargetKeyboard(game.players, p.userId, game.nightNumber));
+        }
         continue;
       }
 

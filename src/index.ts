@@ -4324,11 +4324,13 @@ export class GameRoom extends DurableObject<Env> {
     // that player for the night (per spec, this step must be completed once
     // started, not abandonable as a skip).
     const guessableRoles = gameRolesInPlay(game);
-    const keyboard: InlineKeyboard = guessableRoles.map(({ id, emoji, name }) => {
-      return [{ text: `${emoji} ${name}`, callback_data: `NR${nightNumber}:${targetId}:${id}` }];
-    });
+    const roleButtons = guessableRoles.map(({ id, emoji, name }) => ({
+      text: `${emoji} ${name}`,
+      callback_data: `NR${nightNumber}:${targetId}:${id}`,
+    }));
+    const keyboard: InlineKeyboard = chunk(roleButtons, 2);
 
-    await this.pm(userId, fa.natoSelectRole(target.displayName), chunk(keyboard, 2) as InlineKeyboard);
+    await this.pm(userId, fa.natoSelectRole(target.displayName), keyboard);
     return { text: `بازیکن <b>${target.displayName}</b> انتخاب شد. حالا نقش او را حدس بزنید.`, alert: false };
   }
 

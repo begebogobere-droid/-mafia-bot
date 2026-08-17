@@ -391,6 +391,12 @@ export interface GameState {
   savedDefaultPermissions: ChatPermissions | null;
   lastGroupMessageId: number | null;
   pinnedMessageId: number | null;
+  // Every message ID the bot has pinned during THIS game (lobby card, phase
+  // updates, game-over message, etc.) — Telegram allows many simultaneous
+  // pins and only exposes the single latest one via getChat, so this is the
+  // only reliable way to know "everything the bot pinned" for /delpin and
+  // the end-of-game pin cleanup. See pin()/unpinAllBotPins().
+  botPinnedMessageIds: number[];
   winner: Team | null;
   botUsername: string | null;
   botId: number | null;
@@ -1060,6 +1066,19 @@ export function nightTargetsFor(
     if (type === "johnny_kill") return p.team === "town";
     return true;
   });
+}
+
+// Paranoid's night panel is a plain yes/no on staying alert — never a
+// player or role list. Backend semantics are untouched: it still rides the
+// existing generic "N{night}:paranoid_alert:{targetId}" route into
+// applyNightAction/resolveNight, which already treats targetId>0 (self) as
+// "alert active" and targetId=0 (skip) as "alert inactive" — see the
+// paranoid_alert handling in resolveNight. Only the keyboard changes.
+export function paranoidDecisionKeyboard(actorId: number, nightNumber: number): InlineKeyboard {
+  return [
+    [{ text: "🛡 امشب هوشیار می‌مانم", callback_data: `N${nightNumber}:paranoid_alert:${actorId}` }],
+    [{ text: "❌ نمی‌خواهم امشب هوشیار باشم", callback_data: `N${nightNumber}:paranoid_alert:0` }],
+  ];
 }
 
 export function nightTargetKeyboard(
@@ -1733,7 +1752,7 @@ export function resolveNight(game: GameState): NightResolution {
   const dead = new Set<number>();
   const deaths: DeathRecord[] = [];
   const shieldAbsorbed: number[] = [];
-  const markDead = (userId: number, reason: DeathRecord["reason"], indieRole?: IndependentRoleId) => {
+  const markDead = (userId: number, reason: DeathRecord["reason"]) => {
     if (dead.has(userId)) return;
     const p = findPlayer(game.players, userId);
     if (!p || p.status !== "alive" || !p.role) return;
@@ -1747,7 +1766,11 @@ export function resolveNight(game: GameState): NightResolution {
       }
     }
     dead.add(userId);
-    deaths.push({ userId, reason, revealedRole: p.role, revealedIndependentRole: indieRole });
+    // Central place for "real identity at death": an independent player's
+    // `.role` is cosmetic flavor text, so revealedIndependentRole must always
+    // be read here from the player record itself, not passed in ad hoc by
+    // every call site (that's exactly how it went missing before).
+    deaths.push({ userId, reason, revealedRole: p.role, revealedIndependentRole: p.independentRole ?? undefined });
   };
 
   // 1. Process mafia kill
@@ -1803,9 +1826,14 @@ export function resolveNight(game: GameState): NightResolution {
       continue;
     }
     if (target.team === "mafia") {
+      // Correct target: only the mafia member dies.
+      markDead(target.userId, "sniper");
+    } else if (target.team === "independent") {
+      // Independent is its own team, never a "wrong" (town) target — only
+      // the independent dies, sniper is never penalized for this.
       markDead(target.userId, "sniper");
     } else {
-      // Wrong target - both die
+      // Wrong target (town): both die.
       markDead(target.userId, "sniper");
       markDead(actor.userId, "sniper_penalty");
     }
@@ -1883,20 +1911,27 @@ export function resolveNight(game: GameState): NightResolution {
       if (!actor || !target) continue;
       
       if (actor.independentRole === "lonewolf" && actor.status === "alive") {
-        // Lonewolf gets actual role
-        const result = target.role ? roleLabel(target.role) : "نامشخص";
+        // Lonewolf gets the target's true identity — for an independent
+        // target that's their independentRole, never the cosmetic base role.
+        const result = target.independentRole
+          ? independentRoleLabel(target.independentRole)
+          : (target.role ? roleLabel(target.role) : "نامشخص");
         investigations.push({ actorId: actor.userId, targetId: target.userId, result });
       } else if (actor.role === "detective" && actor.status === "alive") {
-        // Detective gets town/mafia. Special case: the Godfather reads as
-        // "town" the first time he's ever investigated (by anyone), and only
-        // shows up as mafia from the second investigation onward. Every
-        // other mafia member always shows mafia, from the first check.
+        // Detective gets town/mafia/independent. Special case: the Godfather
+        // reads as "town" the first time he's ever investigated (by anyone),
+        // and only shows up as mafia from the second investigation onward.
+        // Every other mafia member always shows mafia, from the first check.
         let result: string;
         if (target.role === "godfather") {
           result = game.godfatherRevealed ? "مافیا" : "شهروند";
           game.godfatherRevealed = true;
+        } else if (target.team === "mafia") {
+          result = "مافیا";
+        } else if (target.team === "independent") {
+          result = "مستقل";
         } else {
-          result = target.team === "town" ? "شهروند" : "مافیا";
+          result = "شهروند";
         }
         investigations.push({ actorId: actor.userId, targetId: target.userId, result });
       }
@@ -2160,6 +2195,11 @@ export const fa = {
   lobbyCreateFailed: "⚠️ ساخت لابی به مشکل خورد. لطفاً دوباره /new را بزنید.",
   lobbyOnlyHere: "این دستور را در گروه بزنید.",
   resetAdminOnly: "برای ریست کردن بات در این گروه باید ادمین باشید.",
+  delpinAdminOnly: "برای حذف پین‌های بات باید ادمین گروه باشید.",
+  delpinNone: "هیچ پیام پین‌شده‌ای توسط بات پیدا نشد.",
+  delpinDone(count: number): string {
+    return `📌 <b>${count}</b> پیام پین‌شده توسط بات، آنپین شد.`;
+  },
   resetDone: [
     "♻️ <b>بات ریست شد</b>",
     "همهٔ لابی‌ها و بازی‌های فعال این گروه غیرفعال شدند و بات دقیقاً مثل تازه اد شدن به گروه آماده است.",
@@ -2548,6 +2588,7 @@ export const fa = {
     "/extend — تمدید بحث (میزبان)",
     "/skip — پایان زودتر مرحله (میزبان)",
     "/reset — ریست کامل بات در گروه (ادمین)",
+    "/delpin — آنپین پیام‌های پین‌شده توسط بات (ادمین)",
     "/help — راهنما",
     "",
     "بحث فقط در گروه. نقش، شب و رأی فقط در پیوی.",
@@ -3124,6 +3165,7 @@ export class GameRoom extends DurableObject<Env> {
     switch (parsed.cmd) {
       case "new": case "mafia": case "newgame": await this.cmdNew(msg); break;
       case "reset": await this.cmdReset(msg); break;
+      case "delpin": await this.cmdDelpin(msg); break;
       case "join": await this.cmdJoin(msg); break;
       case "leave": await this.cmdLeave(msg); break;
       case "startgame": case "begin": await this.cmdStartGame(msg.from!.id, msg.chat.id); break;
@@ -3440,7 +3482,7 @@ export class GameRoom extends DurableObject<Env> {
       natoChancesLeft: 2, paranoidAlertLeft: 2, bomberMarkedTargets: [], independentRoleType: null,
       invincibleShieldHits: {}, gunnerGuns: {},
       gunnerNightsUsed: 0, gunnerWarGunsGiven: 0, gunnerBlackGunsGiven: 0,
-      savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, winner: null,
+      savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, botPinnedMessageIds: [], winner: null,
       botUsername: me?.username ?? null, botId: me?.id ?? null, config: { ...DEFAULT_CONFIG },
       createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
     };
@@ -3480,6 +3522,21 @@ export class GameRoom extends DurableObject<Env> {
     await this.persist(true);
   }
 
+  private async cmdDelpin(msg: TgMessage): Promise<void> {
+    if (msg.chat.type === "group") { await this.tg.sendMessage(msg.chat.id, fa.needSupergroup); return; }
+    if (msg.chat.type !== "supergroup") { await this.tg.sendMessage(msg.chat.id, fa.lobbyOnlyHere); return; }
+    const from = msg.from;
+    if (!from) return;
+    if (!(await this.isChatAdmin(from.id, msg.chat.id))) { await this.tg.sendMessage(msg.chat.id, fa.delpinAdminOnly); return; }
+
+    const game = this.game;
+    if (!game || game.chatId !== msg.chat.id) { await this.tg.sendMessage(msg.chat.id, fa.delpinNone); return; }
+
+    const count = await this.unpinAllBotPins();
+    await this.persist();
+    await this.tg.sendMessage(msg.chat.id, count > 0 ? fa.delpinDone(count) : fa.delpinNone);
+  }
+
   private async cmdReset(msg: TgMessage): Promise<void> {
     if (msg.chat.type === "group") { await this.tg.sendMessage(msg.chat.id, fa.needSupergroup); return; }
     if (msg.chat.type !== "supergroup") { await this.tg.sendMessage(msg.chat.id, fa.lobbyOnlyHere); return; }
@@ -3491,7 +3548,7 @@ export class GameRoom extends DurableObject<Env> {
     if (game && game.chatId === msg.chat.id) {
       if (game.temporaryCourtAdminUserId) await this.removeTemporaryCourtAdmin(game.temporaryCourtAdminUserId);
       if (isPlayingStatus(game.status)) await this.restoreAllPermissions();
-      if (game.pinnedMessageId) await this.unpin();
+      await this.unpinAllBotPins();
     }
 
     // Wipe every trace of this room's state — Durable Object storage (including the
@@ -4199,7 +4256,7 @@ export class GameRoom extends DurableObject<Env> {
         return;
       }
 
-      game.players = applyDeaths(game.players, [{ userId: accusedId, reason: "lynch", revealedRole: accused.role! }], "verdict", game.dayNumber);
+      game.players = applyDeaths(game.players, [{ userId: accusedId, reason: "lynch", revealedRole: accused.role!, revealedIndependentRole: accused.independentRole ?? undefined }], "verdict", game.dayNumber);
       await this.notifyLecterSuccession([{ userId: accusedId, reason: "lynch", revealedRole: accused.role! }]);
       await this.mutePlayer(accusedId);
     }
@@ -4221,6 +4278,10 @@ export class GameRoom extends DurableObject<Env> {
     const game = this.game;
     if (!game) return;
     if (game.temporaryCourtAdminUserId) await this.removeTemporaryCourtAdmin(game.temporaryCourtAdminUserId);
+    // Central end-of-game pin cleanup — runs no matter which win condition
+    // (town/mafia/independent) or other path led here, since every route to
+    // game over passes through this one function.
+    await this.unpinAllBotPins();
     game.status = "finished";
     game.phase = "finished";
     game.winner = winner;
@@ -4276,6 +4337,9 @@ export class GameRoom extends DurableObject<Env> {
       }
       if (action === "paranoid_alert") {
         if (game.paranoidAlertLeft <= 0) return { text: "دیگر امکان فعال کردن هوشیاری ندارید.", alert: true };
+        // Vigilance is a self-only toggle, never a targeted action — reject
+        // any stale/old-panel callback that tries to "target" someone else.
+        if (targetId !== userId) return { text: fa.actionForbidden, alert: true };
       }
       if (action === "escort_block") {
         if (targetId === userId) return { text: "نمی‌توانید خودتان را انتخاب کنید.", alert: true };
@@ -4626,7 +4690,7 @@ export class GameRoom extends DurableObject<Env> {
 
       // Town role prompts
       if (p.role === "paranoid") {
-        await this.pm(p.userId, fa.paranoidPrompt(secs, game.paranoidAlertLeft), nightTargetKeyboard(game.players, p.userId, game.nightNumber, "paranoid_alert", { skipLabel: "⏭ رد کردن این شب" }));
+        await this.pm(p.userId, fa.paranoidPrompt(secs, game.paranoidAlertLeft), paranoidDecisionKeyboard(p.userId, game.nightNumber));
         continue;
       }
 
@@ -5018,12 +5082,32 @@ export class GameRoom extends DurableObject<Env> {
     if (!game) return;
     await this.tg.callSafe("pinChatMessage", { chat_id: game.chatId, message_id: messageId, disable_notification: true });
     game.pinnedMessageId = messageId;
+    if (!game.botPinnedMessageIds.includes(messageId)) game.botPinnedMessageIds.push(messageId);
   }
 
   private async unpin(): Promise<void> {
     const game = this.game;
     if (!game?.pinnedMessageId) return;
     await this.tg.callSafe("unpinChatMessage", { chat_id: game.chatId, message_id: game.pinnedMessageId });
+    game.botPinnedMessageIds = game.botPinnedMessageIds.filter((id) => id !== game.pinnedMessageId);
+  }
+
+  // Unpins EVERY message the bot has pinned during the current game (not
+  // just the latest one) and clears the tracking list. Used by both /delpin
+  // and the end-of-game cleanup — one shared implementation so they can
+  // never drift apart.
+  private async unpinAllBotPins(): Promise<number> {
+    const game = this.game;
+    if (!game || game.botPinnedMessageIds.length === 0) return 0;
+    const ids = [...game.botPinnedMessageIds];
+    let count = 0;
+    for (const id of ids) {
+      const res = await this.tg.callSafe("unpinChatMessage", { chat_id: game.chatId, message_id: id });
+      if (res.ok) count += 1;
+    }
+    game.botPinnedMessageIds = [];
+    game.pinnedMessageId = null;
+    return count;
   }
 
   private async persist(syncDb = false): Promise<void> {
@@ -5299,6 +5383,7 @@ export class GameRoom extends DurableObject<Env> {
       // silently starting a brand-new message thread after recovery.
       lastGroupMessageId: gameRow.last_group_message_id,
       pinnedMessageId: null,
+      botPinnedMessageIds: [],
       winner: (gameRow.winner as Team | null) ?? null,
       botUsername: null,
       botId: null,

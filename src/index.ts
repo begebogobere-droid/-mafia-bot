@@ -175,6 +175,12 @@ export type RoleId =
 
 export type IndependentRoleId = "johnny" | "joker" | "bomber" | "lonewolf";
 
+// A NATO guess can target the game's flavor role (RoleId) OR, when the
+// target happens to be the independent player, their true independent
+// identity (IndependentRoleId) — see the note on `assignRoles` and the
+// nato_guess resolution in `resolveNight`.
+export type GuessableRoleId = RoleId | IndependentRoleId;
+
 export type GunType = "war" | "black";
 
 export type PlayerStatus = "alive" | "dead" | "left";
@@ -228,7 +234,9 @@ export type NightActionType =
   | "paranoid_alert"
   | "bomber_mark"
   | "bomber_explode"
-  | "johnny_kill";
+  | "johnny_kill"
+  | "gunner_give_war"
+  | "gunner_give_black";
 
 export type AlarmKind = "phase_end" | "reminder" | "countdown" | "none";
 
@@ -301,7 +309,7 @@ export interface NightAction {
   actorId: number;
   type: NightActionType;
   targetId: number | null;
-  targetRole?: RoleId | null;
+  targetRole?: GuessableRoleId | null;
   nightNumber: number;
   at: number;
 }
@@ -365,11 +373,20 @@ export interface GameState {
   doctorSelfHealUsedBy: number[];
   sniperShotsLeft: Record<string, number>;
   detectiveChecked: Record<string, number[]>;
+  godfatherRevealed: boolean;
   natoChancesLeft: number;
   paranoidAlertLeft: number;
   bomberMarkedTargets: number[];
   invincibleShieldHits: Record<string, number>;
+  // gunnerGuns holds guns currently held by RECIPIENTS (any player the gunner
+  // has given a gun to that night) — not guns held by the gunner themself.
   gunnerGuns: Record<string, GunType[]>;
+  // Total nights (max 2) the gunner has *successfully* completed a full
+  // war+black distribution. Only increments when both guns are delivered —
+  // a skipped or incomplete night never consumes one of the 2 chances.
+  gunnerNightsUsed: number;
+  gunnerWarGunsGiven: number;
+  gunnerBlackGunsGiven: number;
   independentRoleType: IndependentRoleId | null;
   savedDefaultPermissions: ChatPermissions | null;
   lastGroupMessageId: number | null;
@@ -1039,7 +1056,7 @@ export function nightTargetsFor(
     if (!opts?.includeSelf && p.userId === actorId) return false;
     if (type === "mafia_kill") return p.team === "town";
     if (type === "heal" && actor?.role === "lecter") return p.team === "mafia";
-    if (type === "nato_guess") return p.team === "town";
+    if (type === "nato_guess") return p.team !== "mafia";
     if (type === "johnny_kill") return p.team === "town";
     return true;
   });
@@ -1071,6 +1088,33 @@ export function natoTargetKeyboard(
   return playerButtons(targets, `NG${nightNumber}:`, [
     { text: "⏭ رد کردن این شب", data: `N${nightNumber}:nato_guess:0` },
   ]);
+}
+
+// Gunner's war-gun step: any living player except the gunner. Has a skip
+// button ("امشب نمی‌خواهم تفنگ بدهم") — declining here is the ONLY skip
+// point in the gunner's two-step flow.
+export function gunnerWarKeyboard(
+  players: Player[],
+  gunnerId: number,
+  nightNumber: number,
+): InlineKeyboard {
+  const targets = players.filter((p) => p.userId !== gunnerId);
+  return playerButtons(targets, `GW${nightNumber}:`, [
+    { text: "⏭ امشب نمی‌خواهم تفنگ بدهم", data: `GW${nightNumber}:0` },
+  ]);
+}
+
+// Gunner's black-gun step: any living player except the gunner AND except
+// whoever just received the war gun this same night. Deliberately has no
+// skip button — the gunner must complete this to deliver either gun.
+export function gunnerBlackKeyboard(
+  players: Player[],
+  gunnerId: number,
+  warRecipientId: number,
+  nightNumber: number,
+): InlineKeyboard {
+  const targets = players.filter((p) => p.userId !== gunnerId && p.userId !== warRecipientId);
+  return playerButtons(targets, `GB${nightNumber}:`);
 }
 
 
@@ -1105,7 +1149,7 @@ export const ROLES: Record<RoleId, RoleDef> = {
     name: "ناتو",
     emoji: "💣",
     title: "ناتو",
-    description: "عضو مافیا هستید. هر شب می‌توانید نقش یک بازیکن شهروند را حدس بزنید. اگر درست حدس بزنید، آن بازیکن کشته می‌شود. ۳ شانس دارید.",
+    description: "عضو مافیا هستید. هر شب می‌توانید نقش یک بازیکن غیرمافیا را حدس بزنید. اگر درست حدس بزنید، آن بازیکن کشته می‌شود. در کل بازی ۲ شانس دارید (حدس درست یا اشتباه، هر دو یک شانس مصرف می‌کنند).",
     nightAction: "nato_guess",
     nightOptional: true,
   },
@@ -1155,7 +1199,7 @@ export const ROLES: Record<RoleId, RoleDef> = {
     name: "تفنگدار",
     emoji: "🔫",
     title: "تفنگدار",
-    description: "هر شب دو تفنگ (یک تفنگ جنگی و یک تفنگ مشکی) به‌طور پنهانی دریافت می‌کنید. در طول روز از پنل پیوی بات روی یک بازیکن شلیک می‌کنید؛ اگر تفنگ جنگی باشد هدف همان لحظه حذف می‌شود، اگر تفنگ مشکی باشد اتفاقی نمی‌افتد. نوع تفنگ از قبل مشخص نیست.",
+    description: "در کل بازی فقط ۲ شب می‌توانید تفنگ توزیع کنید. هر شب یک تفنگ جنگی و یک تفنگ مشکی به دو بازیکن زندهٔ متفاوت (هرگز به خودتان) می‌دهید؛ اگر هرکدام را کامل نکنید هیچ تفنگی تحویل داده نمی‌شود و فرصتتان هدر نمی‌رود. گیرنده تا لحظهٔ شلیک نمی‌داند چه نوع تفنگی دارد؛ تفنگ جنگی هدف را همان لحظه حذف می‌کند، تفنگ مشکی بی‌اثر است.",
     nightAction: null,
     nightOptional: true,
   },
@@ -1440,6 +1484,29 @@ export function getTownRoles(): RoleId[] {
     .map(([id, _]) => id as RoleId);
 }
 
+// Every role actually in play in this specific game: the (mafia/town) flavor
+// role of every player, plus the game's one independent role (if any) —
+// used to build NATO's role-guess panel. Independent role is listed once
+// under its own id (not the flavor role dressing the independent player),
+// since that's what a NATO guess must actually match against.
+export function gameRolesInPlay(game: GameState): Array<{ id: GuessableRoleId; emoji: string; name: string }> {
+  const seen = new Set<GuessableRoleId>();
+  const result: Array<{ id: GuessableRoleId; emoji: string; name: string }> = [];
+  for (const p of game.players) {
+    if (p.independentRole) continue; // listed separately below, not by flavor role
+    if (!p.role || seen.has(p.role)) continue;
+    seen.add(p.role);
+    const def = ROLES[p.role];
+    result.push({ id: p.role, emoji: def.emoji, name: def.name });
+  }
+  if (game.independentRoleType && !seen.has(game.independentRoleType)) {
+    seen.add(game.independentRoleType);
+    const def = INDEPENDENT_ROLES[game.independentRoleType];
+    result.push({ id: game.independentRoleType, emoji: def.emoji, name: def.name });
+  }
+  return result;
+}
+
 export function nightActionTypesFor(role: RoleId | null, indieRole: IndependentRoleId | null): NightActionType[] {
   if (!role) return [];
   
@@ -1469,6 +1536,8 @@ export function nightActionTypesFor(role: RoleId | null, indieRole: IndependentR
       return ["escort_block"];
     case "paranoid":
       return ["paranoid_alert"];
+    case "gunner":
+      return ["gunner_give_war"];
     default:
       return [];
   }
@@ -1490,7 +1559,22 @@ export function hasFinishedAllNightActions(game: GameState): boolean {
         ),
       );
     }
-    
+
+    // Gunner's two-step give flow is all-or-nothing: out of chances counts
+    // as done; an explicit skip (war action with a null target) counts as
+    // done; otherwise both the war AND black picks must be present.
+    if (p.role === "gunner") {
+      if (game.gunnerNightsUsed >= 2) return true;
+      const warAction = game.nightActions.find(
+        (a) => a.actorId === p.userId && a.type === "gunner_give_war" && a.nightNumber === game.nightNumber,
+      );
+      if (!warAction) return false;
+      if (warAction.targetId === null) return true;
+      return game.nightActions.some(
+        (a) => a.actorId === p.userId && a.type === "gunner_give_black" && a.nightNumber === game.nightNumber,
+      );
+    }
+
     return types.every((type) =>
       game.nightActions.some(
         (a) =>
@@ -1677,15 +1761,19 @@ export function resolveNight(game: GameState): NightResolution {
       const nato = findPlayer(game.players, a.actorId);
       if (nato?.status === "alive" && nato.role === "nato" && game.natoChancesLeft > 0) {
         const target = findPlayer(game.players, a.targetId);
-        if (target?.status === "alive" && target.role === a.targetRole && target.team === "town") {
+        if (target?.status === "alive" && target.team !== "mafia") {
+          // The independent player's `.role` is cosmetic flavor text (see
+          // assignRoles); their real identity is `.independentRole`.
+          const actualRole: GuessableRoleId | null = target.independentRole ?? target.role;
           natoTarget = a.targetId;
-          natoGuessCorrect = true;
-          if (!protectedIds.has(a.targetId) && !paranoidAlerts.has(a.targetId)) {
-            markDead(a.targetId, "nato");
+          if (actualRole === a.targetRole) {
+            natoGuessCorrect = true;
+            if (!protectedIds.has(a.targetId) && !paranoidAlerts.has(a.targetId)) {
+              markDead(a.targetId, "nato");
+            }
+          } else {
+            natoGuessCorrect = false;
           }
-        } else {
-          natoTarget = a.targetId;
-          natoGuessCorrect = false;
         }
       }
     }
@@ -1795,8 +1883,17 @@ export function resolveNight(game: GameState): NightResolution {
         const result = target.role ? roleLabel(target.role) : "نامشخص";
         investigations.push({ actorId: actor.userId, targetId: target.userId, result });
       } else if (actor.role === "detective" && actor.status === "alive") {
-        // Detective gets town/mafia
-        const result = target.team === "town" ? "شهروند" : "مافیا";
+        // Detective gets town/mafia. Special case: the Godfather reads as
+        // "town" the first time he's ever investigated (by anyone), and only
+        // shows up as mafia from the second investigation onward. Every
+        // other mafia member always shows mafia, from the first check.
+        let result: string;
+        if (target.role === "godfather") {
+          result = game.godfatherRevealed ? "مافیا" : "شهروند";
+          game.godfatherRevealed = true;
+        } else {
+          result = target.team === "town" ? "شهروند" : "مافیا";
+        }
         investigations.push({ actorId: actor.userId, targetId: target.userId, result });
       }
     }
@@ -1848,6 +1945,33 @@ export function applyDeaths(
   });
 }
 
+// Central Doctor Lecter succession check. Must run after EVERY death path
+// (night resolution, lynch, joker self-elimination, gunner shot, host
+// removal, etc.) so a dead Godfather is always followed by their still-alive
+// Lecter becoming the new Godfather — immediately, not just at night's end.
+// Mutates game.players in place; returns the promoted player (for a private
+// notification) or null if no succession happened. Entirely silent as far
+// as this function is concerned — it does not send any messages itself, so
+// callers control exactly who finds out (see the "fully secret" requirement:
+// only the promoted player is ever told, never the group).
+export function checkLecterSuccession(game: GameState, deaths: DeathRecord[]): Player | null {
+  // Guard: an independent player's `.role` is cosmetic flavor text (see
+  // assignRoles) and can coincidentally read "godfather" too — so this must
+  // confirm the death was the REAL Godfather (team === "mafia"), not just
+  // match on revealedRole, or an eliminated Joker/Bomber with "godfather"
+  // flavor would wrongly trigger a promotion.
+  const godfatherDied = deaths.some((d) => {
+    if (d.revealedRole !== "godfather") return false;
+    const p = findPlayer(game.players, d.userId);
+    return p?.team === "mafia";
+  });
+  if (!godfatherDied) return null;
+  const lecter = game.players.find((p) => p.role === "lecter" && p.status === "alive");
+  if (!lecter) return null;
+  lecter.role = "godfather";
+  return lecter;
+}
+
 export function consumeSniperShots(game: GameState, actions: NightAction[]): Record<string, number> {
   const next = { ...game.sniperShotsLeft };
   for (const a of actions) {
@@ -1896,14 +2020,22 @@ export function resolveVotes(
     .map(([userId, v]) => ({ userId, votes: v.votes, names: v.names }))
     .sort((a, b) => b.votes - a.votes);
 
-  const candidates = list.filter((t) => t.userId !== null);
-  if (candidates.length === 0) {
+  if (list.length === 0) {
     return { tallies: list, eliminated: null, tied: false };
   }
-  const top = candidates[0]!;
-  const tied = candidates.length > 1 && candidates[1]!.votes === top.votes;
-  if (tied || top.votes <= 0) {
+  // Abstain (userId === null) now counts as a real bucket in the comparison:
+  // if abstain ties or beats the top candidate, nobody goes to trial.
+  const top = list[0]!;
+  if (top.votes <= 0) {
+    return { tallies: list, eliminated: null, tied: false };
+  }
+  const tiedWithTop = list.filter((t) => t.votes === top.votes);
+  if (tiedWithTop.length > 1) {
     return { tallies: list, eliminated: null, tied: true };
+  }
+  if (top.userId === null) {
+    // Abstain won outright — no one is put on trial.
+    return { tallies: list, eliminated: null, tied: false };
   }
   const eliminated = findPlayer(players, top.userId as number) ?? null;
   return { tallies: list, eliminated, tied: false };
@@ -2131,11 +2263,18 @@ export const fa = {
     ].join("\n");
   },
 
+  // Sent ONLY in the promoted player's own PV — never anywhere public. See
+  // checkLecterSuccession / notifyLecterSuccession for why this must stay
+  // completely invisible to the group and other mafia members.
+  lecterSuccession(): string {
+    return "🎩 پدرخوانده کشته شد.\nاز این لحظه، تو پدرخوانده جدید مافیا هستی.";
+  },
+
   natoPrompt(seconds: number, chancesLeft: number): string {
     return [
       "💣 <b>نوبت اقدام شبانه — 💣 ناتو</b>",
       "",
-      "یک بازیکن شهروند را انتخاب کنید و نقش او را حدس بزنید.",
+      "یک بازیکن غیرمافیا را انتخاب کنید و نقش او را حدس بزنید.",
       `اگر درست حدس بزنید، آن بازیکن کشته می‌شود!`,
       `شانس‌های باقی‌مانده: ${chancesLeft}`,
       "",
@@ -2178,7 +2317,7 @@ export const fa = {
 
   actionForbidden: "الان اجازهٔ این اقدام را ندارید.",
   cannotKillTeammate: "این بازیکن هم‌تیمی شماست و امکان شلیک به او وجود ندارد.",
-  lecterTownTarget: "این بازیکن شهروند است؛ دکتر لکتر فقط می‌تواند از اعضای تیم مافیا محافظت کند.",
+  lecterTownTarget: "دکتر لکتر فقط می‌تواند از اعضای تیم مافیا محافظت کند.",
   lecterCannotSelf: "نمی‌توانید خودتان را برای محافظت انتخاب کنید.",
   invalidTarget: "هدف انتخابی معتبر نیست.",
   targetNotInGame: "هدف انتخابی عضو این بازی نیست.",
@@ -2219,6 +2358,22 @@ export const fa = {
   },
 
   gunnerBlackMiss: "تیر مشکی بود و اتفاقی نیفتاد.",
+
+  gunnerWarPrompt(seconds: number): string {
+    return ["🔫 به چه کسی می‌خواهی تفنگ جنگی بدهی؟", `⏱ ${seconds} ثانیه`].join("\n");
+  },
+  gunnerWarChosen(name: string): string {
+    return `دریافت شد. تفنگ جنگی برای ${esc(name)} ثبت شد.`;
+  },
+  gunnerWarSkipped: "دریافت شد. امشب تفنگی نمی‌دهید.",
+  gunnerBlackPrompt: "🔫 به چه کسی می‌خواهی تفنگ مشکی بدهی؟",
+  gunnerBlackChosen(name: string): string {
+    return `دریافت شد. تفنگ مشکی برای ${esc(name)} ثبت شد.`;
+  },
+  gunnerCannotSelf: "به خودت نمی‌توانی تفنگ بدهی.",
+  gunnerNoNightsLeft: "دیگر فرصتی برای توزیع تفنگ ندارید.",
+  gunnerMustChooseWarFirst: "ابتدا باید گیرندهٔ تفنگ جنگی را انتخاب کنید.",
+  gunnerSameRecipient: "این بازیکن همین امشب تفنگ جنگی گرفته است؛ نمی‌تواند تفنگ مشکی هم بگیرد.",
 
   invincibleShieldHit(shotsLeft: number): string {
     return `🛡 امشب هدف شلیک قرار گرفتید اما سپرتان ضربه را دفع کرد.\nتحمل ${shotsLeft} ضربهٔ دیگر را دارید.`;
@@ -2714,7 +2869,7 @@ export async function persistPlayers(db: D1Database, gameId: string, players: Pl
 
 export async function persistNightAction(
   db: D1Database, gameId: string, nightNumber: number, actorId: number,
-  actionType: string, targetId: number | null, targetRole?: RoleId | null,
+  actionType: string, targetId: number | null, targetRole?: GuessableRoleId | null,
 ): Promise<void> {
   await db.prepare(
     `INSERT INTO night_actions (game_id, night_number, actor_id, action_type, target_id, target_role, created_at)
@@ -2788,7 +2943,7 @@ export async function deleteLobbyPlayersNotIn(db: D1Database, gameId: string, us
 // =============================================================================
 
 const EXTEND_SECONDS = 60;
-const DEFENSE_SECONDS = 30;
+const DEFENSE_SECONDS = 50;
 const INQUIRY_SECONDS = 15;
 const CITY_INQUIRY_TOTAL = 2;
 
@@ -3059,7 +3214,7 @@ export class GameRoom extends DurableObject<Env> {
       if (natoRole) {
         const nightNumber = Number(natoRole[1]);
         const targetId = Number(natoRole[2]);
-        const roleId = natoRole[3] as RoleId;
+        const roleId = natoRole[3] as GuessableRoleId;
         const result = await this.applyNatoRoleGuess(user.id, nightNumber, targetId, roleId);
         await this.tg.answerCallbackQuery(cq.id, result.alert ? result.text : undefined, result.alert);
         return;
@@ -3094,12 +3249,32 @@ export class GameRoom extends DurableObject<Env> {
         return;
       }
 
-      // Gunner shot callbacks
+      // Gunner shot callbacks (holder of a delivered gun firing during the day)
       const gunnerShot = /^GU(\d+):(-?\d+)$/.exec(data);
       if (gunnerShot) {
         const dayNumber = Number(gunnerShot[1]);
         const targetId = Number(gunnerShot[2]);
         const result = await this.applyGunnerShot(user.id, dayNumber, targetId);
+        await this.tg.answerCallbackQuery(cq.id, result.alert ? result.text : undefined, result.alert);
+        return;
+      }
+
+      // Gunner night distribution — step 1: war gun recipient (or skip)
+      const gunnerWar = /^GW(\d+):(-?\d+)$/.exec(data);
+      if (gunnerWar) {
+        const nightNumber = Number(gunnerWar[1]);
+        const targetId = Number(gunnerWar[2]);
+        const result = await this.applyGunnerGiveWar(user.id, nightNumber, targetId);
+        await this.tg.answerCallbackQuery(cq.id, result.alert ? result.text : undefined, result.alert);
+        return;
+      }
+
+      // Gunner night distribution — step 2: black gun recipient (no skip)
+      const gunnerBlack = /^GB(\d+):(-?\d+)$/.exec(data);
+      if (gunnerBlack) {
+        const nightNumber = Number(gunnerBlack[1]);
+        const targetId = Number(gunnerBlack[2]);
+        const result = await this.applyGunnerGiveBlack(user.id, nightNumber, targetId);
         await this.tg.answerCallbackQuery(cq.id, result.alert ? result.text : undefined, result.alert);
         return;
       }
@@ -3257,8 +3432,10 @@ export class GameRoom extends DurableObject<Env> {
       inquiryVotes: [], cityInquiryCount: CITY_INQUIRY_TOTAL, pendingInquiryDeaths: null,
       accusedUserId: null, temporaryCourtAdminUserId: null, silencedUserIds: [], blockedUserIds: [],
       escortBlockedUserIds: [], doctorSelfHealUsedBy: [], sniperShotsLeft: {}, detectiveChecked: {},
-      natoChancesLeft: 3, paranoidAlertLeft: 2, bomberMarkedTargets: [], independentRoleType: null,
+      godfatherRevealed: false,
+      natoChancesLeft: 2, paranoidAlertLeft: 2, bomberMarkedTargets: [], independentRoleType: null,
       invincibleShieldHits: {}, gunnerGuns: {},
+      gunnerNightsUsed: 0, gunnerWarGunsGiven: 0, gunnerBlackGunsGiven: 0,
       savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, winner: null,
       botUsername: me?.username ?? null, botId: me?.id ?? null, config: { ...DEFAULT_CONFIG },
       createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
@@ -3495,11 +3672,14 @@ export class GameRoom extends DurableObject<Env> {
       game.nightNumber = 0;
       game.dayNumber = 0;
       game.sniperShotsLeft = {};
-      game.natoChancesLeft = 3;
+      game.natoChancesLeft = 2;
       game.paranoidAlertLeft = 2;
       game.bomberMarkedTargets = [];
       game.invincibleShieldHits = {};
       game.gunnerGuns = {};
+      game.gunnerNightsUsed = 0;
+      game.gunnerWarGunsGiven = 0;
+      game.gunnerBlackGunsGiven = 0;
 
       // Store independent role type
       const indie = game.players.find(p => p.independentRole);
@@ -3668,10 +3848,12 @@ export class GameRoom extends DurableObject<Env> {
   private async sendGunnerPanels(): Promise<void> {
     const game = this.game;
     if (!game) return;
+    // Guns can now be held by ANY living player who received one from the
+    // gunner overnight — not just the "gunner" role holder.
     for (const p of living(game.players)) {
-      if (p.role !== "gunner") continue;
       const guns = game.gunnerGuns[String(p.userId)] ?? [];
       if (guns.length === 0) continue;
+      await this.pm(p.userId, fa.gunnerReceivedGun);
       await this.pm(p.userId, fa.gunnerPanelPrompt, this.gunnerKeyboard(game, p));
     }
   }
@@ -3774,6 +3956,7 @@ export class GameRoom extends DurableObject<Env> {
     const res = resolveNight(game);
     game.sniperShotsLeft = consumeSniperShots(game, game.nightActions.filter((a) => a.nightNumber === game.nightNumber && a.type === "snipe"));
     game.players = applyDeaths(game.players, res.deaths, "night", game.nightNumber);
+    await this.notifyLecterSuccession(res.deaths);
 
     for (const a of game.nightActions) {
       if (a.nightNumber === game.nightNumber && a.type === "heal" && a.targetId === a.actorId && !game.doctorSelfHealUsedBy.includes(a.actorId)) {
@@ -3781,8 +3964,8 @@ export class GameRoom extends DurableObject<Env> {
       }
     }
 
-    // NATO chances
-    if (res.natoGuessCorrect === false && res.natoTarget) {
+    // NATO chances — consumed on ANY resolved guess, correct or wrong.
+    if (res.natoTarget && res.natoGuessCorrect !== null) {
       game.natoChancesLeft = Math.max(0, game.natoChancesLeft - 1);
     }
 
@@ -3968,6 +4151,7 @@ export class GameRoom extends DurableObject<Env> {
     // Check Joker win
     if (res.eliminated.independentRole === "joker") {
       game.players = applyDeaths(game.players, [{ userId: res.eliminated.userId, reason: "joker", revealedRole: res.eliminated.role!, revealedIndependentRole: "joker" }], "nomination", game.dayNumber);
+      await this.notifyLecterSuccession([{ userId: res.eliminated.userId, reason: "joker", revealedRole: res.eliminated.role! }]);
       await this.mutePlayer(res.eliminated.userId);
       await this.persist(true);
       await this.group(fa.jokerWins(res.eliminated.displayName));
@@ -4003,6 +4187,7 @@ export class GameRoom extends DurableObject<Env> {
       // Check Joker win
       if (accused.independentRole === "joker") {
         game.players = applyDeaths(game.players, [{ userId: accusedId, reason: "joker", revealedRole: accused.role!, revealedIndependentRole: "joker" }], "verdict", game.dayNumber);
+        await this.notifyLecterSuccession([{ userId: accusedId, reason: "joker", revealedRole: accused.role! }]);
         await this.mutePlayer(accusedId);
         await this.persist(true);
         await this.group(fa.jokerWins(accused.displayName));
@@ -4011,6 +4196,7 @@ export class GameRoom extends DurableObject<Env> {
       }
 
       game.players = applyDeaths(game.players, [{ userId: accusedId, reason: "lynch", revealedRole: accused.role! }], "verdict", game.dayNumber);
+      await this.notifyLecterSuccession([{ userId: accusedId, reason: "lynch", revealedRole: accused.role! }]);
       await this.mutePlayer(accusedId);
     }
 
@@ -4069,9 +4255,9 @@ export class GameRoom extends DurableObject<Env> {
         if (target.team !== "town") return { text: fa.invalidTarget, alert: true };
       }
       if (action === "heal" && player.role === "lecter") {
-        if (targetId === userId) return { text: fa.lecterCannotSelf, alert: true };
-        if (target.team === "town") return { text: fa.lecterTownTarget, alert: true };
-        if (target.team !== "mafia") return { text: fa.invalidTarget, alert: true };
+        // Lecter's targets are exactly the living mafia team (godfather,
+        // nato, and himself) — self-protection is intentionally allowed.
+        if (target.team !== "mafia") return { text: fa.lecterTownTarget, alert: true };
       }
       if (action === "heal" && player.role === "doctor" && targetId === userId) {
         if (game.doctorSelfHealUsedBy.includes(userId)) return { text: "نجات خودتان را قبلاً استفاده کرده‌اید.", alert: true };
@@ -4124,35 +4310,39 @@ export class GameRoom extends DurableObject<Env> {
     if (game.natoChancesLeft <= 0) return { text: "تمام شانس‌های ناتو استفاده شده است.", alert: true };
     if (targetId <= 0) return { text: "یک بازیکن انتخاب کنید.", alert: true };
     const target = findPlayer(game.players, targetId);
-    if (!target || target.status !== "alive") return { text: fa.targetNotInGame, alert: true };
+    if (!target || target.status !== "alive" || target.team === "mafia") return { text: fa.targetNotInGame, alert: true };
 
-    // Send role selection panel. A "skip this night" button is included here
-    // too: without it, a player who backs out at the role-selection step
-    // never registers any night action at all (applyNatoRoleGuess is the
-    // only place that pushes one), so hasFinishedAllNightActions would never
-    // count NATO as done and the night would never end. The skip button
-    // reuses the generic N{night}:nato_guess:0 route handled by
-    // applyNightAction, which records a proper "skipped" action.
-    const townRoles = getTownRoles();
-    const keyboard: InlineKeyboard = townRoles.map((roleId) => {
-      const roleDef = ROLES[roleId];
-      return [{ text: `${roleDef.emoji} ${roleDef.name}`, callback_data: `NR${nightNumber}:${targetId}:${roleId}` }];
+    // Send role selection panel, built from every role actually in play this
+    // game (all mafia/town roles among current players, plus the game's one
+    // independent role if any) — NOT getTownRoles(), which only ever showed
+    // town roles and made mafia/independent guesses impossible to register.
+    // Deliberately no skip button here: choosing a target commits NATO to
+    // that player for the night (per spec, this step must be completed once
+    // started, not abandonable as a skip).
+    const guessableRoles = gameRolesInPlay(game);
+    const keyboard: InlineKeyboard = guessableRoles.map(({ id, emoji, name }) => {
+      return [{ text: `${emoji} ${name}`, callback_data: `NR${nightNumber}:${targetId}:${id}` }];
     });
-    keyboard.push([{ text: "⏭ رد کردن این شب", callback_data: `N${nightNumber}:nato_guess:0` }]);
 
     await this.pm(userId, fa.natoSelectRole(target.displayName), chunk(keyboard, 2) as InlineKeyboard);
     return { text: `بازیکن <b>${target.displayName}</b> انتخاب شد. حالا نقش او را حدس بزنید.`, alert: false };
   }
 
-  private async applyNatoRoleGuess(userId: number, nightNumber: number, targetId: number, roleId: RoleId): Promise<{ text: string; alert: boolean }> {
+  private async applyNatoRoleGuess(userId: number, nightNumber: number, targetId: number, roleId: GuessableRoleId): Promise<{ text: string; alert: boolean }> {
     const game = this.game;
     if (!game || game.status !== "night" || game.nightNumber !== nightNumber) return { text: fa.staleAction, alert: true };
     const player = findPlayer(game.players, userId);
     if (!player || player.status !== "alive" || player.role !== "nato") return { text: fa.actionForbidden, alert: true };
+    if (game.natoChancesLeft <= 0) return { text: "تمام شانس‌های ناتو استفاده شده است.", alert: true };
+    const target = findPlayer(game.players, targetId);
+    if (!target || target.status !== "alive" || target.team === "mafia") return { text: fa.targetNotInGame, alert: true };
+    const roleDef: { name: string } | undefined = (ROLES as Record<string, RoleDef>)[roleId] ?? (INDEPENDENT_ROLES as Record<string, IndependentRoleDef>)[roleId];
+    if (!roleDef) return { text: fa.actionForbidden, alert: true };
 
     // Update existing NATO guess action
     const existingAction = game.nightActions.find((a) => a.actorId === userId && a.type === "nato_guess" && a.nightNumber === nightNumber);
     if (existingAction) {
+      existingAction.targetId = targetId;
       existingAction.targetRole = roleId;
     } else {
       game.nightActions.push({ actorId: userId, type: "nato_guess", targetId, targetRole: roleId, nightNumber, at: now() });
@@ -4161,9 +4351,7 @@ export class GameRoom extends DurableObject<Env> {
     await this.persist();
     await persistNightAction(this.env.DB, game.id, nightNumber, userId, "nato_guess", targetId, roleId);
 
-    const target = findPlayer(game.players, targetId);
-    const roleDef = ROLES[roleId];
-    await this.pm(userId, fa.natoGuessMade(target?.displayName || "بازیکن", roleDef.name));
+    await this.pm(userId, fa.natoGuessMade(target.displayName, roleDef.name));
     return { text: "حدس شما ثبت شد", alert: false };
   }
 
@@ -4193,8 +4381,9 @@ export class GameRoom extends DurableObject<Env> {
   private async applyGunnerShot(userId: number, dayNumber: number, targetId: number): Promise<{ text: string; alert: boolean }> {
     const game = this.game;
     if (!game || game.status !== "day" || game.dayNumber !== dayNumber) return { text: fa.staleAction, alert: true };
+    // Any player who was given a gun can fire it — not just the "gunner" role.
     const player = findPlayer(game.players, userId);
-    if (!player || player.status !== "alive" || player.role !== "gunner") return { text: fa.actionForbidden, alert: true };
+    if (!player || player.status !== "alive") return { text: fa.actionForbidden, alert: true };
     const guns = game.gunnerGuns[String(userId)] ?? [];
     if (guns.length === 0) return { text: "تفنگی برایتان نمانده.", alert: true };
     if (targetId <= 0) return { text: "یک بازیکن انتخاب کنید.", alert: true };
@@ -4215,6 +4404,7 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     game.players = applyDeaths(game.players, [{ userId: target.userId, reason: "gunner", revealedRole: target.role!, revealedIndependentRole: target.independentRole ?? undefined }], "day", game.dayNumber);
+    await this.notifyLecterSuccession([{ userId: target.userId, reason: "gunner", revealedRole: target.role! }]);
     await this.mutePlayer(target.userId);
     await this.persist(true);
     await this.group(fa.playerDied(target.displayName, target.userId, target.team, fa.reasonGunner));
@@ -4224,6 +4414,105 @@ export class GameRoom extends DurableObject<Env> {
     const indieWinner = checkIndependentWinner(game.players, game);
     if (indieWinner) { await this.finish(indieWinner); return { text: "شلیک انجام شد", alert: false }; }
     return { text: "شلیک انجام شد", alert: false };
+  }
+
+  private async applyGunnerGiveWar(userId: number, nightNumber: number, targetId: number): Promise<{ text: string; alert: boolean }> {
+    const game = this.game;
+    if (!game || game.status !== "night" || game.nightNumber !== nightNumber) return { text: fa.staleAction, alert: true };
+    const player = findPlayer(game.players, userId);
+    if (!player || player.status !== "alive" || player.role !== "gunner") return { text: fa.actionForbidden, alert: true };
+    if (game.gunnerNightsUsed >= 2) return { text: fa.gunnerNoNightsLeft, alert: true };
+
+    // Explicit "امشب نمی‌خواهم تفنگ بدهم" — record it and stop; no black
+    // panel is sent, and per spec this does NOT consume one of the 2 nights.
+    if (targetId <= 0) {
+      game.nightActions = game.nightActions.filter((a) => !(a.actorId === userId && (a.type === "gunner_give_war" || a.type === "gunner_give_black") && a.nightNumber === nightNumber));
+      game.nightActions.push({ actorId: userId, type: "gunner_give_war", targetId: null, nightNumber, at: now() });
+      await this.persist();
+      await persistNightAction(this.env.DB, game.id, nightNumber, userId, "gunner_give_war", null);
+      await this.pm(userId, fa.gunnerWarSkipped);
+      if (hasFinishedAllNightActions(game)) {
+        game.phaseEndsAt = Math.min(game.phaseEndsAt ?? now() + 3000, now() + 3000);
+        await this.schedulePhaseTimers();
+        await this.persist();
+      }
+      return { text: "ثبت شد", alert: false };
+    }
+
+    // Backend-enforced self-check on the Telegram numeric ID — never trust
+    // that the UI already excluded the gunner from the list.
+    if (targetId === userId) return { text: fa.gunnerCannotSelf, alert: true };
+
+    const target = findPlayer(game.players, targetId);
+    if (!target) return { text: fa.targetNotInGame, alert: true };
+    if (target.status !== "alive") return { text: "این بازیکن زنده نیست.", alert: true };
+    if (game.gunnerWarGunsGiven >= 2) return { text: fa.gunnerNoNightsLeft, alert: true };
+
+    // Re-picking the war target before finishing black clears any stale
+    // black selection tied to the old target.
+    game.nightActions = game.nightActions.filter((a) => !(a.actorId === userId && (a.type === "gunner_give_war" || a.type === "gunner_give_black") && a.nightNumber === nightNumber));
+    game.nightActions.push({ actorId: userId, type: "gunner_give_war", targetId, nightNumber, at: now() });
+    await this.persist();
+    await persistNightAction(this.env.DB, game.id, nightNumber, userId, "gunner_give_war", targetId);
+
+    await this.pm(userId, fa.gunnerWarChosen(target.displayName));
+    await this.pm(userId, fa.gunnerBlackPrompt, gunnerBlackKeyboard(game.players, userId, targetId, nightNumber));
+    return { text: "ثبت شد", alert: false };
+  }
+
+  private async applyGunnerGiveBlack(userId: number, nightNumber: number, targetId: number): Promise<{ text: string; alert: boolean }> {
+    const game = this.game;
+    if (!game || game.status !== "night" || game.nightNumber !== nightNumber) return { text: fa.staleAction, alert: true };
+    const player = findPlayer(game.players, userId);
+    if (!player || player.status !== "alive" || player.role !== "gunner") return { text: fa.actionForbidden, alert: true };
+    if (game.gunnerNightsUsed >= 2) return { text: fa.gunnerNoNightsLeft, alert: true };
+
+    const warAction = game.nightActions.find((a) => a.actorId === userId && a.type === "gunner_give_war" && a.nightNumber === nightNumber);
+    if (!warAction || warAction.targetId === null) return { text: fa.gunnerMustChooseWarFirst, alert: true };
+    const warTargetId = warAction.targetId;
+
+    // No skip button on this step — a missing/invalid target is just rejected.
+    if (targetId <= 0) return { text: "یک بازیکن انتخاب کنید.", alert: true };
+    if (targetId === userId) return { text: fa.gunnerCannotSelf, alert: true };
+    if (targetId === warTargetId) return { text: fa.gunnerSameRecipient, alert: true };
+
+    const target = findPlayer(game.players, targetId);
+    if (!target) return { text: fa.targetNotInGame, alert: true };
+    if (target.status !== "alive") return { text: "این بازیکن زنده نیست.", alert: true };
+
+    const warTarget = findPlayer(game.players, warTargetId);
+    if (!warTarget || warTarget.status !== "alive") return { text: "گیرندهٔ تفنگ جنگی دیگر در بازی زنده نیست.", alert: true };
+    if (game.gunnerWarGunsGiven >= 2 || game.gunnerBlackGunsGiven >= 2) return { text: fa.gunnerNoNightsLeft, alert: true };
+
+    game.nightActions = game.nightActions.filter((a) => !(a.actorId === userId && a.type === "gunner_give_black" && a.nightNumber === nightNumber));
+    game.nightActions.push({ actorId: userId, type: "gunner_give_black", targetId, nightNumber, at: now() });
+    await this.persist();
+    await persistNightAction(this.env.DB, game.id, nightNumber, userId, "gunner_give_black", targetId);
+
+    // Both picks are now valid and complete — deliver both guns together,
+    // atomically, and only now consume one of the gunner's 2 nights. A gun's
+    // type is never revealed to its recipient until they actually fire it.
+    const warGuns = game.gunnerGuns[String(warTargetId)] ?? [];
+    warGuns.push("war");
+    game.gunnerGuns[String(warTargetId)] = warGuns;
+
+    const blackGuns = game.gunnerGuns[String(targetId)] ?? [];
+    blackGuns.push("black");
+    game.gunnerGuns[String(targetId)] = blackGuns;
+
+    game.gunnerNightsUsed += 1;
+    game.gunnerWarGunsGiven += 1;
+    game.gunnerBlackGunsGiven += 1;
+
+    await this.pm(userId, fa.gunnerBlackChosen(target.displayName));
+    await this.persist(true);
+
+    if (hasFinishedAllNightActions(game)) {
+      game.phaseEndsAt = Math.min(game.phaseEndsAt ?? now() + 3000, now() + 3000);
+      await this.schedulePhaseTimers();
+      await this.persist();
+    }
+    return { text: "ثبت شد", alert: false };
   }
 
   private async applyNomination(userId: number, dayNumber: number, targetId: number): Promise<{ text: string; alert: boolean }> {
@@ -4341,14 +4630,16 @@ export class GameRoom extends DurableObject<Env> {
       }
 
       if (p.role === "gunner") {
-        const guns = shuffle<GunType>(["war", "black"]);
-        game.gunnerGuns[String(p.userId)] = guns;
-        await this.pm(p.userId, fa.gunnerReceivedGun);
+        if (game.gunnerNightsUsed >= 2) {
+          await this.pm(p.userId, fa.nightCitizenWait);
+        } else {
+          await this.pm(p.userId, fa.gunnerWarPrompt(secs), gunnerWarKeyboard(game.players, p.userId, game.nightNumber));
+        }
         continue;
       }
 
       if (p.role === "lecter") {
-        await this.pm(p.userId, fa.lecterPrompt(secs), nightTargetKeyboard(game.players, p.userId, game.nightNumber, "heal", { skipLabel: "⏭ امشب محافظت نمی‌کنم" }));
+        await this.pm(p.userId, fa.lecterPrompt(secs), nightTargetKeyboard(game.players, p.userId, game.nightNumber, "heal", { includeSelf: true, skipLabel: "⏭ امشب محافظت نمی‌کنم" }));
         continue;
       }
 
@@ -4423,7 +4714,7 @@ export class GameRoom extends DurableObject<Env> {
     if (!game) return;
     if (game.status === "night") {
       for (const p of living(game.players)) {
-        const needs = nightActionTypesFor(p.role, p.independentRole).filter((a) => a !== "snipe" && a !== "escort_block" && a !== "paranoid_alert" && a !== "nato_guess");
+        const needs = nightActionTypesFor(p.role, p.independentRole).filter((a) => a !== "snipe" && a !== "escort_block" && a !== "paranoid_alert" && a !== "nato_guess" && a !== "gunner_give_war");
         const missing = needs.some((a) => !game.nightActions.some((x) => x.actorId === p.userId && x.type === a && x.nightNumber === game.nightNumber));
         if (missing && needs.length) await this.pm(p.userId, fa.nightRemind);
       }
@@ -4461,12 +4752,26 @@ export class GameRoom extends DurableObject<Env> {
     await this.tg.sendMessage(userId, fa.roleCard(p, mates));
   }
 
+  // Runs the Lecter->Godfather succession check and — if it fired — tells
+  // ONLY the promoted player via PV. Deliberately never touches this.group()
+  // or any public/group-facing message; the group only ever sees the
+  // original Godfather's death, never who (if anyone) replaced him.
+  private async notifyLecterSuccession(deaths: DeathRecord[]): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    const promoted = checkLecterSuccession(game, deaths);
+    if (promoted) {
+      await this.pm(promoted.userId, fa.lecterSuccession());
+    }
+  }
+
   private async eliminate(userId: number, reason: "left" | "host"): Promise<void> {
     const game = this.game;
     if (!game) return;
     const p = findPlayer(game.players, userId);
     if (!p || p.status !== "alive" || !p.role) return;
     game.players = applyDeaths(game.players, [{ userId, reason, revealedRole: p.role, revealedIndependentRole: p.independentRole }], game.phase, game.phase === "night" ? game.nightNumber : game.dayNumber);
+    await this.notifyLecterSuccession([{ userId, reason, revealedRole: p.role }]);
     await this.mutePlayer(userId);
     await this.persist(true);
     await this.group(fa.playerDied(p.displayName, p.userId, p.team, reason === "left" ? fa.reasonLeft : fa.reasonLynch));
@@ -4870,7 +5175,7 @@ export class GameRoom extends DurableObject<Env> {
       actorId: r.actor_id,
       type: r.action_type as NightActionType,
       targetId: r.target_id,
-      targetRole: (r.target_role as RoleId | null) ?? null,
+      targetRole: (r.target_role as GuessableRoleId | null) ?? null,
       nightNumber: r.night_number,
       at: r.created_at,
     }));
@@ -4913,6 +5218,28 @@ export class GameRoom extends DurableObject<Env> {
       }
     }
 
+    // Best-effort replay: has the Godfather already been investigated once
+    // before (his one-time "town" reveal already used up)?
+    const godfatherPlayer = players.find((p) => p.role === "godfather");
+    const godfatherRevealed = godfatherPlayer
+      ? nightActions.some((a) => a.type === "investigate" && a.targetId === godfatherPlayer.userId)
+      : false;
+
+    // Best-effort replay: how many nights did the gunner fully complete
+    // (both a war and a black gun successfully assigned that same night)?
+    // Guns already delivered but not yet fired are NOT restored here (same
+    // unavoidable cold-recovery gap as verdictVotes/inquiryVotes below) —
+    // only the "chances used" counters, so a restart can't grant extra nights.
+    let gunnerNightsUsed = 0, gunnerWarGunsGiven = 0, gunnerBlackGunsGiven = 0;
+    const gunnerNightsSeen = new Set(
+      nightActions.filter((a) => a.type === "gunner_give_war" && a.targetId !== null).map((a) => a.nightNumber),
+    );
+    for (const n of gunnerNightsSeen) {
+      const hasWar = nightActions.some((a) => a.type === "gunner_give_war" && a.nightNumber === n && a.targetId !== null);
+      const hasBlack = nightActions.some((a) => a.type === "gunner_give_black" && a.nightNumber === n && a.targetId !== null);
+      if (hasWar && hasBlack) { gunnerNightsUsed += 1; gunnerWarGunsGiven += 1; gunnerBlackGunsGiven += 1; }
+    }
+
     const config: GameConfig = gameRow.config_json ? { ...DEFAULT_CONFIG, ...JSON.parse(gameRow.config_json) } : { ...DEFAULT_CONFIG };
     const savedDefaultPermissions = gameRow.saved_default_permissions ? (JSON.parse(gameRow.saved_default_permissions) as ChatPermissions) : null;
     const independentRoleType = players.find((p) => p.independentRole)?.independentRole ?? null;
@@ -4948,11 +5275,13 @@ export class GameRoom extends DurableObject<Env> {
       doctorSelfHealUsedBy: [],
       sniperShotsLeft: {},
       detectiveChecked,
-      natoChancesLeft: 3,
+      godfatherRevealed,
+      natoChancesLeft: 2,
       paranoidAlertLeft: 2,
       bomberMarkedTargets,
       invincibleShieldHits: {},
       gunnerGuns: {},
+      gunnerNightsUsed, gunnerWarGunsGiven, gunnerBlackGunsGiven,
       independentRoleType,
       savedDefaultPermissions,
       // FIX #6: prefer the persisted pointer to the lobby/status card so

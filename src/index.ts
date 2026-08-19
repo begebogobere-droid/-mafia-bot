@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
   started_bot INTEGER NOT NULL DEFAULT 0,
   games_played INTEGER NOT NULL DEFAULT 0,
   games_won INTEGER NOT NULL DEFAULT 0,
+  recent_roles TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -110,6 +111,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
   // "table game_players has no column named independent_role" — the table
   // pre-dated that column being added to SCHEMA_SQL and was never migrated.
   const tableMigrations: Record<string, Record<string, string>> = {
+    users: {
+      recent_roles: "TEXT",
+    },
     games: {
       state_json: "TEXT",
       last_group_message_id: "INTEGER",
@@ -303,6 +307,12 @@ export interface Player {
   deathRound?: number;
   originalMember: SavedMember | null;
   joinedAt: number;
+  // Set only by checkLecterSuccession when this player is promoted to
+  // Godfather mid-game (their `.role` becomes "godfather" at that point).
+  // Purely for end-game report text ("پدرخوانده (دکتر لکتر سابق)" /
+  // "پدرخوانده (ناتو سابق)") — does not affect any game logic, abilities,
+  // or the succession system itself.
+  promotedFrom?: "lecter" | "nato";
 }
 
 export interface NightAction {
@@ -538,6 +548,38 @@ export function shuffle<T>(items: T[]): T[] {
     arr[j] = tmp;
   }
   return arr;
+}
+
+// Picks a random index using crypto randomness, weighted by `weights`
+// (all weights must be >= 0). Falls back to a uniform pick if every
+// weight is zero, so a role is never truly impossible to draw.
+function weightedPickIndex(weights: number[]): number {
+  const total = weights.reduce((a, b) => a + b, 0);
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  if (total <= 0) return buf[0]! % weights.length;
+  const r = (buf[0]! / 0x100000000) * total;
+  let acc = 0;
+  for (let i = 0; i < weights.length; i++) {
+    acc += weights[i]!;
+    if (r < acc) return i;
+  }
+  return weights.length - 1;
+}
+
+// Lower weight = less likely to be picked for this role. A role that
+// shows up in the player's recent history gets penalized, and more so the
+// more recently they had it — so getting the SAME role again right away
+// is unlikely, while it's not literally impossible (keeps things random).
+function roleWeight(role: RoleId, history: RoleId[]): number {
+  let weight = 100;
+  for (let i = 0; i < history.length; i++) {
+    if (history[i] === role) {
+      const recency = i + 1; // more recent entries are later in the array
+      weight -= 30 * recency;
+    }
+  }
+  return Math.max(weight, 5);
 }
 
 export function randomId(prefix = "g"): string {
@@ -1060,10 +1102,20 @@ export function nightTargetsFor(
   return players.filter((p) => {
     if (p.status !== "alive") return false;
     if (!opts?.includeSelf && p.userId === actorId) return false;
-    if (type === "mafia_kill") return p.team === "town";
+    // Godfather's kill target list (also used identically by any promoted
+    // successor — Lecter or NATO — once their `.role` becomes "godfather",
+    // since this filter runs purely off `p.team`, not off role/actor
+    // identity). Must be: all living players except living mafia teammates
+    // (the actor's own team) — this deliberately includes Independents,
+    // who are NOT on the "mafia" team and must never be filtered out here
+    // just because they aren't "town" either.
+    if (type === "mafia_kill") return p.team !== "mafia";
     if (type === "heal" && actor?.role === "lecter") return p.team === "mafia";
     if (type === "nato_guess") return p.team !== "mafia";
-    if (type === "johnny_kill") return p.team === "town";
+    // Johnny is the game's sole Independent, so there's never another
+    // Independent to exclude. His kill panel is simply every living player
+    // except himself — no team/role filter at all.
+    if (type === "johnny_kill") return true;
     return true;
   });
 }
@@ -1218,7 +1270,7 @@ export const ROLES: Record<RoleId, RoleDef> = {
     name: "تفنگدار",
     emoji: "🔫",
     title: "تفنگدار",
-    description: "در کل بازی فقط ۲ شب می‌توانید تفنگ توزیع کنید. هر شب یک تفنگ جنگی و یک تفنگ مشکی به دو بازیکن زندهٔ متفاوت (هرگز به خودتان) می‌دهید؛ اگر هرکدام را کامل نکنید هیچ تفنگی تحویل داده نمی‌شود و فرصتتان هدر نمی‌رود. گیرنده تا لحظهٔ شلیک نمی‌داند چه نوع تفنگی دارد؛ تفنگ جنگی هدف را همان لحظه حذف می‌کند، تفنگ مشکی بی‌اثر است.",
+    description: "در کل بازی فقط ۲ شب می‌توانید تفنگ توزیع کنید. هر شب یک تفنگ جنگی و یک تفنگ مشقی به دو بازیکن زندهٔ متفاوت (هرگز به خودتان) می‌دهید؛ اگر هرکدام را کامل نکنید هیچ تفنگی تحویل داده نمی‌شود و فرصتتان هدر نمی‌رود. گیرنده تا لحظهٔ شلیک نمی‌داند چه نوع تفنگی دارد؛ تفنگ جنگی هدف را همان لحظه حذف می‌کند، تفنگ مشقی بی‌اثر است.",
     nightAction: null,
     nightOptional: true,
   },
@@ -1338,7 +1390,15 @@ export function buildRoleListNew(playerCount: number): RoleId[] {
   return roles;
 }
 
-export function assignRoles(players: Player[]): Player[] {
+// BUGFIX (fair role distribution): roleHistory (each player's last few
+// roles, most recent last) lets this weight its random picks away from a
+// role a player just had, instead of a plain uniform shuffle that could
+// hand the same person the same role 4-5 games running. Composition
+// guarantees are unchanged — every roleList role still lands exactly once
+// among the non-independent players, just via weighted-random selection
+// instead of a straight positional zip; still fully random, just less
+// repetitive.
+export function assignRoles(players: Player[], roleHistory: Record<number, RoleId[]> = {}): Player[] {
   const playerCount = players.length;
   const roleList = buildRoleListNew(playerCount); // exactly playerCount - 1 entries by design
 
@@ -1365,18 +1425,33 @@ export function assignRoles(players: Player[]): Player[] {
   // never off `.role` for independent players) and can't disturb the real
   // composition since it never consumes a roleList slot.
   const shuffledPlayers = shuffle([...players]);
-  const shuffledRoles = shuffle([...roleList]);
+  const indiePlayer = shuffledPlayers[playerCount - 1]!;
+  const rolePlayers = shuffledPlayers.slice(0, playerCount - 1);
   const flavorRole = roleList[Math.floor(Math.random() * roleList.length)]!;
 
-  const assigned = shuffledPlayers.map((p, i) => {
-    const isIndie = i === players.length - 1;
-    const role = isIndie ? flavorRole : shuffledRoles[i]!;
+  // Weighted-random 1:1 assignment: go through the roles in random order
+  // and, for each one, weight-pick which remaining player gets it based on
+  // how recently (if ever) they had that exact role.
+  const shuffledRoles = shuffle([...roleList]);
+  const remainingPlayers = [...rolePlayers];
+  const roleByUserId = new Map<number, RoleId>();
+  for (const role of shuffledRoles) {
+    const weights = remainingPlayers.map((p) => roleWeight(role, roleHistory[p.userId] ?? []));
+    const idx = weightedPickIndex(weights);
+    const chosen = remainingPlayers[idx]!;
+    roleByUserId.set(chosen.userId, role);
+    remainingPlayers.splice(idx, 1);
+  }
+
+  const assigned = shuffledPlayers.map((p) => {
+    const isIndie = p.userId === indiePlayer.userId;
+    const role = isIndie ? flavorRole : roleByUserId.get(p.userId)!;
     const def = ROLES[role];
 
     return {
       ...p,
       role,
-      team: isIndie ? "independent" : def.team,
+      team: isIndie ? ("independent" as const) : def.team,
       independentRole: isIndie ? indieRole : null,
     };
   });
@@ -1492,7 +1567,17 @@ export function getSharedWinnerIds(players: Player[], winner: Team): number[] {
 }
 
 export function dayDurationSeconds(game: GameState): number {
-  const n = living(game.players).length;
+  // BUGFIX: this used to scale off living(game.players).length — the
+  // number of players CURRENTLY alive. Since players never get removed
+  // from the array (applyDeaths only flips their status, see above), that
+  // count silently shrinks every round as people die, so day 2/3/4 would
+  // get progressively shorter (sometimes down to the 90s floor) even
+  // though the host never changed any setting. Day length should scale
+  // with how big the LOBBY was, not how many people happen to still be
+  // alive right now — so use the fixed original player count instead,
+  // which stays constant for the whole game and always yields the exact
+  // duration implied by the configured settings.
+  const n = game.players.length;
   const raw = game.config.daySecondsBase + game.config.daySecondsPerPlayer * n;
   return Math.min(game.config.daySecondsMax, Math.max(90, raw));
 }
@@ -1752,11 +1837,11 @@ export function resolveNight(game: GameState): NightResolution {
   const dead = new Set<number>();
   const deaths: DeathRecord[] = [];
   const shieldAbsorbed: number[] = [];
-  const markDead = (userId: number, reason: DeathRecord["reason"]) => {
+  const markDead = (userId: number, reason: DeathRecord["reason"], opts?: { bypassShield?: boolean }) => {
     if (dead.has(userId)) return;
     const p = findPlayer(game.players, userId);
     if (!p || p.status !== "alive" || !p.role) return;
-    if (p.role === "invincible" && p.team === "town") {
+    if (!opts?.bypassShield && p.role === "invincible" && p.team === "town") {
       const key = String(userId);
       const hits = (game.invincibleShieldHits[key] ?? 0) + 1;
       game.invincibleShieldHits[key] = hits;
@@ -1795,8 +1880,16 @@ export function resolveNight(game: GameState): NightResolution {
           natoTarget = a.targetId;
           if (actualRole === a.targetRole) {
             natoGuessCorrect = true;
-            if (!protectedIds.has(a.targetId) && !paranoidAlerts.has(a.targetId)) {
-              markDead(a.targetId, "nato");
+            // A correct NATO guess is a direct result: only Escort
+            // blocking NATO before this action ran (already filtered out
+            // of `active`, above) can stop it. Doctor/Lecter Save
+            // (protectedIds) and the Tough Guy shield (invincible) must
+            // NOT be able to neutralize or soften it, unlike a normal
+            // shot — hence bypassShield here and no protectedIds check.
+            // Paranoid's alert/retaliation mechanic is intentionally left
+            // exactly as-is (see the paranoid-alert section below).
+            if (!paranoidAlerts.has(a.targetId)) {
+              markDead(a.targetId, "nato", { bypassShield: true });
             }
           } else {
             natoGuessCorrect = false;
@@ -1984,15 +2077,20 @@ export function applyDeaths(
   });
 }
 
-// Central Doctor Lecter succession check. Must run after EVERY death path
+// Central Godfather succession check. Must run after EVERY death path
 // (night resolution, lynch, joker self-elimination, gunner shot, host
-// removal, etc.) so a dead Godfather is always followed by their still-alive
-// Lecter becoming the new Godfather — immediately, not just at night's end.
-// Mutates game.players in place; returns the promoted player (for a private
-// notification) or null if no succession happened. Entirely silent as far
-// as this function is concerned — it does not send any messages itself, so
-// callers control exactly who finds out (see the "fully secret" requirement:
-// only the promoted player is ever told, never the group).
+// removal, etc.) so a dead Godfather is always immediately followed by a
+// successor — not just at night's end. Priority order: Doctor Lecter first
+// (if alive), otherwise NATO (if alive); if neither is alive, no successor
+// is chosen. Mutates game.players in place — the promoted player's `.role`
+// is actually reassigned to "godfather" (not just cosmetic), so every later
+// piece of game logic (night keyboards, mafia-kill eligibility, etc.)
+// correctly treats them as the Godfather and no longer as Lecter/NATO.
+// Returns the promoted player (for a private notification) or null if no
+// succession happened. Entirely silent as far as this function is
+// concerned — it does not send any messages itself, so callers control
+// exactly who finds out (see the "fully secret" requirement: only the
+// promoted player is ever told, never the group).
 export function checkLecterSuccession(game: GameState, deaths: DeathRecord[]): Player | null {
   // Guard: an independent player's `.role` is cosmetic flavor text (see
   // assignRoles) and can coincidentally read "godfather" too — so this must
@@ -2006,9 +2104,18 @@ export function checkLecterSuccession(game: GameState, deaths: DeathRecord[]): P
   });
   if (!godfatherDied) return null;
   const lecter = game.players.find((p) => p.role === "lecter" && p.status === "alive");
-  if (!lecter) return null;
-  lecter.role = "godfather";
-  return lecter;
+  if (lecter) {
+    lecter.role = "godfather";
+    lecter.promotedFrom = "lecter";
+    return lecter;
+  }
+  const nato = game.players.find((p) => p.role === "nato" && p.status === "alive");
+  if (nato) {
+    nato.role = "godfather";
+    nato.promotedFrom = "nato";
+    return nato;
+  }
+  return null;
 }
 
 export function consumeSniperShots(game: GameState, actions: NightAction[]): Record<string, number> {
@@ -2401,7 +2508,7 @@ export const fa = {
     return `🔫 کاربر ${esc(name)} یک تفنگ داشت.\nتفنگش را روی ${esc(targetName)} گذاشت و شلیک کرد.`;
   },
 
-  gunnerBlackMiss: "تیر مشکی بود و اتفاقی نیفتاد.",
+  gunnerBlackMiss: "تیر مشقی بود و اتفاقی نیفتاد.",
 
   gunnerWarPrompt(seconds: number): string {
     return ["🔫 به چه کسی می‌خواهی تفنگ جنگی بدهی؟", `⏱ ${seconds} ثانیه`].join("\n");
@@ -2410,14 +2517,14 @@ export const fa = {
     return `دریافت شد. تفنگ جنگی برای ${esc(name)} ثبت شد.`;
   },
   gunnerWarSkipped: "دریافت شد. امشب تفنگی نمی‌دهید.",
-  gunnerBlackPrompt: "🔫 به چه کسی می‌خواهی تفنگ مشکی بدهی؟",
+  gunnerBlackPrompt: "🔫 به چه کسی می‌خواهی تفنگ مشقی بدهی؟",
   gunnerBlackChosen(name: string): string {
-    return `دریافت شد. تفنگ مشکی برای ${esc(name)} ثبت شد.`;
+    return `دریافت شد. تفنگ مشقی برای ${esc(name)} ثبت شد.`;
   },
   gunnerCannotSelf: "به خودت نمی‌توانی تفنگ بدهی.",
   gunnerNoNightsLeft: "دیگر فرصتی برای توزیع تفنگ ندارید.",
   gunnerMustChooseWarFirst: "ابتدا باید گیرندهٔ تفنگ جنگی را انتخاب کنید.",
-  gunnerSameRecipient: "این بازیکن همین امشب تفنگ جنگی گرفته است؛ نمی‌تواند تفنگ مشکی هم بگیرد.",
+  gunnerSameRecipient: "این بازیکن همین امشب تفنگ جنگی گرفته است؛ نمی‌تواند تفنگ مشقی هم بگیرد.",
 
   invincibleShieldHit(shotsLeft: number): string {
     return `🛡 امشب هدف شلیک قرار گرفتید اما سپرتان ضربه را دفع کرد.\nتحمل ${shotsLeft} ضربهٔ دیگر را دارید.`;
@@ -2535,7 +2642,7 @@ export const fa = {
         const mark = p.status === "alive" ? "●" : "○";
         const roleStr = p.independentRole 
           ? `${INDEPENDENT_ROLES[p.independentRole].emoji} ${INDEPENDENT_ROLES[p.independentRole].name}`
-          : roleLabel(p.role);
+          : roleLabel(p.role) + (p.promotedFrom === "lecter" ? " (دکتر لکتر سابق)" : p.promotedFrom === "nato" ? " (ناتو سابق)" : "");
         const winTag = sharedSet.has(p.userId) ? " 🏆" : "";
         return `${mark} ${esc(p.displayName)} — ${roleStr}${winTag}`;
       })
@@ -2628,6 +2735,12 @@ export const fa = {
   },
   mafiaSawKill(actor: string, target: string): string {
     return `🔪 ${esc(actor)} هدف قتل را ${esc(target)} گذاشت.`;
+  },
+  mafiaSawSave(actor: string, target: string): string {
+    return `🩺 ${esc(actor)}، ${esc(target)} را سیو کرد.`;
+  },
+  mafiaSawNatoGuess(actor: string, target: string, roleName: string): string {
+    return `🎯 ${esc(actor)} حدس زد: ${esc(target)} = ${esc(roleName)}`;
   },
   extended(seconds: number): string {
     return `⏱ زمان بحث ${seconds} ثانیه تمدید شد.`;
@@ -2722,7 +2835,30 @@ export const fa = {
 
   cityInquiryNotAllowed: "شما نمی‌توانید در این رأی‌گیری نظر دهید.",
 
-  cityInquiryApproved(deaths: DeathRecord[], players: Player[], remaining: number): string {
+  // Sent privately to a voter the moment their vote is registered.
+  cityInquiryVotePrivate(choice: boolean): string {
+    return choice
+      ? "نتیجه شما ثبت شد، شما با استعلام موافقت کردید."
+      : "نتیجه شما ثبت شد، شما با استعلام مخالفت کردید.";
+  },
+
+  // Live running tally posted to the group as votes come in — only the
+  // count for the choice that was just cast/updated, singular vs plural
+  // verb form depending on the count.
+  cityInquiryVoteGroup(choice: boolean, count: number): string {
+    const verb = count === 1 ? "کرد" : "کردند";
+    return choice
+      ? `${count} نفر با استعلام موافقت ${verb}.`
+      : `${count} نفر با استعلام مخالفت ${verb}.`;
+  },
+
+  // Final tally, always shown once the 30s vote window ends — regardless
+  // of whether it was approved, declined, or tied.
+  cityInquiryResult(yes: number, no: number): string {
+    return `نتیجه استعلام:\n\n${yes} نفر موافقت و ${no} نفر مخالفت کردند.`;
+  },
+
+  cityInquiryRolesRevealed(deaths: DeathRecord[], players: Player[], remaining: number): string {
     const lines = deaths.map((d) => {
       const p = findPlayer(players, d.userId);
       const name = p ? p.displayName : "؟";
@@ -2732,17 +2868,13 @@ export const fa = {
       return `• ${mention(d.userId, name)} — <b>${roleStr}</b>`;
     });
     return [
-      "🔎 <b>نتیجهٔ استعلام</b>",
-      "",
-      "شهر رأی به استعلام داد. نقش بازیکنانی که امروز حذف شدند فاش شد:",
+      "نقش بازیکنانی که امروز حذف شدند فاش شد:",
       "",
       ...lines,
       "",
       `استعلام باقی‌ماندهٔ شهر: ${remaining}`,
     ].join("\n");
   },
-
-  cityInquiryDeclined: "🔎 شهر رأی به استعلام نداد.",
 };
 
 export function phaseFa(phase: string): string {
@@ -2814,6 +2946,48 @@ export async function markStarted(db: D1Database, userId: number): Promise<void>
 export async function hasStartedBot(db: D1Database, userId: number): Promise<boolean> {
   const row = await db.prepare(`SELECT started_bot FROM users WHERE telegram_id = ?`).bind(userId).first<{ started_bot: number }>();
   return !!row?.started_bot;
+}
+
+// BUGFIX (fair role distribution): fetches each player's last few assigned
+// roles so assignRoles() can weight its random pick away from roles a
+// player just had, instead of a plain uniform shuffle that lets the same
+// role land on the same person several games in a row.
+export async function getRoleHistory(db: D1Database, userIds: number[]): Promise<Record<number, RoleId[]>> {
+  if (userIds.length === 0) return {};
+  const placeholders = userIds.map(() => "?").join(",");
+  const rows = await db
+    .prepare(`SELECT telegram_id, recent_roles FROM users WHERE telegram_id IN (${placeholders})`)
+    .bind(...userIds)
+    .all<{ telegram_id: number; recent_roles: string | null }>();
+  const map: Record<number, RoleId[]> = {};
+  for (const row of rows.results ?? []) {
+    try {
+      map[row.telegram_id] = row.recent_roles ? (JSON.parse(row.recent_roles) as RoleId[]) : [];
+    } catch {
+      map[row.telegram_id] = [];
+    }
+  }
+  return map;
+}
+
+// Records this game's assigned role onto each player's rolling history
+// (kept to the last 3), so future games in the same chat/bot can weight
+// against repeats. Best-effort — a failure here must never block the game
+// from starting, so callers should wrap this in its own try/catch.
+export async function saveRoleHistory(
+  db: D1Database,
+  previousHistory: Record<number, RoleId[]>,
+  assignments: { userId: number; role: RoleId }[],
+): Promise<void> {
+  if (assignments.length === 0) return;
+  const ts = Date.now();
+  const statements = assignments.map(({ userId, role }) => {
+    const next = [...(previousHistory[userId] ?? []), role].slice(-3);
+    return db
+      .prepare(`UPDATE users SET recent_roles = ?, updated_at = ? WHERE telegram_id = ?`)
+      .bind(JSON.stringify(next), ts, userId);
+  });
+  await db.batch(statements);
 }
 
 export async function findActiveGameForUser(db: D1Database, userId: number): Promise<{ game_id: string; chat_id: number; status: string } | null> {
@@ -2989,7 +3163,7 @@ export async function deleteLobbyPlayersNotIn(db: D1Database, gameId: string, us
 
 const EXTEND_SECONDS = 60;
 const DEFENSE_SECONDS = 50;
-const INQUIRY_SECONDS = 15;
+const INQUIRY_SECONDS = 30;
 const CITY_INQUIRY_TOTAL = 2;
 
 const COURT_ADMIN_MINIMAL_RIGHTS: Record<string, boolean> = {
@@ -3728,7 +3902,23 @@ export class GameRoom extends DurableObject<Env> {
     // run /new again.
     try {
       await this.snapshotPermissions();
-      game.players = assignRoles(game.players);
+      // BUGFIX (fair role distribution): weight the random assignment away
+      // from each player's recently-played roles instead of a plain
+      // uniform shuffle. Best-effort history lookup — if D1 is unreachable
+      // this just falls back to an unweighted (still fully random) draw
+      // rather than blocking the game from starting.
+      let roleHistory: Record<number, RoleId[]> = {};
+      try {
+        roleHistory = await getRoleHistory(this.env.DB, game.players.map((p) => p.userId));
+      } catch (err) {
+        console.error("getRoleHistory failed, falling back to unweighted assignment", err);
+      }
+      game.players = assignRoles(game.players, roleHistory);
+      try {
+        await saveRoleHistory(this.env.DB, roleHistory, game.players.map((p) => ({ userId: p.userId, role: p.role! })));
+      } catch (err) {
+        console.error("saveRoleHistory failed", err);
+      }
       game.startedAt = now();
       game.nightNumber = 0;
       game.dayNumber = 0;
@@ -4152,14 +4342,13 @@ export class GameRoom extends DurableObject<Env> {
     game.pendingInquiryDeaths = null;
     game.inquiryVotes = game.inquiryVotes.filter((v) => v.dayNumber !== dayNumber);
 
-    let resolutionText = "";
+    // Final tally is always shown once the vote window ends, win/lose/tie
+    // alike — only the role reveal itself is conditional on approval.
+    let resolutionText = fa.cityInquiryResult(res.yes, res.no);
     if (res.approved) {
       game.cityInquiryCount = Math.max(0, game.cityInquiryCount - 1);
-      resolutionText = fa.cityInquiryApproved(deaths, game.players, game.cityInquiryCount);
-    } else if (!res.tied) {
-      resolutionText = fa.cityInquiryDeclined;
+      resolutionText += "\n\n" + fa.cityInquiryRolesRevealed(deaths, game.players, game.cityInquiryCount);
     }
-    // A tie stays silent by design — no tally is announced either way.
 
     await this.persist(true);
     await addEvent(this.env.DB, game.id, "inquiry_resolved", res);
@@ -4174,7 +4363,14 @@ export class GameRoom extends DurableObject<Env> {
     game.inquiryVotes = game.inquiryVotes.filter((v) => !(v.voterId === userId && v.dayNumber === dayNumber));
     game.inquiryVotes.push({ voterId: userId, choice, dayNumber, at: now() });
     await this.persist();
-    return { text: choice ? "رأی شما ثبت شد: بله" : "رأی شما ثبت شد: خیر", alert: false };
+
+    // Private confirmation to the voter, plus a live-updating tally for
+    // just their choice's running count posted to the group.
+    await this.pm(userId, fa.cityInquiryVotePrivate(choice));
+    const count = game.inquiryVotes.filter((v) => v.dayNumber === dayNumber && v.choice === choice).length;
+    await this.group(fa.cityInquiryVoteGroup(choice, count));
+
+    return { text: "", alert: false };
   }
 
   private getDeathReasonText(reason: DeathReason): string {
@@ -4209,17 +4405,12 @@ export class GameRoom extends DurableObject<Env> {
 
     if (res.tied || !res.eliminated) { await this.group(fa.noOneOnTrial); await this.enterNight(); return; }
 
-    // Check Joker win
-    if (res.eliminated.independentRole === "joker") {
-      game.players = applyDeaths(game.players, [{ userId: res.eliminated.userId, reason: "joker", revealedRole: res.eliminated.role!, revealedIndependentRole: "joker" }], "nomination", game.dayNumber);
-      await this.notifyLecterSuccession([{ userId: res.eliminated.userId, reason: "joker", revealedRole: res.eliminated.role! }]);
-      await this.mutePlayer(res.eliminated.userId);
-      await this.persist(true);
-      await this.group(fa.jokerWins(res.eliminated.displayName));
-      await this.finish("independent");
-      return;
-    }
-
+    // NOTE: Joker's win must NOT be checked here. Receiving the most votes
+    // only sends a player to court (defense/verdict) — it never wins the
+    // game by itself, even for the Joker. The Joker's win condition is
+    // checked exclusively in resolveVerdictPhase, and only fires if the
+    // verdict is "guilty" (executed). If acquitted there, no win is
+    // recorded and the game continues normally.
     await this.enterDefense(res.eliminated.userId);
   }
 
@@ -4316,8 +4507,10 @@ export class GameRoom extends DurableObject<Env> {
       if (target.status !== "alive") return { text: "این بازیکن زنده نیست.", alert: true };
 
       if (action === "mafia_kill") {
+        // Valid targets are every living player except living mafia
+        // teammates (checked above) — this must include Independents, so
+        // there is no separate "must be town" restriction here.
         if (target.team === "mafia") return { text: fa.cannotKillTeammate, alert: true };
-        if (target.team !== "town") return { text: fa.invalidTarget, alert: true };
       }
       if (action === "heal" && player.role === "lecter") {
         // Lecter's targets are exactly the living mafia team (godfather,
@@ -4359,6 +4552,20 @@ export class GameRoom extends DurableObject<Env> {
       for (const m of livingMafia(game.players)) {
         if (m.userId === userId) continue;
         await this.pm(m.userId, fa.mafiaSawKill(player.displayName, target?.displayName || "؟"));
+      }
+    }
+
+    // Same team-wide visibility rule as the Godfather's kill above: any
+    // action visible to the mafia team must reach every living mafia
+    // member, not just whoever happens to be the target. Lecter's heal
+    // (save) was missing this broadcast — Doctor's heal is unaffected
+    // since Doctor isn't on the mafia team (livingMafia won't include them
+    // as actor, and this block only fires for player.role === "lecter").
+    if (action === "heal" && player.role === "lecter" && targetId > 0) {
+      const target = findPlayer(game.players, targetId);
+      for (const m of livingMafia(game.players)) {
+        if (m.userId === userId) continue;
+        await this.pm(m.userId, fa.mafiaSawSave(player.displayName, target?.displayName || "؟"));
       }
     }
 
@@ -4422,6 +4629,15 @@ export class GameRoom extends DurableObject<Env> {
     await persistNightAction(this.env.DB, game.id, nightNumber, userId, "nato_guess", targetId, roleId);
 
     await this.pm(userId, fa.natoGuessMade(target.displayName, roleDef.name));
+
+    // Same team-wide visibility rule as the Godfather's kill / Lecter's
+    // save: NATO's guess must reach every other living mafia member too,
+    // not just the actor.
+    for (const m of livingMafia(game.players)) {
+      if (m.userId === userId) continue;
+      await this.pm(m.userId, fa.mafiaSawNatoGuess(player.displayName, target.displayName, roleDef.name));
+    }
+
     return { text: "حدس شما ثبت شد", alert: false };
   }
 
@@ -5442,9 +5658,15 @@ function nightKeyboardFor(game: GameState, player: Player): InlineKeyboard | und
   switch (player.role) {
     case "godfather": return nightTargetKeyboard(game.players, player.userId, n, "mafia_kill");
     case "detective": {
-      const checked = new Set(game.detectiveChecked[String(player.userId)] ?? []);
-      // Remove already-investigated players from the target list entirely
-      const candidates = game.players.filter((p) => !checked.has(p.userId));
+      // Detective panel always shows all currently-alive players, regardless
+      // of whether they were investigated on a previous night. Being
+      // investigated before must NOT remove a player from future panels
+      // (e.g. godfather must be re-investigable to flip from "town" to
+      // "mafia" after godfatherRevealed triggers). detectiveChecked is still
+      // recorded elsewhere (unchanged) for that reveal logic — it's just no
+      // longer used to filter this list. nightTargetKeyboard/nightTargetsFor
+      // already restrict candidates to living players and exclude the actor.
+      const candidates = game.players.filter((p) => p.status === "alive");
       return nightTargetKeyboard(candidates, player.userId, n, "investigate");
     }
     case "doctor": return nightTargetKeyboard(game.players, player.userId, n, "heal", { includeSelf: true, skipLabel: "⏭ امشب نجات نمی‌دهم" });

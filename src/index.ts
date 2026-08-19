@@ -93,6 +93,11 @@ CREATE TABLE IF NOT EXISTS game_events (
   payload TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS kill_admins (
+  user_id INTEGER PRIMARY KEY,
+  added_by INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `;
 
 async function ensureSchema(db: D1Database): Promise<void> {
@@ -226,7 +231,8 @@ export type DeathReason =
   | "lynch"
   | "left"
   | "host"
-  | "joker";
+  | "joker"
+  | "admin_kill";
 
 export type NightActionType =
   | "mafia_kill"
@@ -657,6 +663,7 @@ export interface TgMessage {
   new_chat_members?: TgUser[];
   left_chat_member?: TgUser;
   reply_markup?: unknown;
+  reply_to_message?: TgMessage;
 }
 
 export interface TgCallbackQuery {
@@ -1357,7 +1364,7 @@ export function mafiaCountFor(playerCount: number): number {
 }
 
 export function sniperShotsFor(playerCount: number): number {
-  return playerCount >= 10 ? 2 : 1;
+  return 2;
 }
 
 export function buildRoleListNew(playerCount: number): RoleId[] {
@@ -1926,8 +1933,7 @@ export function resolveNight(game: GameState): NightResolution {
       // the independent dies, sniper is never penalized for this.
       markDead(target.userId, "sniper");
     } else {
-      // Wrong target (town): both die.
-      markDead(target.userId, "sniper");
+      // Wrong target (town): only the sniper dies as a penalty, target survives.
       markDead(actor.userId, "sniper_penalty");
     }
   }
@@ -2499,6 +2505,7 @@ export const fa = {
   reasonLynch: "رأی‌گیری روز",
   reasonLeft: "ترک گروه",
   reasonJoker: "حذف جوکر (برد)",
+  reasonAdminKill: "حذف توسط مدیریت",
 
   gunnerReceivedGun: "🔫 شما یک تفنگ دریافت کردید.",
 
@@ -2525,6 +2532,12 @@ export const fa = {
   gunnerNoNightsLeft: "دیگر فرصتی برای توزیع تفنگ ندارید.",
   gunnerMustChooseWarFirst: "ابتدا باید گیرندهٔ تفنگ جنگی را انتخاب کنید.",
   gunnerSameRecipient: "این بازیکن همین امشب تفنگ جنگی گرفته است؛ نمی‌تواند تفنگ مشقی هم بگیرد.",
+  // FIX: shown when a gunner who has already completed BOTH guns for the
+  // current night clicks a stale/old panel (or otherwise re-triggers the
+  // give-gun flow). Exact wording per spec.
+  gunnerNightAlreadyDone: "⛔ نمی‌توانید مجدداً تفنگ بدهید.\nتفنگ جنگی و مشقی امشب قبلاً تحویل داده‌شده‌اند.",
+  gunnerWarAlreadyGiven: "⛔ شما همین امشب قبلاً تفنگ جنگی داده‌اید.",
+  gunnerBlackAlreadyGiven: "⛔ شما همین امشب قبلاً تفنگ مشقی داده‌اید.",
 
   invincibleShieldHit(shotsLeft: number): string {
     return `🛡 امشب هدف شلیک قرار گرفتید اما سپرتان ضربه را دفع کرد.\nتحمل ${shotsLeft} ضربهٔ دیگر را دارید.`;
@@ -2902,6 +2915,31 @@ export function leaveAnnounce(userId: number, name: string, count: number, max: 
 
 
 // =============================================================================
+// KILL ADMIN — independent moderation feature.
+// =============================================================================
+// Deliberately isolated from Role / NightAction / Vote / Phase logic: nothing
+// here reads or writes a RoleId, Team, NightAction, or Vote, and permission
+// is decided purely from Telegram numeric user IDs — never username, display
+// name, or reply "from" text. The super admin's ID is a fixed constant (not
+// stored, so it can never be edited away); granted admins live in D1 (global,
+// shared across every GameRoom Durable Object) so the list survives Worker
+// restarts, Durable Object evictions, and redeploys.
+export const SUPER_KILL_ADMIN_ID = 6337988032;
+
+export async function isKillAdmin(db: D1Database, userId: number): Promise<boolean> {
+  if (userId === SUPER_KILL_ADMIN_ID) return true;
+  const row = await db.prepare("SELECT 1 FROM kill_admins WHERE user_id = ?").bind(userId).first();
+  return row != null;
+}
+
+export async function addKillAdmin(db: D1Database, userId: number, addedBy: number): Promise<void> {
+  await db
+    .prepare("INSERT INTO kill_admins (user_id, added_by, created_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO NOTHING")
+    .bind(userId, addedBy, Date.now())
+    .run();
+}
+
+// =============================================================================
 // DATABASE FUNCTIONS
 // =============================================================================
 
@@ -3200,6 +3238,21 @@ export class GameRoom extends DurableObject<Env> {
   private game: GameState | null = null;
   private tg: Telegram;
   private nominationVoteQueue: Promise<void> = Promise.resolve();
+  // FIX: serializes gunner give-war/give-black actions per this DO instance
+  // (one instance = one game = one gunner acting at a time), the same
+  // pattern used for nomination votes — so two near-simultaneous callbacks
+  // for the same gunner (a genuine race, or a duplicate/stale click) can
+  // never both read the "already given?" state as false and both write.
+  private gunnerActionQueue: Promise<void> = Promise.resolve();
+  // Guards against two phase transitions running concurrently (e.g. the
+  // phase-end alarm firing at the same time a host presses "پایان مرحله").
+  // Durable Objects process one request at a time, but async work inside a
+  // single request still has await points where a second invocation (another
+  // alarm() call, another callback) can interleave — this in-memory flag
+  // closes that window. It intentionally is NOT persisted: a DO restart
+  // always starts a fresh, unlocked instance, which is correct since any
+  // in-flight transition from the previous instance is gone with it.
+  private transitioning = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -3303,6 +3356,25 @@ export class GameRoom extends DurableObject<Env> {
         await this.schedulePhaseTimers();
         return;
       }
+      // FIX: an alarm firing is only ever a *signal* to check the phase, never
+      // proof the phase is actually over. A stray/early alarm (a stale timer
+      // left over from before a phase change, a defensive fallback alarm set
+      // by enterDay() to survive a mid-transition error, clock drift, etc.)
+      // must never be allowed to end a phase before its real phaseEndsAt. Only
+      // reason === "timer" goes through alarm(), and for that reason
+      // advancePhase() itself also re-checks this — this early return just
+      // avoids the log noise/lock churn of calling into it needlessly.
+      if (!game.phaseEndsAt || t < game.phaseEndsAt) {
+        console.error("alarm fired before phaseEndsAt — rescheduling instead of advancing", {
+          gameId: game.id, day: game.dayNumber, night: game.nightNumber,
+          phase: game.phase, status: game.status, now: t,
+          phaseEndsAt: game.phaseEndsAt, remainingMs: game.phaseEndsAt ? game.phaseEndsAt - t : null,
+          alarmKind: game.alarmKind,
+        });
+        await this.schedulePhaseTimers();
+        await this.persist();
+        return;
+      }
       await this.advancePhase("timer");
     } catch (err) {
       console.error("alarm failed, will retry in 5s", err);
@@ -3349,6 +3421,12 @@ export class GameRoom extends DurableObject<Env> {
       case "help": await this.tg.sendMessage(msg.chat.id, fa.helpGroup); break;
       case "extend": await this.cmdExtend(msg.from!.id); break;
       case "skip": await this.cmdSkip(msg.from!.id); break;
+      // Kill Admin: independent moderation commands, deliberately routed
+      // outside the normal game-command set. See cmdKill / cmdAddKill for
+      // the isolation rationale — permission is never derived from
+      // anything but msg.from.id.
+      case "kill": await this.cmdKill(msg); break;
+      case "addkill": await this.cmdAddKill(msg); break;
       default: break;
     }
   }
@@ -4187,14 +4265,60 @@ export class GameRoom extends DurableObject<Env> {
   private async advancePhase(reason: "timer" | "skip" | "early"): Promise<void> {
     const game = this.game;
     if (!game) return;
-    if (game.status === "lobby") { await this.cancelInternal(fa.lobbyExpired); return; }
-    if (game.status === "night") { await this.resolveNightPhase(); return; }
-    if (game.status === "inquiry") { await this.resolveInquiryPhase(); return; }
-    if (game.status === "day") { await this.enterNomination(); return; }
-    if (game.status === "nomination") { await this.resolveNominationPhase(); return; }
-    if (game.status === "defense") { await this.resolveDefensePhase(); return; }
-    if (game.status === "verdict") { await this.resolveVerdictPhase(); return; }
-    console.log("advance ignored", game.status, reason);
+
+    // FIX: central guard — this is the one place every transition path
+    // (alarm's "timer", the skip button's "skip", and any internal "early"
+    // call) funnels through. For "timer" specifically, we require the game
+    // to still be active, in a real phase, with a phaseEndsAt that has
+    // actually been reached — an alarm is only ever a hint to check, never
+    // authorization to advance by itself. "skip" is deliberately exempt:
+    // a host pressing "⏭ پایان مرحله" must always be able to end the phase
+    // immediately, regardless of phaseEndsAt.
+    if (reason === "timer") {
+      const t = now();
+      const blocked = !isActiveStatus(game.status) || !game.phase || !game.phaseEndsAt || t < game.phaseEndsAt;
+      if (blocked) {
+        console.error("advancePhase(timer) blocked — phase has not actually ended", {
+          gameId: game.id, day: game.dayNumber, night: game.nightNumber,
+          phase: game.phase, status: game.status, reason, now: t,
+          phaseEndsAt: game.phaseEndsAt, remainingMs: game.phaseEndsAt ? game.phaseEndsAt - t : null,
+          alarmKind: game.alarmKind,
+        });
+        await this.schedulePhaseTimers();
+        await this.persist();
+        return;
+      }
+    }
+
+    // FIX: prevent two transitions from resolving the same phase twice (e.g.
+    // the phase-end alarm and a host's Skip landing in the same tick). Only
+    // one advancePhase() may be "in flight" at a time; a second call while
+    // one is running is simply dropped — it would be trying to advance a
+    // phase that (by the time it would run) is already gone.
+    if (this.transitioning) {
+      console.log("advancePhase ignored — a transition is already in progress", { gameId: game.id, reason });
+      return;
+    }
+    this.transitioning = true;
+    try {
+      console.log("phase transition", {
+        gameId: game.id, day: game.dayNumber, night: game.nightNumber,
+        phase: game.phase, status: game.status, reason, now: now(),
+        phaseEndsAt: game.phaseEndsAt,
+        remainingMs: game.phaseEndsAt ? game.phaseEndsAt - now() : null,
+        alarmKind: game.alarmKind,
+      });
+      if (game.status === "lobby") { await this.cancelInternal(fa.lobbyExpired); return; }
+      if (game.status === "night") { await this.resolveNightPhase(); return; }
+      if (game.status === "inquiry") { await this.resolveInquiryPhase(); return; }
+      if (game.status === "day") { await this.enterNomination(); return; }
+      if (game.status === "nomination") { await this.resolveNominationPhase(); return; }
+      if (game.status === "defense") { await this.resolveDefensePhase(); return; }
+      if (game.status === "verdict") { await this.resolveVerdictPhase(); return; }
+      console.log("advance ignored", game.status, reason);
+    } finally {
+      this.transitioning = false;
+    }
   }
 
   private async resolveNightPhase(): Promise<void> {
@@ -4520,7 +4644,12 @@ export class GameRoom extends DurableObject<Env> {
       if (action === "heal" && player.role === "doctor" && targetId === userId) {
         if (game.doctorSelfHealUsedBy.includes(userId)) return { text: "نجات خودتان را قبلاً استفاده کرده‌اید.", alert: true };
       }
-      if (action === "investigate") {
+      if (action === "investigate" && player.independentRole === "lonewolf") {
+        // FIX: this one-check-per-target restriction is specific to Lonewolf.
+        // The Detective must be able to investigate the same player any
+        // number of times, with no limit — detectiveChecked is still
+        // recorded for the detective (used for the Godfather's first-check
+        // reveal rule), it just no longer blocks repeat investigations.
         const prev = game.detectiveChecked[String(userId)] ?? [];
         if (prev.includes(targetId)) return { text: "این نفر را قبلاً استعلام کرده‌اید.", alert: true };
       }
@@ -4703,11 +4832,44 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   private async applyGunnerGiveWar(userId: number, nightNumber: number, targetId: number): Promise<{ text: string; alert: boolean }> {
+    const operation = this.gunnerActionQueue.then(() => this.applyGunnerGiveWarSerialized(userId, nightNumber, targetId));
+    this.gunnerActionQueue = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  // Returns whether this gunner already has a *valid* (targetId>0) war/black
+  // action recorded for this specific night. This is the per-night source of
+  // truth — deliberately separate from gunnerWarGunsGiven/gunnerBlackGunsGiven,
+  // which are lifetime totals across both of the gunner's nights and can't by
+  // themselves tell "did THIS night already finish". Only a request whose gun
+  // was actually delivered counts; skips and rejected attempts never set this.
+  private gunnerNightGunStatus(game: GameState, userId: number, nightNumber: number): { warGiven: boolean; blackGiven: boolean } {
+    const warGiven = game.nightActions.some(
+      (a) => a.actorId === userId && a.type === "gunner_give_war" && a.nightNumber === nightNumber && a.targetId !== null && a.targetId > 0,
+    );
+    const blackGiven = game.nightActions.some(
+      (a) => a.actorId === userId && a.type === "gunner_give_black" && a.nightNumber === nightNumber && a.targetId !== null && a.targetId > 0,
+    );
+    return { warGiven, blackGiven };
+  }
+
+  private async applyGunnerGiveWarSerialized(userId: number, nightNumber: number, targetId: number): Promise<{ text: string; alert: boolean }> {
     const game = this.game;
     if (!game || game.status !== "night" || game.nightNumber !== nightNumber) return { text: fa.staleAction, alert: true };
     const player = findPlayer(game.players, userId);
     if (!player || player.status !== "alive" || player.role !== "gunner") return { text: fa.actionForbidden, alert: true };
     if (game.gunnerNightsUsed >= 2) return { text: fa.gunnerNoNightsLeft, alert: true };
+
+    // FIX: Backend is the final authority — never trust that the panel is
+    // gone or that this is the first time this callback has been seen. Once
+    // a valid war gun has been recorded for THIS night, no further
+    // gunner_give_war of any kind (a fresh pick, a stale panel, a duplicate
+    // callback, a retry) is accepted for the same night, whether or not
+    // black has been given yet. This also covers the "both already given"
+    // case, since blackGiven implies warGiven.
+    const { warGiven, blackGiven } = this.gunnerNightGunStatus(game, userId, nightNumber);
+    if (blackGiven) return { text: fa.gunnerNightAlreadyDone, alert: true };
+    if (warGiven) return { text: fa.gunnerWarAlreadyGiven, alert: true };
 
     // Explicit "امشب نمی‌خواهم تفنگ بدهم" — record it and stop; no black
     // panel is sent, and per spec this does NOT consume one of the 2 nights.
@@ -4734,8 +4896,9 @@ export class GameRoom extends DurableObject<Env> {
     if (target.status !== "alive") return { text: "این بازیکن زنده نیست.", alert: true };
     if (game.gunnerWarGunsGiven >= 2) return { text: fa.gunnerNoNightsLeft, alert: true };
 
-    // Re-picking the war target before finishing black clears any stale
-    // black selection tied to the old target.
+    // No stale black selection can be lying around at this point — if one
+    // existed for this night, blackGiven above would have already rejected
+    // this request — but the filter is kept as defense in depth.
     game.nightActions = game.nightActions.filter((a) => !(a.actorId === userId && (a.type === "gunner_give_war" || a.type === "gunner_give_black") && a.nightNumber === nightNumber));
     game.nightActions.push({ actorId: userId, type: "gunner_give_war", targetId, nightNumber, at: now() });
     await this.persist();
@@ -4747,11 +4910,24 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   private async applyGunnerGiveBlack(userId: number, nightNumber: number, targetId: number): Promise<{ text: string; alert: boolean }> {
+    const operation = this.gunnerActionQueue.then(() => this.applyGunnerGiveBlackSerialized(userId, nightNumber, targetId));
+    this.gunnerActionQueue = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  private async applyGunnerGiveBlackSerialized(userId: number, nightNumber: number, targetId: number): Promise<{ text: string; alert: boolean }> {
     const game = this.game;
     if (!game || game.status !== "night" || game.nightNumber !== nightNumber) return { text: fa.staleAction, alert: true };
     const player = findPlayer(game.players, userId);
     if (!player || player.status !== "alive" || player.role !== "gunner") return { text: fa.actionForbidden, alert: true };
     if (game.gunnerNightsUsed >= 2) return { text: fa.gunnerNoNightsLeft, alert: true };
+
+    // FIX: same per-night backend authority as the war step — once a valid
+    // black gun has already been recorded for this night, no further
+    // gunner_give_black (fresh, stale panel, duplicate, retry, race) is
+    // accepted for the same night.
+    const { blackGiven } = this.gunnerNightGunStatus(game, userId, nightNumber);
+    if (blackGiven) return { text: fa.gunnerNightAlreadyDone, alert: true };
 
     const warAction = game.nightActions.find((a) => a.actorId === userId && a.type === "gunner_give_war" && a.nightNumber === nightNumber);
     if (!warAction || warAction.targetId === null) return { text: fa.gunnerMustChooseWarFirst, alert: true };
@@ -5067,6 +5243,65 @@ export class GameRoom extends DurableObject<Env> {
     await this.group(fa.playerDied(p.displayName, p.userId, p.team, reason === "left" ? fa.reasonLeft : fa.reasonLynch));
     let winner = checkWinner(game.players);
     if (winner) await this.finish(winner);
+  }
+
+  // ===========================================================================
+  // KILL ADMIN — independent moderation feature (see module-level helpers
+  // isKillAdmin/addKillAdmin above). Intentionally kept separate from every
+  // Role/NightAction/Vote code path:
+  //   - Permission is checked purely against msg.from.id (Telegram numeric
+  //     user ID), never username/display name/reply-from text.
+  //   - No NightAction is recorded, no Vote is cast, no Role ability is
+  //     consumed, no Phase is advanced.
+  //   - The actual kill reuses applyDeaths() — the same central death path
+  //     used by lynch/host-removal (see eliminate() above) — so game state
+  //     never diverges into a parallel death system.
+  // ===========================================================================
+  private async cmdKill(msg: TgMessage): Promise<void> {
+    const from = msg.from;
+    if (!from) return;
+    const targetUser = msg.reply_to_message?.from;
+    if (!targetUser) return; // /kill without a reply selects nobody — no-op.
+    if (!(await isKillAdmin(this.env.DB, from.id))) return; // unauthorized — completely silent, no side effects.
+
+    const game = this.game;
+    if (!game || !isActiveStatus(game.status)) return; // no active game in this chat.
+
+    const player = findPlayer(game.players, targetUser.id);
+    if (!player || player.status !== "alive" || !player.role) return; // already dead / left / never in this game.
+
+    game.players = applyDeaths(
+      game.players,
+      [{ userId: player.userId, reason: "admin_kill", revealedRole: player.role, revealedIndependentRole: player.independentRole }],
+      game.phase,
+      game.phase === "night" ? game.nightNumber : game.dayNumber,
+    );
+    await this.notifyLecterSuccession([{ userId: player.userId, reason: "admin_kill", revealedRole: player.role }]);
+    await this.mutePlayer(player.userId);
+    await this.persist(true);
+    await this.group(fa.playerDied(player.displayName, player.userId, player.team, fa.reasonAdminKill));
+    const winner = checkWinner(game.players);
+    if (winner) await this.finish(winner);
+  }
+
+  private async cmdAddKill(msg: TgMessage): Promise<void> {
+    const from = msg.from;
+    if (!from) return;
+    if (from.id !== SUPER_KILL_ADMIN_ID) return; // only the super admin may grant Kill Admin — silent no-op otherwise.
+
+    const parsed = parseCommand(msg.text ?? "");
+    const replyTarget = msg.reply_to_message?.from;
+    let targetId: number | null = null;
+    if (replyTarget) {
+      targetId = replyTarget.id;
+    } else if (parsed?.args) {
+      const n = Number(parsed.args.trim());
+      if (Number.isInteger(n) && n > 0) targetId = n;
+    }
+    if (targetId === null) return; // no reply and no valid numeric ID — no-op.
+
+    await addKillAdmin(this.env.DB, targetId, from.id);
+    await this.group(`✅ کاربر <code>${targetId}</code> به Kill Admin اضافه شد.`);
   }
 
   private async promoteCourtAccused(userId: number): Promise<boolean> {
@@ -5563,10 +5798,14 @@ export class GameRoom extends DurableObject<Env> {
       phase: (gameRow.phase as Phase) ?? "lobby",
       dayNumber: gameRow.day_number,
       nightNumber: gameRow.night_number,
+      // FIX #9: phase_ends_at is already the day's real end time; there is no
+      // persisted "day started at" to derive a correct extend-cap from here,
+      // so we must NOT fabricate one by adding daySecondsMax on top of the
+      // end time (that silently inflated the /extend ceiling on this
+      // legacy-recovery path). Leaving it null just means /extend has no cap
+      // for the rest of this recovered day, instead of an incorrect one.
       phaseEndsAt: gameRow.phase_ends_at,
-      dayPhaseMaxEndsAt: gameRow.phase === "day" && gameRow.phase_ends_at
-        ? gameRow.phase_ends_at + config.daySecondsMax * 1000
-        : null,
+      dayPhaseMaxEndsAt: null,
       reminderAt: null,
       nextTickAt: null,
       alarmKind: "phase_end",

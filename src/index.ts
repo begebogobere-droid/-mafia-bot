@@ -1,6 +1,1008 @@
 import { DurableObject } from "cloudflare:workers";
 
 
+const MINIAPP_HTML = `<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>مافیا مینی‌اپ</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+/* =====================================================================
+   MAFIA MINI APP — Design Tokens & Styling
+   ===================================================================== */
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap');
+
+:root{
+  --bg:#0a0b0d; --bg-2:#0d0f12;
+  --panel:rgba(255,255,255,0.045); --panel-strong:rgba(255,255,255,0.075);
+  --panel-border:rgba(255,255,255,0.09); --panel-border-strong:rgba(255,255,255,0.16);
+  --ink:#eef0f3; --ink-dim:#98a0ac; --ink-faint:#5b6270;
+  --blood:#7d2430; --blood-bright:#b23a44; --blood-glow:rgba(178,58,68,0.35);
+  --gold:#b8934c; --gold-dim:#8a713d; --good:#3f8f6f;
+  --radius-lg:20px; --radius-md:14px; --radius-sm:10px;
+  --font-display:'Vazirmatn',sans-serif; --font-mono:'JetBrains Mono',monospace;
+}
+
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+html,body{height:100%;}
+body{ margin:0; background:var(--bg); color:var(--ink); font-family:var(--font-display); font-size:15px; line-height:1.6; overflow-x:hidden; -webkit-font-smoothing:antialiased; }
+button, input {font-family:inherit;}
+::selection{background:var(--blood);color:#fff;}
+
+/* ---------- Atmosphere (Background Glow) ---------- */
+#atmosphere{ position:fixed; inset:0; z-index:0; pointer-events:none; background:var(--bg); transition:background 1.4s ease; }
+#atmosphere.is-night{ background:radial-gradient(120% 90% at 50% -10%, rgba(30,52,90,0.35), transparent 60%), var(--bg); }
+#atmosphere.is-day{ background:radial-gradient(120% 90% at 50% -10%, rgba(120,86,32,0.28), transparent 60%), var(--bg); }
+#atmosphere::before{ content:""; position:absolute; left:50%; top:-140px; transform:translateX(-50%); width:420px; height:420px; border-radius:50%; background:radial-gradient(circle, var(--halo-color,rgba(120,140,200,0.28)) 0%, transparent 70%); animation:haloPulse 6s ease-in-out infinite; }
+@keyframes haloPulse{ 0%,100%{opacity:.55; transform:translateX(-50%) scale(1);} 50%{opacity:.9; transform:translateX(-50%) scale(1.08);} }
+#atmosphere.is-night::before{ --halo-color:rgba(90,130,210,0.3); }
+#atmosphere.is-day::before{ --halo-color:rgba(220,160,80,0.28); }
+
+.fog{ position:absolute; inset:auto 0 0 0; height:38vh; opacity:0; transition:opacity 1.2s ease; pointer-events:none; background:radial-gradient(60% 40% at 20% 100%, rgba(255,255,255,0.035), transparent 70%), radial-gradient(50% 35% at 80% 100%, rgba(255,255,255,0.03), transparent 70%); animation:fogDrift 18s ease-in-out infinite alternate; }
+#atmosphere.is-night .fog{ opacity:1; }
+@keyframes fogDrift{ from{ transform:translateX(-2%);} to{ transform:translateX(2%);} }
+
+/* ---------- Layout Shell & Header ---------- */
+#app{ position:relative; z-index:1; min-height:100vh; display:flex; flex-direction:column; padding-bottom:74px; }
+header.hdr{ position:sticky; top:0; z-index:20; padding:14px 16px 12px; background:linear-gradient(to bottom, rgba(10,11,13,0.92), rgba(10,11,13,0.75) 70%, transparent); backdrop-filter:blur(10px); }
+.hdr-row{ display:flex; align-items:center; gap:12px; }
+.hdr-disc{ width:46px; height:46px; border-radius:50%; flex:none; display:flex; align-items:center; justify-content:center; font-size:21px; background:var(--panel-strong); border:1px solid var(--panel-border-strong); box-shadow:0 0 0 1px rgba(0,0,0,0.3), 0 6px 18px -6px var(--halo-color,rgba(90,130,210,0.4)); }
+.hdr-mid{ flex:1; min-width:0; }
+.hdr-title{ font-weight:800; font-size:16px; letter-spacing:.2px; }
+.hdr-sub{ color:var(--ink-dim); font-size:12.5px; margin-top:1px; }
+.hdr-timer{ font-family:var(--font-mono); font-weight:600; font-size:20px; min-width:64px; text-align:center; padding:6px 10px; border-radius:var(--radius-sm); background:var(--panel); border:1px solid var(--panel-border); font-variant-numeric:tabular-nums; }
+.hdr-timer.low{ color:var(--blood-bright); border-color:rgba(178,58,68,0.5); animation:tick 1s steps(1) infinite; }
+@keyframes tick{ 50%{opacity:.55;} }
+.hdr-meta{ display:flex; gap:10px; margin-top:10px; font-size:12.5px; color:var(--ink-dim); }
+.hdr-chip{ display:flex; align-items:center; gap:5px; background:var(--panel); border:1px solid var(--panel-border); padding:5px 10px; border-radius:999px; }
+
+/* ---------- Views & Components ---------- */
+main{ flex:1; padding:4px 16px 24px; }
+.view{ display:none; animation:viewIn .35s ease; }
+.view.active{ display:block; }
+@keyframes viewIn{ from{ opacity:0; transform:translateY(6px);} to{ opacity:1; transform:none;} }
+.section-title{ font-size:12.5px; color:var(--ink-dim); font-weight:600; margin:18px 2px 10px; display:flex; align-items:center; gap:6px; }
+.section-title:first-child{ margin-top:6px; }
+.panel{ background:var(--panel); border:1px solid var(--panel-border); border-radius:var(--radius-lg); padding:16px; position:relative; overflow:hidden; }
+.panel + .panel{ margin-top:10px; }
+
+/* ---------- Buttons ---------- */
+.btn{ display:block; width:100%; text-align:center; border:none; cursor:pointer; padding:14px 16px; border-radius:999px; font-weight:700; font-size:14.5px; background:var(--panel-strong); color:var(--ink); border:1px solid var(--panel-border-strong); transition:transform .1s ease, opacity .15s ease; }
+.btn:active{ transform:scale(.97); }
+.btn:disabled{ opacity:0.35; cursor:not-allowed; }
+.btn.primary{ background:linear-gradient(180deg, var(--blood-bright), var(--blood)); border-color:transparent; color:#fff; box-shadow:0 8px 20px -8px var(--blood-glow); }
+.btn.ghost{ background:transparent; border-color:var(--panel-border); color:var(--ink-dim); }
+.btn.gold{ background:linear-gradient(180deg,#c9a765,var(--gold-dim)); color:#1a1408; border-color:transparent; }
+.btn-row{ display:flex; gap:8px; margin-top:12px; }
+.btn-row .btn{ flex:1; }
+
+.empty-note{ text-align:center; color:var(--ink-faint); font-size:13px; padding:26px 10px; }
+.empty-note .big{ font-size:30px; display:block; margin-bottom:8px; }
+
+/* ---------- Lobby ---------- */
+.lobby-box { text-align: center; padding: 40px 10px; }
+.lobby-code-display { font-size: 48px; font-family: var(--font-mono); letter-spacing: 12px; color: var(--gold); margin: 20px 0; font-weight: bold; text-shadow: 0 0 20px rgba(184, 147, 76, 0.4); }
+.input-code { width: 100%; padding: 16px; text-align: center; font-size: 28px; letter-spacing: 8px; border-radius: 16px; background: rgba(0,0,0,0.3); border: 2px solid var(--panel-border-strong); color: #fff; margin-bottom: 20px; font-family: var(--font-mono); font-weight: bold; outline: none; transition: border-color 0.3s; }
+.input-code:focus { border-color: var(--gold); }
+.lobby-players { margin: 30px 0; text-align: right; }
+.player-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--panel-strong); padding: 12px 16px; border-radius: var(--radius-sm); margin-bottom: 8px; border: 1px solid var(--panel-border); font-weight: 600; }
+
+/* ---------- Player Grid ---------- */
+.players-grid{ display:grid; grid-template-columns:repeat(2, 1fr); gap:10px; }
+.pcard{ background:var(--panel); border:1px solid var(--panel-border); border-radius:var(--radius-md); padding:12px 12px 11px; display:flex; flex-direction:column; gap:6px; transition:transform .15s ease, border-color .15s ease, background .15s ease; }
+.pcard[data-selectable="1"]{ cursor:pointer; }
+.pcard[data-selectable="1"]:active{ transform:scale(.97); }
+.pcard.dead{ opacity:.5; }
+.pcard.selected{ border-color:var(--blood-bright); background:rgba(178,58,68,0.12); box-shadow:0 0 0 1px var(--blood-bright) inset; }
+.pcard.is-you{ border-color:var(--gold-dim); }
+.pcard-top{ display:flex; align-items:center; justify-content:space-between; }
+.pcard-avatar{ width:34px; height:34px; border-radius:50%; background:var(--panel-strong); display:flex; align-items:center; justify-content:center; font-size:15px; border:1px solid var(--panel-border); }
+.pcard-name{ font-weight:600; font-size:13.5px; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pcard-status{ font-size:11.5px; color:var(--ink-dim); display:flex; align-items:center; gap:4px; }
+.pcard-status.alive{ color:var(--good); }
+.pcard-status.dead{ color:var(--ink-faint); }
+.pcard-role-tag{ font-size:11px; color:var(--gold); }
+.you-badge{ font-size:10px; background:var(--gold-dim); color:#fff; padding:1px 7px; border-radius:999px; }
+
+/* ---------- Role Panel ---------- */
+.role-hero{ display:flex; align-items:center; gap:14px; }
+.role-hero-emoji{ font-size:34px; width:60px; height:60px; border-radius:16px; display:flex; align-items:center; justify-content:center; background:var(--panel-strong); border:1px solid var(--panel-border-strong); flex:none; }
+.role-hero-name{ font-weight:800; font-size:18px; }
+.role-hero-team{ font-size:12px; color:var(--ink-dim); margin-top:2px; }
+.role-desc{ margin-top:12px; font-size:13px; color:var(--ink-dim); line-height:1.85; }
+.role-stats{ display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+.stat-pill{ font-size:11.5px; background:var(--panel-strong); border:1px solid var(--panel-border); padding:5px 10px; border-radius:999px; color:var(--ink-dim); }
+.stat-pill b{ color:var(--ink); }
+
+/* ---------- Action Targets ---------- */
+.targets{ display:flex; flex-direction:column; gap:8px; margin-top:12px; }
+.targets.nato-roles { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+.target-row{ display:flex; align-items:center; justify-content:space-between; gap:10px; background:var(--panel); border:1px solid var(--panel-border); border-radius:var(--radius-sm); padding:11px 14px; cursor:pointer; transition:border-color .15s, background .15s; }
+.targets.nato-roles .target-row { padding: 8px 10px; }
+.target-row:active{ transform:scale(.985); }
+.target-row.picked{ border-color:var(--blood-bright); background:rgba(178,58,68,0.14); }
+.target-row .tname{ font-weight:600; font-size:13.5px; }
+.radio-dot{ width:18px; height:18px; border-radius:50%; border:2px solid var(--panel-border-strong); flex:none; position:relative; }
+.target-row.picked .radio-dot{ border-color:var(--blood-bright); }
+.target-row.picked .radio-dot::after{ content:""; position:absolute; inset:3px; border-radius:50%; background:var(--blood-bright); }
+
+/* ---------- Voting ---------- */
+.vote-bar-wrap{ margin-top:8px; }
+.vote-row{ margin-bottom:12px; cursor:pointer; }
+.vote-row:active .vote-track { transform:scale(0.99); }
+.vote-row-top{ display:flex; justify-content:space-between; align-items:center; font-size:13px; margin-bottom:5px; }
+.vote-row-top .vn{ font-weight:600; }
+.vote-row-top .vc{ color:var(--ink-dim); font-family:var(--font-mono); }
+.vote-track{ height:9px; border-radius:999px; background:var(--panel-strong); overflow:hidden; transition:transform 0.1s; }
+.vote-fill{ height:100%; background:linear-gradient(90deg, var(--gold-dim), var(--gold)); border-radius:999px; transition:width .5s ease; }
+
+/* ---------- Chat / Day Phase ---------- */
+.chat-container { display: flex; flex-direction: column; height: calc(100vh - 180px); }
+.chat-header { display: flex; justify-content: space-between; align-items: center; padding: 16px; background: var(--panel-strong); border-radius: var(--radius-lg) var(--radius-lg) 0 0; border: 1px solid var(--panel-border); border-bottom: none; }
+.speaker-name { color: var(--gold); font-weight: 800; font-size: 16px; display:flex; align-items:center; gap:8px;}
+.speaker-name.is-me { color: var(--good); }
+.speaker-timer { font-family: var(--font-mono); font-size: 22px; color: var(--ink); font-weight: bold; background: var(--bg); padding: 4px 12px; border-radius: 8px; border: 1px solid var(--panel-border); }
+.speaker-timer.urgent { color: var(--blood-bright); animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: 0.5; } }
+
+.chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; background: var(--panel); border-left: 1px solid var(--panel-border); border-right: 1px solid var(--panel-border); scroll-behavior: smooth; }
+.chat-msg { padding: 12px 16px; border-radius: 16px; background: var(--panel-strong); max-width: 85%; align-self: flex-start; border: 1px solid var(--panel-border); line-height: 1.5; position: relative; }
+.chat-msg.mine { background: rgba(184, 147, 76, 0.1); border-color: rgba(184, 147, 76, 0.3); align-self: flex-end; border-bottom-right-radius: 4px; }
+.chat-msg.others { border-bottom-left-radius: 4px; }
+.chat-msg.system { align-self: center; background: transparent; border: none; color: var(--ink-dim); font-size: 12px; text-align: center; width: 100%; padding: 4px; }
+.chat-msg .sender { font-size: 11.5px; color: var(--gold); margin-bottom: 4px; font-weight: bold; }
+.chat-msg.mine .sender { color: var(--good); }
+.chat-msg .time { font-size: 9px; color: var(--ink-faint); margin-top: 4px; text-align: right; }
+
+.chat-input-area { display: flex; gap: 8px; padding: 12px; background: var(--panel-strong); border-radius: 0 0 var(--radius-lg) var(--radius-lg); border: 1px solid var(--panel-border); border-top: none; }
+.chat-input-area input { flex: 1; padding: 14px 18px; border-radius: 999px; background: var(--bg); border: 1px solid var(--panel-border-strong); color: #fff; font-size: 14.5px; outline: none; transition: border-color 0.2s; }
+.chat-input-area input:focus { border-color: var(--gold-dim); }
+.chat-input-area button { padding: 0 24px; border-radius: 999px; background: var(--gold); border: none; color: #1a1408; font-weight: 800; font-size: 15px; }
+.chat-input-area input:disabled, .chat-input-area button:disabled { opacity: 0.4; cursor: not-allowed; background: var(--panel); border-color: transparent; color: var(--ink-faint); }
+
+/* ---------- Bottom Nav ---------- */
+nav.bottomnav{ position:fixed; bottom:0; left:0; right:0; z-index:30; display:flex; padding:8px 12px calc(8px + env(safe-area-inset-bottom)); gap:6px; background:rgba(10,11,13,0.92); backdrop-filter:blur(14px); border-top:1px solid var(--panel-border); }
+nav.bottomnav button{ flex:1; background:none; border:none; color:var(--ink-faint); display:flex; flex-direction:column; align-items:center; gap:3px; padding:6px 2px; border-radius:12px; font-size:10.5px; position:relative; }
+nav.bottomnav button .ico{ font-size:19px; }
+nav.bottomnav button.active{ color:var(--ink); background:var(--panel); }
+nav.bottomnav button .dot{ position:absolute; top:2px; left:50%; margin-left:9px; width:7px; height:7px; border-radius:50%; background:var(--blood-bright); display:none; }
+nav.bottomnav button.alert .dot{ display:block; }
+
+/* ---------- Toast ---------- */
+#toast{ position:fixed; bottom:88px; left:50%; transform:translateX(-50%) translateY(20px); background:var(--panel-strong); border:1px solid var(--panel-border-strong); padding:10px 18px; border-radius:999px; font-size:12.5px; z-index:50; opacity:0; transition:opacity .25s ease, transform .25s ease; pointer-events:none; backdrop-filter:blur(10px); color:#fff; }
+#toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
+
+/* ---------- Timeline & End Game ---------- */
+.tl-item{ display:flex; gap:10px; padding:10px 0; border-bottom:1px solid var(--panel-border); }
+.tl-item:last-child{ border-bottom:none; }
+.tl-icon{ width:30px; height:30px; border-radius:9px; background:var(--panel-strong); display:flex; align-items:center; justify-content:center; font-size:14px; flex:none; }
+.tl-text{ font-size:13px; color:var(--ink-dim); padding-top:4px; }
+.tl-head{ font-size:12px; font-weight:700; color:var(--ink); }
+
+.endgame-banner{ text-align:center; padding:28px 16px 22px; }
+.endgame-banner .emoji{ font-size:48px; }
+.endgame-banner h2{ margin:10px 0 2px; font-size:20px; font-weight:800; }
+.endgame-banner p{ color:var(--ink-dim); font-size:13px; margin:0; }
+.reveal-row{ display:flex; align-items:center; justify-content:space-between; padding:11px 4px; border-bottom:1px solid var(--panel-border); }
+.reveal-row:last-child{ border-bottom:none; }
+.reveal-left{ display:flex; align-items:center; gap:10px; }
+.reveal-name{ font-weight:600; font-size:13.5px; }
+.reveal-role{ font-size:12px; color:var(--gold); }
+</style>
+</head>
+<body>
+
+<div id="atmosphere"><div class="fog"></div></div>
+
+<div id="app">
+
+  <!-- Header -->
+  <header class="hdr" id="mainHeader" style="display:none;">
+    <div class="hdr-row">
+      <div class="hdr-disc" id="phaseDisc">🌙</div>
+      <div class="hdr-mid">
+        <div class="hdr-title" id="phaseTitle">در انتظار اتصال…</div>
+        <div class="hdr-sub" id="phaseSub">مافیا</div>
+      </div>
+      <div class="hdr-timer" id="timer">--:--</div>
+    </div>
+    <div class="hdr-meta">
+      <div class="hdr-chip">👥 <b id="aliveCount">–</b> بازیکن زنده</div>
+      <div class="hdr-chip" id="dayNightChip">—</div>
+    </div>
+  </header>
+
+  <main>
+    <!-- VIEW: LOBBY INIT (Create / Join) -->
+    <section class="view active" id="view-lobby-init">
+       <div class="lobby-box">
+          <div style="font-size: 70px; margin-bottom: 5px;">🎭</div>
+          <h2 style="margin-top:0; font-weight:800; font-size:24px;">بازی مافیا</h2>
+          <p style="color: var(--ink-dim); margin-bottom: 40px; font-size:14px;">لابی اختصاصی مینی‌اپ</p>
+          
+          <button class="btn primary" id="btnCreateLobby" style="margin-bottom:12px;">ساخت لابی جدید</button>
+          <button class="btn ghost" id="btnShowJoin">پیوستن به لابی</button>
+       </div>
+       
+       <div class="lobby-box" id="joinLobbyForm" style="display:none; padding-top:0;">
+          <input type="text" id="inputLobbyCode" class="input-code" placeholder="کد ۵ رقمی" maxlength="5" inputmode="numeric">
+          <button class="btn gold" id="btnJoinLobbySubmit">ورود به بازی</button>
+       </div>
+    </section>
+
+    <!-- VIEW: LOBBY WAIT (Show code & players) -->
+    <section class="view" id="view-lobby-wait">
+       <div class="lobby-box" style="padding-top:20px;">
+          <div class="section-title" style="justify-content:center; font-size:14px;">کد لابی شما</div>
+          <div class="lobby-code-display" id="displayLobbyCode">-----</div>
+          <p style="color: var(--ink-dim); font-size:13px; background:var(--panel); padding:10px; border-radius:10px;">این کد را به دوستان خود بدهید تا وارد بازی شوند</p>
+          
+          <div class="lobby-players">
+             <div class="section-title">بازیکنان پیوسته (<span id="lobbyPlayerCount">0</span>)</div>
+             <div id="lobbyPlayersList"></div>
+          </div>
+          
+          <button class="btn primary" id="btnStartGame" style="display:none; margin-top:30px; box-shadow: 0 0 20px rgba(178,58,68,0.4);">شروع بازی</button>
+          <div id="waitingForHostMsg" style="margin-top:30px; color:var(--ink-dim); display:none;">در انتظار میزبان برای شروع بازی...</div>
+       </div>
+    </section>
+
+    <!-- VIEW: CHAT (40s Turn Based) -->
+    <section class="view" id="view-chat">
+       <div class="chat-container">
+          <div class="chat-header">
+             <div class="speaker-name" id="uiSpeakerName">---</div>
+             <div class="speaker-timer" id="uiSpeakerTimer">--:--</div>
+          </div>
+          <div class="chat-messages" id="uiChatMessages"></div>
+          
+          <form class="chat-input-area" id="chatForm">
+             <input type="text" id="uiChatInput" placeholder="فقط در نوبت خود می‌توانید صحبت کنید..." autocomplete="off" disabled>
+             <button type="submit" id="uiChatSend" disabled>ارسال</button>
+          </form>
+       </div>
+    </section>
+
+    <!-- VIEW: PLAYERS -->
+    <section class="view" id="view-players">
+      <div class="section-title">👥 بازیکنان بازی</div>
+      <div class="players-grid" id="playersGrid"></div>
+
+      <div id="deadSection" style="display:none;">
+        <div class="section-title">💀 حذف‌شده‌ها</div>
+        <div class="players-grid" id="deadGrid"></div>
+      </div>
+    </section>
+
+    <!-- VIEW: ROLE & ACTIONS -->
+    <section class="view" id="view-role">
+      <div class="panel" id="rolePanel"></div>
+      <div class="panel" id="actionPanel" style="display:none;"></div>
+    </section>
+
+    <!-- VIEW: VOTING / COURT -->
+    <section class="view" id="view-vote">
+      <div class="panel" id="votePanel"></div>
+    </section>
+
+    <!-- VIEW: TIMELINE / EVENTS -->
+    <section class="view" id="view-events">
+      <div class="section-title">📜 روند بازی</div>
+      <div class="panel" id="timelinePanel">
+        <div class="empty-note"><span class="big">🕯</span>هنوز اتفاقی ثبت نشده</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Bottom Navigation -->
+  <nav class="bottomnav" id="mainNav" style="display:none;">
+    <button data-tab="lobby-wait" id="navLobbyBtn" style="display:none;"><span class="ico">🃏</span>لابی</button>
+    <button data-tab="players" id="navPlayersBtn"><span class="ico">👥</span>بازیکنان</button>
+    <button data-tab="role" id="navRoleBtn"><span class="ico">🎭</span>نقش من<span class="dot" id="actionDot"></span></button>
+    <button data-tab="chat" id="navChatBtn"><span class="ico">💬</span>چت روز</button>
+    <button data-tab="vote" id="navVoteBtn"><span class="ico">⚖️</span>دادگاه</button>
+    <button data-tab="events" id="navEventsBtn"><span class="ico">📜</span>رویدادها</button>
+  </nav>
+
+</div>
+
+<div id="toast"></div>
+
+<script>
+/* =====================================================================
+   MAFIA MINI APP — FRONTEND LOGIC (Connected to Backend API)
+   ===================================================================== */
+
+const CONFIG = {
+  API_BASE: window.location.origin,
+  POLL_MS: 3000,
+};
+
+const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+if (tg) { tg.ready(); tg.expand(); try{ tg.setHeaderColor('#0a0b0d'); tg.setBackgroundColor('#0a0b0d'); }catch(e){} }
+
+const qs = new URLSearchParams(location.search);
+let CHAT_ID = qs.get('chat_id') || (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || null;
+
+const ROLE_META = {
+  godfather:{name:'پدرخوانده',emoji:'🎩',team:'مافیا'},
+  lecter:{name:'دکتر لکتر',emoji:'🩺',team:'مافیا'},
+  nato:{name:'ناتو',emoji:'💣',team:'مافیا'},
+  detective:{name:'کارآگاه',emoji:'🔍',team:'شهروند'},
+  doctor:{name:'دکتر',emoji:'💉',team:'شهروند'},
+  sniper:{name:'اسنایپر',emoji:'🎯',team:'شهروند'},
+  mayor:{name:'شهردار',emoji:'🏛',team:'شهروند'},
+  gunner:{name:'تفنگدار',emoji:'🔫',team:'شهروند'},
+  invincible:{name:'رویین‌تن',emoji:'🛡',team:'شهروند'},
+  escort:{name:'اسکورت',emoji:'💋',team:'شهروند'},
+  paranoid:{name:'پارانوئید',emoji:'🧠',team:'شهروند'},
+  johnny:{name:'جانی',emoji:'🔪',team:'مستقل'},
+  joker:{name:'جوکر',emoji:'🤡',team:'مستقل'},
+  bomber:{name:'بمب‌گذار',emoji:'🧨',team:'مستقل'},
+  lonewolf:{name:'گرگ تنها',emoji:'🕵️',team:'مستقل'},
+};
+
+const ACTION_LABEL = {
+  mafia_kill: {title:'انتخاب هدف قتل', cta:'تأیید قتل', icon:'🔪'},
+  heal: {title:'انتخاب فرد برای نجات', cta:'تأیید نجات', icon:'💉'},
+  investigate: {title:'استعلام هویت', cta:'تأیید استعلام', icon:'🔍'},
+  snipe: {title:'انتخاب هدف شلیک', cta:'شلیک', icon:'🎯'},
+  escort_block: {title:'مسدودسازی', cta:'تأیید مسدودسازی', icon:'💋'},
+  nato_guess: {title:'حدس نقش', cta:'تأیید حدس', icon:'💣'},
+  paranoid_alert: {title:'هوشیاری', cta:'هوشیار می‌شوم', icon:'🧠'},
+  johnny_kill: {title:'انتخاب هدف قتل', cta:'تأیید قتل', icon:'🔪'},
+  bomber_mark: {title:'علامت‌گذاری', cta:'تأیید علامت‌گذاری', icon:'🧨'},
+  bomber_explode: {title:'انفجار', cta:'منفجر کن', icon:'💥'},
+  gunner_give_war: {title:'توزیع تفنگ جنگی', cta:'تأیید جنگی', icon:'🔫'},
+  gunner_give_black: {title:'توزیع تفنگ مشقی', cta:'تأیید مشقی', icon:'🔫'},
+  gunner_shot: {title:'شلیک با تفنگ', cta:'شلیک', icon:'🔫'},
+};
+
+let state = { game:null, you:null, selectedTarget:null, selectedRole:null, activeTab:'lobby-init', lastChatLength: 0 };
+let pollTimer = null;
+
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(()=>t.classList.remove('show'), 2200);
+}
+
+function fmtClock(sec){
+  if (sec == null || sec < 0) return '--:--';
+  const m = Math.floor(sec/60), s = Math.floor(sec%60);
+  return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+}
+function toFa(n){ return String(n).replace(/[0-9]/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]); }
+function escapeHtml(s){ return String(s??'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+/* ---------------- API ---------------- */
+async function apiGetState(){
+  if (!CONFIG.API_BASE && !CHAT_ID) throw new Error('Backend not connected');
+  const res = await fetch(\`\${CONFIG.API_BASE}/api/miniapp/state?chat_id=\${encodeURIComponent(CHAT_ID || '')}\`, {
+    headers: { 'X-Telegram-Init-Data': tg ? tg.initData : '' },
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+async function apiPostAction(body){
+  try {
+    const res = await fetch(\`\${CONFIG.API_BASE}/api/miniapp/action\`, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'X-Telegram-Init-Data': tg ? tg.initData : '' },
+      body: JSON.stringify({ chatId: CHAT_ID, ...body }),
+    });
+    const data = await res.json();
+    if (!data.ok) toast(data.error || 'خطا در ثبت اطلاعات');
+    return data;
+  } catch(e) { toast('ارتباط با سرور برقرار نشد'); return { ok:false }; }
+}
+
+/* ---------------- MAIN LOOP ---------------- */
+async function pollLoop(){
+  if (!CHAT_ID) return;
+  try {
+    const data = await apiGetState();
+    if (data.ok) {
+       state.game = data.game; 
+       state.you = data.you;
+       render();
+    }
+  } catch(e) { }
+}
+
+function startPolling(){
+  pollLoop();
+  clearInterval(pollTimer);
+  pollTimer = setInterval(()=>{ if (!document.hidden) pollLoop(); }, CONFIG.POLL_MS);
+}
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) pollLoop(); });
+
+/* ---------------- TAB MANAGEMENT ---------------- */
+function switchTab(tabId) {
+  state.activeTab = tabId;
+  document.querySelectorAll('.bottomnav button').forEach(b => b.classList.remove('active'));
+  const btn = document.querySelector(\`.bottomnav button[data-tab="\${tabId}"]\`);
+  if(btn) btn.classList.add('active');
+  
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById(\`view-\${tabId}\`).classList.add('active');
+  if (tg) tg.HapticFeedback && tg.HapticFeedback.impactOccurred('light');
+}
+
+document.querySelectorAll('.bottomnav button').forEach(btn => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
+
+/* ---------------- LOBBY HANDLERS ---------------- */
+document.getElementById('btnCreateLobby').addEventListener('click', async () => {
+  const res = await apiPostAction({ action: 'create_lobby', api: true });
+  if (res.ok && res.chatId) {
+    CHAT_ID = res.chatId;
+    window.history.replaceState(null, null, \`?chat_id=\${CHAT_ID}\`);
+    startPolling();
+  }
+});
+
+document.getElementById('btnShowJoin').addEventListener('click', () => {
+  document.getElementById('joinLobbyForm').style.display = 'block';
+  document.getElementById('inputLobbyCode').focus();
+});
+
+document.getElementById('btnJoinLobbySubmit').addEventListener('click', async () => {
+  const code = document.getElementById('inputLobbyCode').value.trim();
+  if (!/^\d{5}\$/.test(code)) { toast('کد لابی باید ۵ رقم باشد'); return; }
+  const res = await apiPostAction({ action: 'join_lobby', api: true, code: code });
+  if (res.ok && res.chatId) {
+    CHAT_ID = res.chatId;
+    window.history.replaceState(null, null, \`?chat_id=\${CHAT_ID}\`);
+    startPolling();
+  }
+});
+
+document.getElementById('btnStartGame').addEventListener('click', async () => {
+  await apiPostAction({ action: 'start_game' });
+  pollLoop();
+});
+
+/* ---------------- RENDER ---------------- */
+const PHASE_META = {
+  lobby:{disc:'🃏', label:'لابی بازی', dn:'day'},
+  night:{disc:'🌙', label:'شب', dn:'night'},
+  inquiry:{disc:'🔎', label:'استعلام شهر', dn:'day'},
+  day:{disc:'☀️', label:'روز', dn:'day'},
+  nomination:{disc:'⚖️', label:'معرفی متهم', dn:'day'},
+  defense:{disc:'🎙', label:'دفاعیه', dn:'day'},
+  verdict:{disc:'🗳', label:'رأی نهایی دادگاه', dn:'day'},
+  resolving:{disc:'⏳', label:'در حال پردازش…', dn:'day'},
+  finished:{disc:'🏁', label:'پایان بازی', dn:'day'},
+};
+
+function render() {
+  const g = state.game, you = state.you;
+  if (!g) return;
+
+  // LOBBY PHASE
+  if (g.phase === 'lobby') {
+    document.getElementById('mainHeader').style.display = 'none';
+    document.getElementById('mainNav').style.display = 'flex';
+    document.getElementById('navLobbyBtn').style.display = 'flex';
+    document.getElementById('navRoleBtn').style.display = 'none';
+    document.getElementById('navChatBtn').style.display = 'none';
+    document.getElementById('navVoteBtn').style.display = 'none';
+    document.getElementById('navEventsBtn').style.display = 'none';
+    
+    if (state.activeTab === 'lobby-init') switchTab('lobby-wait');
+    
+    document.getElementById('displayLobbyCode').textContent = toFa(g.lobbyCode || '-----');
+    document.getElementById('lobbyPlayerCount').textContent = toFa((g.players||[]).length);
+    document.getElementById('lobbyPlayersList').innerHTML = (g.players||[]).map(p => \`
+      <div class="player-row">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span>👤</span> <span>\${escapeHtml(p.displayName)}</span>
+        </div>
+        \${p.isHost ? '<span style="font-size:11px; color:var(--gold);">میزبان</span>' : ''}
+      </div>
+    \`).join('');
+    
+    const isMeHost = (g.players||[]).some(p => p.userId === (you&&you.userId) && p.isHost);
+    document.getElementById('btnStartGame').style.display = isMeHost ? 'block' : 'none';
+    document.getElementById('waitingForHostMsg').style.display = isMeHost ? 'none' : 'block';
+    
+    return;
+  }
+
+  // IN GAME PHASES
+  document.getElementById('mainHeader').style.display = 'block';
+  document.getElementById('mainNav').style.display = 'flex';
+  document.getElementById('navLobbyBtn').style.display = 'none';
+  document.getElementById('navRoleBtn').style.display = 'flex';
+  document.getElementById('navVoteBtn').style.display = 'flex';
+  document.getElementById('navEventsBtn').style.display = 'flex';
+  
+  const isDay = g.phase === 'day';
+  document.getElementById('navChatBtn').style.display = isDay ? 'flex' : 'none';
+  
+  if (state.activeTab === 'lobby-init' || state.activeTab === 'lobby-wait') {
+    switchTab(isDay ? 'chat' : 'role');
+  }
+
+  const meta = PHASE_META[g.phase] || PHASE_META.lobby;
+  const atm = document.getElementById('atmosphere');
+  atm.className = meta.dn === 'night' ? 'is-night' : 'is-day';
+
+  document.getElementById('phaseDisc').textContent = meta.disc;
+  const dayNightNum = g.phase === 'night' ? g.nightNumber : g.dayNumber;
+  document.getElementById('phaseTitle').textContent = \`\${meta.label}\${dayNightNum ? ' ' + toFa(dayNightNum) : ''}\`;
+  document.getElementById('phaseSub').textContent = g.chatTitle || 'مافیا';
+
+  const alive = (g.players||[]).filter(p=>p.status==='alive');
+  document.getElementById('aliveCount').textContent = toFa(alive.length);
+  document.getElementById('dayNightChip').textContent = g.status === 'finished' ? 'پایان بازی' : (meta.dn === 'night' ? \`🌙 شب \${toFa(g.nightNumber||0)}\` : \`☀️ روز \${toFa(g.dayNumber||0)}\`);
+
+  renderTimer(g);
+  renderPlayers(g, you);
+  renderRole(g, you);
+  renderVote(g, you);
+  renderTimeline(g);
+  if (isDay) renderChatState(g, you);
+
+  if (g.status === 'finished') renderEndgame(g, you);
+
+  const hasAction = you && you.availableAction && you.status === 'alive';
+  document.getElementById('actionDot').classList.toggle('alert', !!hasAction);
+}
+
+let timerInterval = null;
+function renderTimer(g){
+  clearInterval(timerInterval);
+  const el = document.getElementById('timer');
+  function tick(){
+    if (!g.phaseEndsAt){ el.textContent='--:--'; el.classList.remove('low'); return; }
+    const left = Math.max(0, Math.round((g.phaseEndsAt - Date.now())/1000));
+    el.textContent = fmtClock(left);
+    el.classList.toggle('low', left <= 10);
+  }
+  tick();
+  timerInterval = setInterval(tick, 1000);
+}
+
+/* ---------------- PLAYERS ---------------- */
+function pcardHTML(p, you, selectable, selected){
+  const isYou = you && p.userId === you.userId;
+  const showRole = isYou || (p.status !== 'alive' && state.game.status === 'finished');
+  const roleInfo = showRole && (p.independentRole || p.role) ? (ROLE_META[p.independentRole || p.role] || {}) : null;
+  return \`
+  <div class="pcard \${p.status!=='alive'?'dead':''} \${isYou?'is-you':''} \${selected?'selected':''}" data-uid="\${p.userId}" data-selectable="\${selectable?1:0}">
+    <div class="pcard-top">
+      <div class="pcard-avatar">\${p.status==='alive' ? '👤' : '💀'}</div>
+      \${isYou ? '<span class="you-badge">شما</span>' : ''}
+    </div>
+    <div class="pcard-name">\${escapeHtml(p.displayName)}</div>
+    <div class="pcard-status \${p.status==='alive'?'alive':'dead'}">\${p.status==='alive' ? '🟢 زنده' : '💀 حذف‌شده'}</div>
+    \${roleInfo ? \`<div class="pcard-role-tag">\${roleInfo.emoji||''} \${roleInfo.name||''}</div>\` : ''}
+  </div>\`;
+}
+
+function renderPlayers(g, you){
+  const players = g.players || [];
+  const alive = players.filter(p=>p.status==='alive');
+  const dead = players.filter(p=>p.status!=='alive');
+  
+  const selectable = you && you.availableAction && you.status==='alive' && you.availableAction.type !== 'paranoid_alert';
+  
+  document.getElementById('playersGrid').innerHTML = alive.map(p =>
+    pcardHTML(p, you, selectable && (you.availableAction.targets||[]).includes(p.userId), state.selectedTarget===p.userId)
+  ).join('') || \`<div class="empty-note">هنوز بازیکنی نیست</div>\`;
+
+  document.getElementById('deadSection').style.display = dead.length ? 'block' : 'none';
+  document.getElementById('deadGrid').innerHTML = dead.map(p => pcardHTML(p, you, false, false)).join('');
+
+  document.querySelectorAll('#playersGrid .pcard[data-selectable="1"]').forEach(card=>{
+    card.addEventListener('click', ()=>{
+      const uid = Number(card.dataset.uid);
+      state.selectedTarget = state.selectedTarget === uid ? null : uid;
+      if (you.availableAction && you.availableAction.type === 'nato_guess') state.selectedRole = null;
+      render();
+    });
+  });
+}
+
+/* ---------------- ROLE & ACTIONS ---------------- */
+function renderRole(g, you){
+  const panel = document.getElementById('rolePanel');
+  if (!you || (!you.role && !you.independentRole)){
+    panel.innerHTML = \`<div class="empty-note"><span class="big">🎭</span>نقش شما هنوز مشخص نشده</div>\`;
+    document.getElementById('actionPanel').style.display='none';
+    return;
+  }
+  
+  const meta = ROLE_META[you.independentRole || you.role] || {name:'—',emoji:'🎭',team:'—'};
+  panel.innerHTML = \`
+    <div class="role-hero">
+      <div class="role-hero-emoji">\${meta.emoji}</div>
+      <div>
+        <div class="role-hero-name">\${meta.name}</div>
+        <div class="role-hero-team">تیم: \${meta.team}</div>
+      </div>
+    </div>
+    <div class="role-desc">\${escapeHtml(you.roleDescription || '')}</div>
+    \${renderRoleStats(you)}
+  \`;
+
+  const actionPanel = document.getElementById('actionPanel');
+  if (you.status !== 'alive'){
+    actionPanel.style.display='block';
+    actionPanel.innerHTML = \`<div class="empty-note"><span class="big">👻</span>شما دیگر در بازی نیستید</div>\`;
+    return;
+  }
+  if (!you.availableAction){
+    if (g.phase === 'night') {
+      actionPanel.style.display='block';
+      actionPanel.innerHTML = \`<div class="empty-note"><span class="big">🌒</span>در این فاز اقدامی برای شما نیست</div>\`;
+    } else {
+      actionPanel.style.display='none';
+    }
+    return;
+  }
+  
+  renderActionPanel(you, g);
+}
+
+function renderRoleStats(you){
+  const chips = [];
+  if (you.natoChancesLeft != null) chips.push(\`<span class="stat-pill">شانس حدس: <b>\${toFa(you.natoChancesLeft)}</b></span>\`);
+  if (you.paranoidAlertLeft != null) chips.push(\`<span class="stat-pill">هوشیاری باقی‌مانده: <b>\${toFa(you.paranoidAlertLeft)}</b></span>\`);
+  if (you.sniperShotsLeft != null) chips.push(\`<span class="stat-pill">تیر باقی‌مانده: <b>\${toFa(you.sniperShotsLeft)}</b></span>\`);
+  if (you.gunnerNightsLeft != null) chips.push(\`<span class="stat-pill">شب‌های توزیع باقی‌مانده: <b>\${toFa(you.gunnerNightsLeft)}</b></span>\`);
+  return chips.length ? \`<div class="role-stats">\${chips.join('')}</div>\` : '';
+}
+
+function renderActionPanel(you, g){
+  const panel = document.getElementById('actionPanel');
+  panel.style.display = 'block';
+  
+  const act = you.availableAction;
+  const info = ACTION_LABEL[act.type] || {title:'انتخاب هدف', cta:'تأیید', icon:'🎯'};
+  const targets = (g.players||[]).filter(p => (act.targets||[]).includes(p.userId));
+
+  let isConfirmDisabled = state.selectedTarget == null;
+
+  let natoRolesHtml = '';
+  if (act.type === 'nato_guess' && state.selectedTarget != null) {
+    const roles = act.guessableRoles || [];
+    isConfirmDisabled = state.selectedRole == null;
+    natoRolesHtml = \`
+      <div class="section-title">انتخاب نقش (ناتو)</div>
+      <div class="targets nato-roles">
+        \${roles.map(r => \`<div class="target-row \${state.selectedRole === r.id ? 'picked' : ''}" data-role="\${r.id}">
+          <div class="tname">\${r.emoji} \${escapeHtml(r.name)}</div>
+          <div class="radio-dot"></div>
+        </div>\`).join('')}
+      </div>
+    \`;
+  }
+
+  let bomberExplodeHtml = '';
+  if (act.type === 'bomber_mark' && act.canExplode) {
+    bomberExplodeHtml = \`<button class="btn primary" style="margin-top:16px;" id="btnExplode">💥 منفجر کردن بمب‌ها (\${toFa(act.markedCount||0)} نفر)</button>\`;
+  }
+
+  let targetsHtml = '';
+  if (act.type !== 'paranoid_alert') {
+    targetsHtml = \`
+      <div class="targets" id="targetList">
+        \${targets.map(t => \`
+          <div class="target-row \${state.selectedTarget===t.userId?'picked':''}" data-uid="\${t.userId}">
+            <div>
+              <div class="tname">\${escapeHtml(t.displayName)}\${t.userId===you.userId?' (خودم)':''}</div>
+            </div>
+            <div class="radio-dot"></div>
+          </div>\`).join('')}
+      </div>
+    \`;
+  } else {
+    isConfirmDisabled = false;
+    targetsHtml = \`<div class="empty-note" style="padding-top:0;">آیا می‌خواهید امشب هوشیار شوید؟ (در صورت حمله به شما، حمله‌کننده کشته می‌شود)</div>\`;
+  }
+
+  panel.innerHTML = \`
+    <div class="section-title" style="margin-top:0;">\${info.icon} \${info.title}</div>
+    \${targetsHtml}
+    \${natoRolesHtml}
+    \${bomberExplodeHtml}
+    <div class="btn-row">
+      \${act.skipLabel ? \`<button class="btn ghost" id="btnSkip">\${escapeHtml(act.skipLabel)}</button>\` : ''}
+      <button class="btn primary" id="btnConfirm" \${isConfirmDisabled ? 'disabled':''}>\${info.cta}</button>
+    </div>
+  \`;
+
+  if (act.type !== 'paranoid_alert') {
+    panel.querySelectorAll('#targetList .target-row').forEach(row=>{
+      row.addEventListener('click', ()=>{
+        state.selectedTarget = Number(row.dataset.uid);
+        if (act.type === 'nato_guess') state.selectedRole = null;
+        renderActionPanel(you, g);
+        renderPlayers(g, you);
+      });
+    });
+  }
+
+  if (act.type === 'nato_guess') {
+    panel.querySelectorAll('.nato-roles .target-row').forEach(row=>{
+      row.addEventListener('click', ()=>{
+        state.selectedRole = row.dataset.role;
+        renderActionPanel(you, g);
+      });
+    });
+  }
+
+  document.getElementById('btnSkip')?.addEventListener('click', async ()=>{
+    let payload = { action: act.type, targetId: null };
+    if (act.type === 'paranoid_alert') payload.targetId = 0; 
+    await apiPostAction(payload);
+    state.selectedTarget = null;
+    state.selectedRole = null;
+    toast('اقدام رد شد');
+    pollLoop();
+  });
+
+  document.getElementById('btnExplode')?.addEventListener('click', async ()=>{
+    await apiPostAction({ action: 'bomber_explode' });
+    state.selectedTarget = null;
+    toast('بمب‌ها منفجر شدند!');
+    pollLoop();
+  });
+
+  document.getElementById('btnConfirm').addEventListener('click', async ()=>{
+    if (isConfirmDisabled) return;
+    let payload = { action: act.type };
+    if (act.type === 'paranoid_alert') {
+      payload.targetId = you.userId;
+    } else {
+      payload.targetId = state.selectedTarget;
+      if (act.type === 'nato_guess') payload.targetRole = state.selectedRole;
+    }
+
+    const res = await apiPostAction(payload);
+    if (res.ok){ toast('ثبت شد'); state.selectedTarget = null; state.selectedRole = null; if (tg) tg.HapticFeedback && tg.HapticFeedback.notificationOccurred('success'); }
+    pollLoop();
+  });
+}
+
+/* ---------------- TURN BASED CHAT ---------------- */
+function renderChatState(g, you) {
+  if (g.phase !== 'day') return;
+  
+  const currentSpeakerId = g.currentSpeakerId;
+  const isMyTurn = (currentSpeakerId === (you && you.userId));
+  const currentSpeaker = (g.players||[]).find(p => p.userId === currentSpeakerId);
+  
+  const nameEl = document.getElementById('uiSpeakerName');
+  if (currentSpeaker) {
+     nameEl.innerHTML = isMyTurn ? \`🎙 شما <span style="font-size:12px; color:var(--ink-dim);">(درحال صحبت)</span>\` : \`🎙 \${escapeHtml(currentSpeaker.displayName)}\`;
+     nameEl.className = \`speaker-name \${isMyTurn ? 'is-me' : ''}\`;
+  } else {
+     nameEl.innerHTML = \`---\`;
+  }
+  
+  const timerEl = document.getElementById('uiSpeakerTimer');
+  const timeLeft = g.speakerTimeLeft || 0;
+  timerEl.textContent = \`00:\${String(timeLeft).padStart(2,'0')}\`;
+  timerEl.classList.toggle('urgent', timeLeft <= 10);
+  
+  const inputEl = document.getElementById('uiChatInput');
+  const btnEl = document.getElementById('uiChatSend');
+  
+  if (isMyTurn) {
+    inputEl.disabled = false;
+    btnEl.disabled = false;
+    if (inputEl.placeholder !== "تایپ کنید...") inputEl.placeholder = "تایپ کنید...";
+  } else {
+    inputEl.disabled = true;
+    btnEl.disabled = true;
+    if (inputEl.placeholder !== "فقط در نوبت خود می‌توانید صحبت کنید...") inputEl.placeholder = "فقط در نوبت خود می‌توانید صحبت کنید...";
+  }
+  
+  // Render Messages efficiently
+  const chatMessages = g.miniAppChat || [];
+  if (chatMessages.length !== state.lastChatLength) {
+     const container = document.getElementById('uiChatMessages');
+     container.innerHTML = chatMessages.map(msg => {
+        if (msg.isSystem) return \`<div class="chat-msg system">\${escapeHtml(msg.text)}</div>\`;
+        const isMine = you && msg.senderId === you.userId;
+        const d = new Date(msg.time);
+        const timeStr = \`\${String(d.getHours()).padStart(2,'0')}:\${String(d.getMinutes()).padStart(2,'0')}\`;
+        return \`
+          <div class="chat-msg \${isMine ? 'mine' : 'others'}">
+            <div class="sender">\${escapeHtml(msg.senderName)}</div>
+            <div class="text">\${escapeHtml(msg.text)}</div>
+            <div class="time">\${timeStr}</div>
+          </div>
+        \`;
+     }).join('');
+     container.scrollTop = container.scrollHeight;
+     state.lastChatLength = chatMessages.length;
+  }
+}
+
+document.getElementById('chatForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('uiChatInput');
+  const text = input.value.trim();
+  if (text) {
+    input.value = '';
+    const res = await apiPostAction({ action: 'chat_send', text: text });
+    if (res.ok) pollLoop(); // immediate fetch to show my message
+  }
+});
+
+
+/* ---------------- VOTING ---------------- */
+function renderVote(g, you){
+  const panel = document.getElementById('votePanel');
+  if (g.phase === 'nomination') renderNomination(panel, g, you);
+  else if (g.phase === 'defense') renderDefense(panel, g);
+  else if (g.phase === 'verdict') renderVerdict(panel, g, you);
+  else if (g.phase === 'inquiry') renderInquiry(panel, g, you);
+  else panel.innerHTML = \`<div class="empty-note"><span class="big">⚖️</span>الان رأی‌گیری فعالی نیست</div>\`;
+}
+
+function tallyVotes(votes, players){
+  const byTarget = {};
+  (votes||[]).forEach(v=>{
+    if (v.targetId == null) return;
+    byTarget[v.targetId] = (byTarget[v.targetId]||0) + (v.weight||1);
+  });
+  const max = Math.max(1, ...Object.values(byTarget), 1);
+  return { byTarget, max };
+}
+
+function renderNomination(panel, g, you){
+  const alive = (g.players||[]).filter(p=>p.status==='alive');
+  const { byTarget, max } = tallyVotes(g.votes, alive);
+  const myVote = (g.votes||[]).find(v=>v.voterId === (you&&you.userId));
+  
+  panel.innerHTML = \`
+    <div class="section-title" style="margin-top:0;">⚖️ چه کسی باید به دادگاه برود؟</div>
+    <div class="vote-bar-wrap">
+      \${alive.map(p=>{
+        const v = byTarget[p.userId]||0;
+        return \`<div class="vote-row" data-uid="\${p.userId}">
+          <div class="vote-row-top"><span class="vn">\${escapeHtml(p.displayName)}</span><span class="vc">\${toFa(v)} رأی</span></div>
+          <div class="vote-track"><div class="vote-fill" style="width:\${(v/max)*100}%"></div></div>
+        </div>\`;
+      }).join('')}
+    </div>
+    \${you && you.status==='alive' ? \`<div class="btn-row"><button class="btn ghost" id="btnAbstain">\${myVote && myVote.targetId===null ? '✓ ممتنع' : 'ممتنع'}</button></div>\` : ''}
+  \`;
+  if (you && you.status==='alive'){
+    panel.querySelectorAll('.vote-row').forEach(row=>{
+      row.addEventListener('click', async ()=>{
+        await apiPostAction({ action:'vote_nominate', targetId: Number(row.dataset.uid) });
+        toast('رأی ثبت شد'); pollLoop();
+      });
+    });
+    document.getElementById('btnAbstain')?.addEventListener('click', async ()=>{
+      await apiPostAction({ action:'vote_nominate', targetId: null });
+      toast('ممتنع ثبت شد'); pollLoop();
+    });
+  }
+}
+
+function renderDefense(panel, g){
+  const accused = (g.players||[]).find(p=>p.userId === g.accusedUserId);
+  panel.innerHTML = \`
+    <div class="section-title" style="margin-top:0;">🎙 زمان دفاعیه</div>
+    <div class="empty-note">
+      <span class="big">🎙</span>
+      \${accused ? escapeHtml(accused.displayName) + ' در حال دفاع از خودش است' : 'در انتظار دفاعیه'}
+    </div>
+  \`;
+}
+
+function renderVerdict(panel, g, you){
+  const myVerdict = (g.verdictVotes||[]).find(v=>v.voterId === (you&&you.userId));
+  const guilty = (g.verdictVotes||[]).filter(v=>v.guilty).reduce((s,v)=>s+(v.weight||1),0);
+  const innocent = (g.verdictVotes||[]).filter(v=>!v.guilty).reduce((s,v)=>s+(v.weight||1),0);
+  const total = Math.max(1, guilty+innocent);
+  const accused = (g.players||[]).find(p=>p.userId === g.accusedUserId);
+  
+  panel.innerHTML = \`
+    <div class="section-title" style="margin-top:0;">🗳 رأی نهایی — \${accused ? escapeHtml(accused.displayName) : ''}</div>
+    <div class="vote-row">
+      <div class="vote-row-top"><span class="vn">مجرم</span><span class="vc">\${toFa(guilty)}</span></div>
+      <div class="vote-track"><div class="vote-fill" style="width:\${(guilty/total)*100}%"></div></div>
+    </div>
+    <div class="vote-row">
+      <div class="vote-row-top"><span class="vn">بی‌گناه</span><span class="vc">\${toFa(innocent)}</span></div>
+      <div class="vote-track"><div class="vote-fill" style="width:\${(innocent/total)*100}%"></div></div>
+    </div>
+    \${you && you.status==='alive' && you.userId !== g.accusedUserId ? \`
+    <div class="btn-row">
+      <button class="btn ghost" id="btnInnocent">\${myVerdict && !myVerdict.guilty ? '✓ ' : ''}بی‌گناه</button>
+      <button class="btn primary" id="btnGuilty">\${myVerdict && myVerdict.guilty ? '✓ ' : ''}مجرم</button>
+    </div>\` : ''}
+  \`;
+  if (you && you.status==='alive' && you.userId !== g.accusedUserId){
+    document.getElementById('btnGuilty')?.addEventListener('click', async ()=>{ await apiPostAction({action:'vote_verdict', guilty:true}); toast('رأی مجرم ثبت شد'); pollLoop(); });
+    document.getElementById('btnInnocent')?.addEventListener('click', async ()=>{ await apiPostAction({action:'vote_verdict', guilty:false}); toast('رأی بی‌گناه ثبت شد'); pollLoop(); });
+  }
+}
+
+function renderInquiry(panel, g, you){
+  const myVote = (g.inquiryVotes||[]).find(v=>v.voterId === (you&&you.userId));
+  panel.innerHTML = \`
+    <div class="section-title" style="margin-top:0;">🔎 استعلام شهر</div>
+    <div class="empty-note" style="padding-bottom:10px;"><span class="big">🔎</span>آیا با استعلام نقش‌های خارج شده موافقت می‌کنید؟</div>
+    \${you && you.status === 'alive' ? \`
+      <div class="btn-row">
+        <button class="btn ghost" id="btnInqNo">\${myVote && myVote.choice===false ? '✓ ' : ''}مخالفم</button>
+        <button class="btn primary" id="btnInqYes">\${myVote && myVote.choice===true ? '✓ ' : ''}موافقم</button>
+      </div>
+    \` : ''}
+  \`;
+  if (you && you.status === 'alive') {
+    document.getElementById('btnInqYes')?.addEventListener('click', async ()=>{ await apiPostAction({ action:'vote_inquiry', choice:true }); toast('رأی موافق ثبت شد'); pollLoop(); });
+    document.getElementById('btnInqNo')?.addEventListener('click', async ()=>{ await apiPostAction({ action:'vote_inquiry', choice:false }); toast('رأی مخالف ثبت شد'); pollLoop(); });
+  }
+}
+
+/* ---------------- EVENTS / TIMELINE ---------------- */
+function renderTimeline(g){
+  const panel = document.getElementById('timelinePanel');
+  const items = g.timeline || [];
+  if (!items.length){
+    panel.innerHTML = \`<div class="empty-note"><span class="big">🕯</span>هنوز اتفاقی ثبت نشده</div>\`;
+    return;
+  }
+  panel.innerHTML = items.map(it => \`
+    <div class="tl-item">
+      <div class="tl-icon">\${it.icon||'•'}</div>
+      <div>
+        <div class="tl-head">\${escapeHtml(it.head||'')}</div>
+        <div class="tl-text">\${escapeHtml(it.text||'')}</div>
+      </div>
+    </div>
+  \`).join('');
+}
+
+/* ---------------- END GAME ---------------- */
+function renderEndgame(g, you){
+  const panel = document.getElementById('votePanel');
+  const winnerLabel = { mafia:'🎭 مافیا برنده شد', town:'🏘 شهروندان برنده شدند', independent:'🃏 مستقل برنده شد' }[g.winner] || 'بازی تمام شد';
+  panel.innerHTML = \`
+    <div class="endgame-banner">
+      <div class="emoji">🏆</div>
+      <h2>\${winnerLabel}</h2>
+      <p>نتیجه نهایی بازی</p>
+    </div>
+    <div>
+      \${(g.players||[]).map(p=>{
+        const meta = ROLE_META[p.independentRole || p.role] || {};
+        return \`<div class="reveal-row">
+          <div class="reveal-left"><span>\${p.status==='alive'?'🟢':'💀'}</span><span class="reveal-name">\${escapeHtml(p.displayName)}</span></div>
+          <span class="reveal-role">\${meta.emoji||''} \${meta.name||'—'}</span>
+        </div>\`;
+      }).join('')}
+    </div>
+  \`;
+}
+
+/* ---------------- BOOT ---------------- */
+if (CHAT_ID) {
+  document.getElementById('view-lobby-init').classList.remove('active');
+  startPolling();
+}
+</script>
+</body>
+</html>
+`;
+
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS users (
   telegram_id INTEGER PRIMARY KEY,
@@ -420,6 +1422,9 @@ export interface GameState {
   createdAt: number;
   updatedAt: number;
   startedAt: number | null;
+  lobbyCode: string | null;
+  dayStartedAt: number | null;
+  miniAppChat: Array<{id: number, senderId: number, senderName: string, text: string, time: number, isSystem: boolean}>;
   finishedAt: number | null;
 }
 
@@ -3272,10 +4277,202 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/miniapp/")) {
+      const userId = Number(request.headers.get("X-User-Id"));
+      const userName = request.headers.get("X-User-Name") || "کاربر";
+      
+      if (url.pathname === "/api/miniapp/state") {
+        return this.handleApiState(userId);
+      }
+      if (url.pathname === "/api/miniapp/action") {
+        const body = await request.json();
+        
+        if (body.api && body.action === "create_lobby") {
+           // Create a virtual room
+           const ts = now();
+           const host = { userId, username: null, firstName: userName, displayName: userName, role: null, team: null, independentRole: null, status: "alive" as PlayerStatus, originalMember: null, joinedAt: ts };
+           const vChatId = -1000000000 - userId;
+           this.game = {
+               id: randomId("g"), chatId: vChatId, chatTitle: "گروه مینی‌اپ", hostId: userId, status: "lobby", phase: "lobby", dayNumber: 0, nightNumber: 0,
+               phaseEndsAt: ts + DEFAULT_CONFIG.lobbySeconds * 1000, dayPhaseMaxEndsAt: null, reminderAt: null, nextTickAt: null, alarmKind: "phase_end",
+               players: [host], nightActions: [], votes: [], verdictVotes: [], inquiryVotes: [], cityInquiryCount: CITY_INQUIRY_TOTAL, pendingInquiryDeaths: null,
+               accusedUserId: null, temporaryCourtAdminUserId: null, silencedUserIds: [], blockedUserIds: [], escortBlockedUserIds: [], doctorSelfHealUsedBy: [],
+               sniperShotsLeft: {}, detectiveChecked: {}, godfatherRevealed: false, natoChancesLeft: 2, paranoidAlertLeft: 2, bomberMarkedTargets: [], invincibleShieldHits: {}, gunnerGuns: {},
+               gunnerNightsUsed: 0, gunnerWarGunsGiven: 0, gunnerBlackGunsGiven: 0, independentRoleType: null, savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, botPinnedMessageIds: [], winner: null,
+               botUsername: "mafia_bot", botId: 0, config: { ...DEFAULT_CONFIG }, createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
+               lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: []
+           };
+           await this.persist(true);
+           return Response.json({ ok: true, chatId: vChatId });
+        }
+        
+        if (body.api && body.action === "join_lobby") {
+           if (!this.game) return Response.json({ ok: false, error: "No game" });
+           if (this.game.players.length >= this.game.config.maxPlayers) return Response.json({ ok: false, error: "لابی پر است" });
+           if (findPlayer(this.game.players, userId)) return Response.json({ ok: true, chatId: this.game.chatId });
+           
+           const newPlayer = { userId, username: null, firstName: userName, displayName: userName, role: null, team: null, independentRole: null, status: "alive" as PlayerStatus, originalMember: null, joinedAt: now() };
+           this.game.players.push(newPlayer);
+           await this.persist(true);
+           return Response.json({ ok: true, chatId: this.game.chatId });
+        }
+
+        return this.handleApiAction(userId, userName, body);
+      }
+    }
+    
     if (request.method !== "POST") return new Response("ok");
     const update = (await request.json()) as TgUpdate;
     const result = await this.handleUpdate(update);
     return Response.json(result);
+  }
+
+  private async handleApiState(userId: number): Promise<Response> {
+    if (!this.game) return Response.json({ ok: false, error: "No game" });
+    const g = this.game;
+    const p = findPlayer(g.players, userId);
+
+    let availableAction: any = null;
+    let youStatus = p ? p.status : 'left';
+    let roleDescription = p?.role ? (ROLES[p.role]?.description || '') : (p?.independentRole ? (INDEPENDENT_ROLES[p.independentRole]?.description || '') : '');
+
+    if (p && p.status === 'alive') {
+      if (g.status === 'night') {
+        if (p.independentRole === 'bomber') {
+            availableAction = { type: 'bomber_mark', targets: nightTargetsFor(g.players, userId, 'bomber_mark').map(x=>x.userId), canExplode: g.bomberMarkedTargets.length > 0, markedCount: g.bomberMarkedTargets.length, skipLabel: '⏭ رد کردن این شب' };
+        } else if (p.independentRole === 'johnny') {
+             availableAction = { type: 'johnny_kill', targets: nightTargetsFor(g.players, userId, 'johnny_kill').map(x=>x.userId), skipLabel: '⏭ امشب قتل نمی‌کنم' };
+        } else if (p.independentRole === 'lonewolf') {
+             availableAction = { type: 'investigate', targets: nightTargetsFor(g.players, userId, 'investigate').map(x=>x.userId), skipLabel: '⏭ رد کردن این شب' };
+        } else if (p.role === 'paranoid') {
+             if (g.paranoidAlertLeft > 0) availableAction = { type: 'paranoid_alert', skipLabel: '❌ نمی‌خواهم امشب هوشیار باشم' };
+        } else if (p.role === 'gunner') {
+             if (g.gunnerNightsUsed < 2) {
+                 const { warGiven, blackGiven } = this.gunnerNightGunStatus(g, userId, g.nightNumber);
+                 if (!warGiven) availableAction = { type: 'gunner_give_war', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive').map(x=>x.userId), skipLabel: '⏭ امشب تفنگ نمی‌دهم' };
+                 else if (!blackGiven) availableAction = { type: 'gunner_give_black', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive' && !g.nightActions.some(a=>a.actorId===userId&&a.type==="gunner_give_war"&&a.targetId===x.userId)).map(x=>x.userId) };
+             }
+        } else if (p.role === 'nato') {
+             if (g.natoChancesLeft > 0) availableAction = { type: 'nato_guess', targets: nightTargetsFor(g.players, userId, 'nato_guess').map(x=>x.userId), guessableRoles: gameRolesInPlay(g), skipLabel: '⏭ رد کردن این شب' };
+        } else {
+             const def = ROLES[p.role];
+             if (def?.nightAction) availableAction = { type: def.nightAction, targets: nightTargetsFor(g.players, userId, def.nightAction, { includeSelf: def.id === 'doctor' || def.id === 'lecter' }).map(x=>x.userId), skipLabel: (def.nightOptional || def.id === 'doctor' || def.id === 'lecter') ? '⏭ امشب رد می‌کنم' : null };
+        }
+      } else if (g.status === 'day') {
+          const guns = g.gunnerGuns[String(userId)] ?? [];
+          if (guns.length > 0) availableAction = { type: 'gunner_shot', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive').map(x=>x.userId) };
+      }
+    }
+    
+    // TURN BASED CHAT CALCULATION (40 SECONDS)
+    let currentSpeakerId = null;
+    let speakerEndsAt = null;
+    let speakerTimeLeft = 0;
+    
+    if (g.status === 'day' && g.dayStartedAt) {
+       const alive = g.players.filter(x => x.status === 'alive');
+       if (alive.length > 0) {
+           const elapsed = now() - g.dayStartedAt;
+           const turnDuration = 40000;
+           const turnIndex = Math.floor(elapsed / turnDuration);
+           const speaker = alive[turnIndex % alive.length];
+           currentSpeakerId = speaker.userId;
+           speakerEndsAt = g.dayStartedAt + (turnIndex + 1) * turnDuration;
+           speakerTimeLeft = Math.max(0, Math.ceil((speakerEndsAt - now()) / 1000));
+       }
+    }
+
+    const sanitizedGame = {
+      chatId: g.chatId,
+      status: g.status,
+      phase: g.phase,
+      dayNumber: g.dayNumber,
+      nightNumber: g.nightNumber,
+      chatTitle: g.chatTitle,
+      phaseEndsAt: g.phaseEndsAt,
+      winner: g.winner,
+      accusedUserId: g.accusedUserId,
+      lobbyCode: g.lobbyCode,
+      votes: g.votes,
+      verdictVotes: g.verdictVotes,
+      inquiryVotes: g.inquiryVotes,
+      timeline: [], 
+      currentSpeakerId,
+      speakerEndsAt,
+      speakerTimeLeft,
+      miniAppChat: g.miniAppChat || [],
+      players: g.players.map(x => ({
+          userId: x.userId,
+          displayName: x.displayName,
+          status: x.status,
+          isHost: x.userId === g.hostId,
+          role: g.status === 'finished' ? x.role : null,
+          independentRole: g.status === 'finished' ? x.independentRole : null,
+          deathReason: x.deathReason,
+          team: g.status === 'finished' ? x.team : null,
+      }))
+    };
+
+    return Response.json({
+      ok: true,
+      game: sanitizedGame,
+      you: p ? {
+          userId: p.userId, status: youStatus, role: p.role, independentRole: p.independentRole, team: p.team, roleDescription, availableAction,
+          natoChancesLeft: g.natoChancesLeft, paranoidAlertLeft: g.paranoidAlertLeft,
+          sniperShotsLeft: p.role === 'sniper' ? (g.sniperShotsLeft[String(userId)] ?? 0) : null,
+          gunnerNightsLeft: p.role === 'gunner' ? Math.max(0, 2 - g.gunnerNightsUsed) : null,
+      } : null
+    });
+  }
+
+  private async handleApiAction(userId: number, userName: string, body: any): Promise<Response> {
+    const { action, targetId, targetRole, guilty, choice, text } = body;
+    const g = this.game;
+    if (!g) return Response.json({ ok: false, error: "No game" });
+    
+    // START GAME
+    if (action === "start_game") {
+        if (g.hostId !== userId) return Response.json({ ok: false, error: "شما میزبان نیستید" });
+        await this.cmdStartGame(userId, g.chatId);
+        return Response.json({ ok: true });
+    }
+    
+    // CHAT SEND (40s logic)
+    if (action === "chat_send") {
+        if (g.status !== 'day' || !g.dayStartedAt) return Response.json({ ok: false, error: "چت غیرفعال است" });
+        const alive = g.players.filter(x => x.status === 'alive');
+        const turnDuration = 40000;
+        const turnIndex = Math.floor((now() - g.dayStartedAt) / turnDuration);
+        const speaker = alive[turnIndex % alive.length];
+        
+        if (!speaker || speaker.userId !== userId) {
+            return Response.json({ ok: false, error: "نوبت شما نیست" });
+        }
+        
+        if (!g.miniAppChat) g.miniAppChat = [];
+        g.miniAppChat.push({ id: now(), senderId: userId, senderName: userName, text: text, time: now(), isSystem: false });
+        await this.persist();
+        return Response.json({ ok: true });
+    }
+
+    let res = { alert: false, text: "" };
+    
+    if (action === "vote_nominate") res = await this.applyNomination(userId, g.dayNumber, targetId ?? 0);
+    else if (action === "vote_verdict") res = await this.applyVerdict(userId, g.dayNumber, guilty);
+    else if (action === "vote_inquiry") res = await this.applyInquiryVote(userId, g.dayNumber, choice);
+    else if (action === "gunner_shot") res = await this.applyGunnerShot(userId, g.dayNumber, targetId ?? 0);
+    else if (action === "gunner_give_war") res = await this.applyGunnerGiveWar(userId, g.nightNumber, targetId ?? 0);
+    else if (action === "gunner_give_black") res = await this.applyGunnerGiveBlack(userId, g.nightNumber, targetId ?? 0);
+    else if (action === "nato_guess") {
+       if (targetRole) res = await this.applyNatoRoleGuess(userId, g.nightNumber, targetId, targetRole);
+       else res = await this.applyNightAction(userId, g.nightNumber, "nato_guess", 0);
+    } 
+    else if (action === "bomber_explode") res = await this.applyBomberExplode(userId, g.nightNumber);
+    else res = await this.applyNightAction(userId, g.nightNumber, action as NightActionType, targetId ?? 0);
+
+    if (res.alert) return Response.json({ ok: false, error: res.text });
+    return Response.json({ ok: true });
   }
 
   async handleUpdate(update: TgUpdate): Promise<{ ok: boolean }> {
@@ -3736,7 +4933,7 @@ export class GameRoom extends DurableObject<Env> {
       gunnerNightsUsed: 0, gunnerWarGunsGiven: 0, gunnerBlackGunsGiven: 0,
       savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, botPinnedMessageIds: [], winner: null,
       botUsername: me?.username ?? null, botId: me?.id ?? null, config: { ...DEFAULT_CONFIG },
-      createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
+      lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), createdAt: ts, updatedAt: ts, startedAt: null, lobbyCode: null, dayStartedAt: null, miniAppChat: [], finishedAt: null,
     };
 
     // IMPORTANT: send the lobby announcement BEFORE committing anything to storage/D1.
@@ -4155,6 +5352,8 @@ export class GameRoom extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(now() + 10000);
 
     game.status = "day";
+    game.dayStartedAt = now();
+    game.miniAppChat = [{ id: now(), senderId: 0, senderName: 'سیستم', text: '☀️ روز آغاز شد. هر نفر ۴۰ ثانیه فرصت صحبت دارد.', time: now(), isSystem: true }];
     game.phase = "day";
     game.accusedUserId = null;
     const secs = dayDurationSeconds(game);
@@ -5846,6 +7045,9 @@ export class GameRoom extends DurableObject<Env> {
       createdAt: gameRow.created_at,
       updatedAt: gameRow.updated_at,
       startedAt: gameRow.started_at,
+      lobbyCode: null,
+      dayStartedAt: null,
+      miniAppChat: [],
       finishedAt: gameRow.finished_at,
     };
 
@@ -5928,6 +7130,84 @@ function inferChatId(update: TgUpdate): number | null {
 // EXPORTS
 // =============================================================================
 
+
+async function verifyInitData(initData: string | null, token: string) {
+  if (!initData) return null;
+  const q = new URLSearchParams(initData);
+  const hash = q.get("hash");
+  if (!hash) return null;
+  q.delete("hash");
+  const keys = [...q.keys()].sort();
+  const dataCheckString = keys.map(k => `${k}=${q.get(k)}`).join("\n");
+  
+  const encoder = new TextEncoder();
+  const secretKey = await crypto.subtle.importKey("raw", encoder.encode("WebAppData"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const secretHash = await crypto.subtle.sign("HMAC", secretKey, encoder.encode(token));
+  const finalKey = await crypto.subtle.importKey("raw", secretHash, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", finalKey, encoder.encode(dataCheckString));
+  const hex = [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, '0')).join('');
+  
+  if (hex !== hash) return null;
+  try { return JSON.parse(q.get("user") || "{}"); } catch { return null; }
+}
+
+async function handleMiniappApi(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const method = request.method;
+  
+  let initData = request.headers.get("X-Telegram-Init-Data");
+  const user = await verifyInitData(initData, env.BOT_TOKEN);
+  
+  // To allow testing locally if needed, mock user if no init data:
+  // const user = { id: 12345, first_name: "Test" };
+  
+  if (!user) return json({ ok: false, error: "Unauthorized" }, 401);
+
+  let body: any = {};
+  if (method === "POST") body = await request.clone().json().catch(()=>({}));
+
+  // Handle Create Lobby (Virtual Chat Room)
+  if (method === "POST" && body.action === "create_lobby") {
+     const virtualChatId = -1000000000 - user.id; // Synthetic ID
+     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${virtualChatId}`));
+     return stub.fetch(new Request(request.url, {
+         method: "POST",
+         headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name },
+         body: JSON.stringify({ api: true, action: "create_lobby" })
+     }));
+  }
+  
+  // Handle Join Lobby
+  if (method === "POST" && body.action === "join_lobby") {
+     const code = body.code;
+     const row = await env.DB.prepare(`SELECT chat_id FROM games WHERE json_extract(state_json, '$.lobbyCode') = ? AND status = 'lobby' ORDER BY created_at DESC LIMIT 1`).bind(code).first<{chat_id: number}>();
+     if (!row) return json({ ok: false, error: "لابی یافت نشد یا پر شده است" });
+     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${row.chat_id}`));
+     return stub.fetch(new Request(request.url, {
+         method: "POST",
+         headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name },
+         body: JSON.stringify({ api: true, action: "join_lobby", chatId: row.chat_id })
+     }));
+  }
+
+  let chatId = Number(url.searchParams.get("chat_id") || body.chatId);
+  if (!chatId || isNaN(chatId)) {
+      // Find active game for user
+      const active = await findActiveGameForUser(env.DB, user.id);
+      if (active) chatId = active.chat_id;
+      else return json({ ok: false, error: "No active game" });
+  }
+
+  const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${chatId}`));
+  const newRequest = new Request(request.url, {
+    method: request.method,
+    headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name },
+    body: request.method === "POST" ? await request.clone().text() : null
+  });
+
+  return stub.fetch(newRequest);
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -5935,6 +7215,10 @@ export default {
       return json({ ok: true, service: "telegram-mafia-bot", ts: Date.now() });
     }
     if (request.method === "GET" && url.pathname === "/setup") return setup(url, env);
+    if (request.method === "GET" && url.pathname === "/app") {
+       return new Response(MINIAPP_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (url.pathname.startsWith("/api/miniapp/")) return handleMiniappApi(request, env);
     if (request.method === "POST" && url.pathname === "/webhook") {
       const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
       if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) return new Response("unauthorized", { status: 401 });

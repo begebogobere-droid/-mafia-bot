@@ -7211,11 +7211,11 @@ async function handleMiniappApi(request: Request, env: Env): Promise<Response> {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
+    if (request.method === "GET" && url.pathname === "/health") {
       return json({ ok: true, service: "telegram-mafia-bot", ts: Date.now() });
     }
     if (request.method === "GET" && url.pathname === "/setup") return setup(url, env);
-    if (request.method === "GET" && url.pathname === "/app") {
+    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/app")) {
        return new Response(MINIAPP_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
     if (url.pathname.startsWith("/api/miniapp/")) return handleMiniappApi(request, env);

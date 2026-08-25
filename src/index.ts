@@ -1422,10 +1422,10 @@ export interface GameState {
   createdAt: number;
   updatedAt: number;
   startedAt: number | null;
+  finishedAt: number | null;
   lobbyCode: string | null;
   dayStartedAt: number | null;
   miniAppChat: Array<{id: number, senderId: number, senderName: string, text: string, time: number, isSystem: boolean}>;
-  finishedAt: number | null;
 }
 
 export interface RoleDef {
@@ -4281,17 +4281,17 @@ export class GameRoom extends DurableObject<Env> {
     if (url.pathname.startsWith("/api/miniapp/")) {
       const userId = Number(request.headers.get("X-User-Id"));
       const userName = request.headers.get("X-User-Name") || "کاربر";
-      
+
       if (url.pathname === "/api/miniapp/state") {
         return this.handleApiState(userId);
       }
       if (url.pathname === "/api/miniapp/action") {
         const body = await request.json();
-        
+
         if (body.api && body.action === "create_lobby") {
-           // Create a virtual room
+           // Create a virtual room (mini-app-only lobby, not tied to a Telegram group)
            const ts = now();
-           const host = { userId, username: null, firstName: userName, displayName: userName, role: null, team: null, independentRole: null, status: "alive" as PlayerStatus, originalMember: null, joinedAt: ts };
+           const host: Player = { userId, username: null, firstName: userName, displayName: userName, role: null, team: null, independentRole: null, status: "alive" as PlayerStatus, originalMember: null, joinedAt: ts };
            const vChatId = -1000000000 - userId;
            this.game = {
                id: randomId("g"), chatId: vChatId, chatTitle: "گروه مینی‌اپ", hostId: userId, status: "lobby", phase: "lobby", dayNumber: 0, nightNumber: 0,
@@ -4301,18 +4301,21 @@ export class GameRoom extends DurableObject<Env> {
                sniperShotsLeft: {}, detectiveChecked: {}, godfatherRevealed: false, natoChancesLeft: 2, paranoidAlertLeft: 2, bomberMarkedTargets: [], invincibleShieldHits: {}, gunnerGuns: {},
                gunnerNightsUsed: 0, gunnerWarGunsGiven: 0, gunnerBlackGunsGiven: 0, independentRoleType: null, savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, botPinnedMessageIds: [], winner: null,
                botUsername: "mafia_bot", botId: 0, config: { ...DEFAULT_CONFIG }, createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
-               lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: []
+               lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [],
            };
            await this.persist(true);
            return Response.json({ ok: true, chatId: vChatId });
         }
-        
+
         if (body.api && body.action === "join_lobby") {
            if (!this.game) return Response.json({ ok: false, error: "No game" });
+           // BUGFIX (was missing in the draft): reject joins once the game has left the lobby
+           // phase, instead of silently letting a late joiner attach mid-round.
+           if (this.game.status !== "lobby") return Response.json({ ok: false, error: "بازی قبلاً شروع شده است" });
            if (this.game.players.length >= this.game.config.maxPlayers) return Response.json({ ok: false, error: "لابی پر است" });
            if (findPlayer(this.game.players, userId)) return Response.json({ ok: true, chatId: this.game.chatId });
-           
-           const newPlayer = { userId, username: null, firstName: userName, displayName: userName, role: null, team: null, independentRole: null, status: "alive" as PlayerStatus, originalMember: null, joinedAt: now() };
+
+           const newPlayer: Player = { userId, username: null, firstName: userName, displayName: userName, role: null, team: null, independentRole: null, status: "alive" as PlayerStatus, originalMember: null, joinedAt: now() };
            this.game.players.push(newPlayer);
            await this.persist(true);
            return Response.json({ ok: true, chatId: this.game.chatId });
@@ -4321,158 +4324,11 @@ export class GameRoom extends DurableObject<Env> {
         return this.handleApiAction(userId, userName, body);
       }
     }
-    
+
     if (request.method !== "POST") return new Response("ok");
     const update = (await request.json()) as TgUpdate;
     const result = await this.handleUpdate(update);
     return Response.json(result);
-  }
-
-  private async handleApiState(userId: number): Promise<Response> {
-    if (!this.game) return Response.json({ ok: false, error: "No game" });
-    const g = this.game;
-    const p = findPlayer(g.players, userId);
-
-    let availableAction: any = null;
-    let youStatus = p ? p.status : 'left';
-    let roleDescription = p?.role ? (ROLES[p.role]?.description || '') : (p?.independentRole ? (INDEPENDENT_ROLES[p.independentRole]?.description || '') : '');
-
-    if (p && p.status === 'alive') {
-      if (g.status === 'night') {
-        if (p.independentRole === 'bomber') {
-            availableAction = { type: 'bomber_mark', targets: nightTargetsFor(g.players, userId, 'bomber_mark').map(x=>x.userId), canExplode: g.bomberMarkedTargets.length > 0, markedCount: g.bomberMarkedTargets.length, skipLabel: '⏭ رد کردن این شب' };
-        } else if (p.independentRole === 'johnny') {
-             availableAction = { type: 'johnny_kill', targets: nightTargetsFor(g.players, userId, 'johnny_kill').map(x=>x.userId), skipLabel: '⏭ امشب قتل نمی‌کنم' };
-        } else if (p.independentRole === 'lonewolf') {
-             availableAction = { type: 'investigate', targets: nightTargetsFor(g.players, userId, 'investigate').map(x=>x.userId), skipLabel: '⏭ رد کردن این شب' };
-        } else if (p.role === 'paranoid') {
-             if (g.paranoidAlertLeft > 0) availableAction = { type: 'paranoid_alert', skipLabel: '❌ نمی‌خواهم امشب هوشیار باشم' };
-        } else if (p.role === 'gunner') {
-             if (g.gunnerNightsUsed < 2) {
-                 const { warGiven, blackGiven } = this.gunnerNightGunStatus(g, userId, g.nightNumber);
-                 if (!warGiven) availableAction = { type: 'gunner_give_war', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive').map(x=>x.userId), skipLabel: '⏭ امشب تفنگ نمی‌دهم' };
-                 else if (!blackGiven) availableAction = { type: 'gunner_give_black', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive' && !g.nightActions.some(a=>a.actorId===userId&&a.type==="gunner_give_war"&&a.targetId===x.userId)).map(x=>x.userId) };
-             }
-        } else if (p.role === 'nato') {
-             if (g.natoChancesLeft > 0) availableAction = { type: 'nato_guess', targets: nightTargetsFor(g.players, userId, 'nato_guess').map(x=>x.userId), guessableRoles: gameRolesInPlay(g), skipLabel: '⏭ رد کردن این شب' };
-        } else {
-             const def = ROLES[p.role];
-             if (def?.nightAction) availableAction = { type: def.nightAction, targets: nightTargetsFor(g.players, userId, def.nightAction, { includeSelf: def.id === 'doctor' || def.id === 'lecter' }).map(x=>x.userId), skipLabel: (def.nightOptional || def.id === 'doctor' || def.id === 'lecter') ? '⏭ امشب رد می‌کنم' : null };
-        }
-      } else if (g.status === 'day') {
-          const guns = g.gunnerGuns[String(userId)] ?? [];
-          if (guns.length > 0) availableAction = { type: 'gunner_shot', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive').map(x=>x.userId) };
-      }
-    }
-    
-    // TURN BASED CHAT CALCULATION (40 SECONDS)
-    let currentSpeakerId = null;
-    let speakerEndsAt = null;
-    let speakerTimeLeft = 0;
-    
-    if (g.status === 'day' && g.dayStartedAt) {
-       const alive = g.players.filter(x => x.status === 'alive');
-       if (alive.length > 0) {
-           const elapsed = now() - g.dayStartedAt;
-           const turnDuration = 40000;
-           const turnIndex = Math.floor(elapsed / turnDuration);
-           const speaker = alive[turnIndex % alive.length];
-           currentSpeakerId = speaker.userId;
-           speakerEndsAt = g.dayStartedAt + (turnIndex + 1) * turnDuration;
-           speakerTimeLeft = Math.max(0, Math.ceil((speakerEndsAt - now()) / 1000));
-       }
-    }
-
-    const sanitizedGame = {
-      chatId: g.chatId,
-      status: g.status,
-      phase: g.phase,
-      dayNumber: g.dayNumber,
-      nightNumber: g.nightNumber,
-      chatTitle: g.chatTitle,
-      phaseEndsAt: g.phaseEndsAt,
-      winner: g.winner,
-      accusedUserId: g.accusedUserId,
-      lobbyCode: g.lobbyCode,
-      votes: g.votes,
-      verdictVotes: g.verdictVotes,
-      inquiryVotes: g.inquiryVotes,
-      timeline: [], 
-      currentSpeakerId,
-      speakerEndsAt,
-      speakerTimeLeft,
-      miniAppChat: g.miniAppChat || [],
-      players: g.players.map(x => ({
-          userId: x.userId,
-          displayName: x.displayName,
-          status: x.status,
-          isHost: x.userId === g.hostId,
-          role: g.status === 'finished' ? x.role : null,
-          independentRole: g.status === 'finished' ? x.independentRole : null,
-          deathReason: x.deathReason,
-          team: g.status === 'finished' ? x.team : null,
-      }))
-    };
-
-    return Response.json({
-      ok: true,
-      game: sanitizedGame,
-      you: p ? {
-          userId: p.userId, status: youStatus, role: p.role, independentRole: p.independentRole, team: p.team, roleDescription, availableAction,
-          natoChancesLeft: g.natoChancesLeft, paranoidAlertLeft: g.paranoidAlertLeft,
-          sniperShotsLeft: p.role === 'sniper' ? (g.sniperShotsLeft[String(userId)] ?? 0) : null,
-          gunnerNightsLeft: p.role === 'gunner' ? Math.max(0, 2 - g.gunnerNightsUsed) : null,
-      } : null
-    });
-  }
-
-  private async handleApiAction(userId: number, userName: string, body: any): Promise<Response> {
-    const { action, targetId, targetRole, guilty, choice, text } = body;
-    const g = this.game;
-    if (!g) return Response.json({ ok: false, error: "No game" });
-    
-    // START GAME
-    if (action === "start_game") {
-        if (g.hostId !== userId) return Response.json({ ok: false, error: "شما میزبان نیستید" });
-        await this.cmdStartGame(userId, g.chatId);
-        return Response.json({ ok: true });
-    }
-    
-    // CHAT SEND (40s logic)
-    if (action === "chat_send") {
-        if (g.status !== 'day' || !g.dayStartedAt) return Response.json({ ok: false, error: "چت غیرفعال است" });
-        const alive = g.players.filter(x => x.status === 'alive');
-        const turnDuration = 40000;
-        const turnIndex = Math.floor((now() - g.dayStartedAt) / turnDuration);
-        const speaker = alive[turnIndex % alive.length];
-        
-        if (!speaker || speaker.userId !== userId) {
-            return Response.json({ ok: false, error: "نوبت شما نیست" });
-        }
-        
-        if (!g.miniAppChat) g.miniAppChat = [];
-        g.miniAppChat.push({ id: now(), senderId: userId, senderName: userName, text: text, time: now(), isSystem: false });
-        await this.persist();
-        return Response.json({ ok: true });
-    }
-
-    let res = { alert: false, text: "" };
-    
-    if (action === "vote_nominate") res = await this.applyNomination(userId, g.dayNumber, targetId ?? 0);
-    else if (action === "vote_verdict") res = await this.applyVerdict(userId, g.dayNumber, guilty);
-    else if (action === "vote_inquiry") res = await this.applyInquiryVote(userId, g.dayNumber, choice);
-    else if (action === "gunner_shot") res = await this.applyGunnerShot(userId, g.dayNumber, targetId ?? 0);
-    else if (action === "gunner_give_war") res = await this.applyGunnerGiveWar(userId, g.nightNumber, targetId ?? 0);
-    else if (action === "gunner_give_black") res = await this.applyGunnerGiveBlack(userId, g.nightNumber, targetId ?? 0);
-    else if (action === "nato_guess") {
-       if (targetRole) res = await this.applyNatoRoleGuess(userId, g.nightNumber, targetId, targetRole);
-       else res = await this.applyNightAction(userId, g.nightNumber, "nato_guess", 0);
-    } 
-    else if (action === "bomber_explode") res = await this.applyBomberExplode(userId, g.nightNumber);
-    else res = await this.applyNightAction(userId, g.nightNumber, action as NightActionType, targetId ?? 0);
-
-    if (res.alert) return Response.json({ ok: false, error: res.text });
-    return Response.json({ ok: true });
   }
 
   async handleUpdate(update: TgUpdate): Promise<{ ok: boolean }> {
@@ -4933,7 +4789,8 @@ export class GameRoom extends DurableObject<Env> {
       gunnerNightsUsed: 0, gunnerWarGunsGiven: 0, gunnerBlackGunsGiven: 0,
       savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, botPinnedMessageIds: [], winner: null,
       botUsername: me?.username ?? null, botId: me?.id ?? null, config: { ...DEFAULT_CONFIG },
-      lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), createdAt: ts, updatedAt: ts, startedAt: null, lobbyCode: null, dayStartedAt: null, miniAppChat: [], finishedAt: null,
+      createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
+      lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [],
     };
 
     // IMPORTANT: send the lobby announcement BEFORE committing anything to storage/D1.
@@ -5352,8 +5209,6 @@ export class GameRoom extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(now() + 10000);
 
     game.status = "day";
-    game.dayStartedAt = now();
-    game.miniAppChat = [{ id: now(), senderId: 0, senderName: 'سیستم', text: '☀️ روز آغاز شد. هر نفر ۴۰ ثانیه فرصت صحبت دارد.', time: now(), isSystem: true }];
     game.phase = "day";
     game.accusedUserId = null;
     const secs = dayDurationSeconds(game);
@@ -5361,6 +5216,8 @@ export class GameRoom extends DurableObject<Env> {
     game.dayPhaseMaxEndsAt = now() + game.config.daySecondsMax * 1000;
     game.reminderAt = null;
     game.nextTickAt = secs > 90 ? now() + 60000 : null;
+    game.dayStartedAt = now();
+    game.miniAppChat = [{ id: now(), senderId: 0, senderName: 'سیستم', text: '☀️ روز آغاز شد. هر نفر ۴۰ ثانیه فرصت صحبت دارد.', time: now(), isSystem: true }];
     await this.unlockForDay();
     await this.persist(true);
     await this.schedulePhaseTimers();
@@ -7045,14 +6902,163 @@ export class GameRoom extends DurableObject<Env> {
       createdAt: gameRow.created_at,
       updatedAt: gameRow.updated_at,
       startedAt: gameRow.started_at,
+      finishedAt: gameRow.finished_at,
       lobbyCode: null,
       dayStartedAt: null,
       miniAppChat: [],
-      finishedAt: gameRow.finished_at,
     };
 
     await this.persist();
     if (isActiveStatus(this.game.status)) await this.ensureAlarm();
+  }
+
+  private async handleApiState(userId: number): Promise<Response> {
+    if (!this.game) return Response.json({ ok: false, error: "No game" });
+    const g = this.game;
+    const p = findPlayer(g.players, userId);
+
+    let availableAction: any = null;
+    let youStatus = p ? p.status : 'left';
+    let roleDescription = p?.role ? (ROLES[p.role]?.description || '') : (p?.independentRole ? (INDEPENDENT_ROLES[p.independentRole]?.description || '') : '');
+
+    if (p && p.status === 'alive') {
+      if (g.status === 'night') {
+        if (p.independentRole === 'bomber') {
+            availableAction = { type: 'bomber_mark', targets: nightTargetsFor(g.players, userId, 'bomber_mark').map(x=>x.userId), canExplode: g.bomberMarkedTargets.length > 0, markedCount: g.bomberMarkedTargets.length, skipLabel: '⏭ رد کردن این شب' };
+        } else if (p.independentRole === 'johnny') {
+             availableAction = { type: 'johnny_kill', targets: nightTargetsFor(g.players, userId, 'johnny_kill').map(x=>x.userId), skipLabel: '⏭ امشب قتل نمی‌کنم' };
+        } else if (p.independentRole === 'lonewolf') {
+             availableAction = { type: 'investigate', targets: nightTargetsFor(g.players, userId, 'investigate').map(x=>x.userId), skipLabel: '⏭ رد کردن این شب' };
+        } else if (p.role === 'paranoid') {
+             if (g.paranoidAlertLeft > 0) availableAction = { type: 'paranoid_alert', skipLabel: '❌ نمی‌خواهم امشب هوشیار باشم' };
+        } else if (p.role === 'gunner') {
+             if (g.gunnerNightsUsed < 2) {
+                 const { warGiven, blackGiven } = this.gunnerNightGunStatus(g, userId, g.nightNumber);
+                 if (!warGiven) availableAction = { type: 'gunner_give_war', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive').map(x=>x.userId), skipLabel: '⏭ امشب تفنگ نمی‌دهم' };
+                 else if (!blackGiven) availableAction = { type: 'gunner_give_black', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive' && !g.nightActions.some(a=>a.actorId===userId&&a.type==="gunner_give_war"&&a.targetId===x.userId)).map(x=>x.userId) };
+             }
+        } else if (p.role === 'nato') {
+             if (g.natoChancesLeft > 0) availableAction = { type: 'nato_guess', targets: nightTargetsFor(g.players, userId, 'nato_guess').map(x=>x.userId), guessableRoles: gameRolesInPlay(g), skipLabel: '⏭ رد کردن این شب' };
+        } else {
+             const def = ROLES[p.role!];
+             if (def?.nightAction) availableAction = { type: def.nightAction, targets: nightTargetsFor(g.players, userId, def.nightAction, { includeSelf: def.id === 'doctor' || def.id === 'lecter' }).map(x=>x.userId), skipLabel: (def.nightOptional || def.id === 'doctor' || def.id === 'lecter') ? '⏭ امشب رد می‌کنم' : null };
+        }
+      } else if (g.status === 'day') {
+          const guns = g.gunnerGuns[String(userId)] ?? [];
+          if (guns.length > 0) availableAction = { type: 'gunner_shot', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive').map(x=>x.userId) };
+      }
+    }
+
+    // TURN BASED CHAT CALCULATION (40 SECONDS)
+    let currentSpeakerId = null;
+    let speakerEndsAt = null;
+    let speakerTimeLeft = 0;
+
+    if (g.status === 'day' && g.dayStartedAt) {
+       const alive = g.players.filter(x => x.status === 'alive');
+       if (alive.length > 0) {
+           const elapsed = now() - g.dayStartedAt;
+           const turnDuration = 40000;
+           const turnIndex = Math.floor(elapsed / turnDuration);
+           const speaker = alive[turnIndex % alive.length];
+           currentSpeakerId = speaker.userId;
+           speakerEndsAt = g.dayStartedAt + (turnIndex + 1) * turnDuration;
+           speakerTimeLeft = Math.max(0, Math.ceil((speakerEndsAt - now()) / 1000));
+       }
+    }
+
+    const sanitizedGame = {
+      chatId: g.chatId,
+      status: g.status,
+      phase: g.phase,
+      dayNumber: g.dayNumber,
+      nightNumber: g.nightNumber,
+      chatTitle: g.chatTitle,
+      phaseEndsAt: g.phaseEndsAt,
+      winner: g.winner,
+      accusedUserId: g.accusedUserId,
+      lobbyCode: g.lobbyCode,
+      votes: g.votes,
+      verdictVotes: g.verdictVotes,
+      inquiryVotes: g.inquiryVotes,
+      timeline: [],
+      currentSpeakerId,
+      speakerEndsAt,
+      speakerTimeLeft,
+      miniAppChat: g.miniAppChat || [],
+      players: g.players.map(x => ({
+          userId: x.userId,
+          displayName: x.displayName,
+          status: x.status,
+          isHost: x.userId === g.hostId,
+          role: g.status === 'finished' ? x.role : null,
+          independentRole: g.status === 'finished' ? x.independentRole : null,
+          deathReason: x.deathReason,
+          team: g.status === 'finished' ? x.team : null,
+      }))
+    };
+
+    return Response.json({
+      ok: true,
+      game: sanitizedGame,
+      you: p ? {
+          userId: p.userId, status: youStatus, role: p.role, independentRole: p.independentRole, team: p.team, roleDescription, availableAction,
+          natoChancesLeft: g.natoChancesLeft, paranoidAlertLeft: g.paranoidAlertLeft,
+          sniperShotsLeft: p.role === 'sniper' ? (g.sniperShotsLeft[String(userId)] ?? 0) : null,
+          gunnerNightsLeft: p.role === 'gunner' ? Math.max(0, 2 - g.gunnerNightsUsed) : null,
+      } : null
+    });
+  }
+
+  private async handleApiAction(userId: number, userName: string, body: any): Promise<Response> {
+    const { action, targetId, targetRole, guilty, choice, text } = body;
+    const g = this.game;
+    if (!g) return Response.json({ ok: false, error: "No game" });
+
+    // START GAME
+    if (action === "start_game") {
+        if (g.hostId !== userId) return Response.json({ ok: false, error: "شما میزبان نیستید" });
+        await this.cmdStartGame(userId, g.chatId);
+        return Response.json({ ok: true });
+    }
+
+    // CHAT SEND (40s turn-based logic)
+    if (action === "chat_send") {
+        if (g.status !== 'day' || !g.dayStartedAt) return Response.json({ ok: false, error: "چت غیرفعال است" });
+        // BUGFIX: reject empty/whitespace-only messages instead of pushing blank chat bubbles.
+        if (typeof text !== "string" || !text.trim()) return Response.json({ ok: false, error: "پیام خالی است" });
+        const alive = g.players.filter(x => x.status === 'alive');
+        const turnDuration = 40000;
+        const turnIndex = Math.floor((now() - g.dayStartedAt) / turnDuration);
+        const speaker = alive[turnIndex % alive.length];
+
+        if (!speaker || speaker.userId !== userId) {
+            return Response.json({ ok: false, error: "نوبت شما نیست" });
+        }
+
+        if (!g.miniAppChat) g.miniAppChat = [];
+        g.miniAppChat.push({ id: now(), senderId: userId, senderName: userName, text: text.trim().slice(0, 500), time: now(), isSystem: false });
+        await this.persist();
+        return Response.json({ ok: true });
+    }
+
+    let res = { alert: false, text: "" };
+
+    if (action === "vote_nominate") res = await this.applyNomination(userId, g.dayNumber, targetId ?? 0);
+    else if (action === "vote_verdict") res = await this.applyVerdict(userId, g.dayNumber, guilty);
+    else if (action === "vote_inquiry") res = await this.applyInquiryVote(userId, g.dayNumber, choice);
+    else if (action === "gunner_shot") res = await this.applyGunnerShot(userId, g.dayNumber, targetId ?? 0);
+    else if (action === "gunner_give_war") res = await this.applyGunnerGiveWar(userId, g.nightNumber, targetId ?? 0);
+    else if (action === "gunner_give_black") res = await this.applyGunnerGiveBlack(userId, g.nightNumber, targetId ?? 0);
+    else if (action === "nato_guess") {
+       if (targetRole) res = await this.applyNatoRoleGuess(userId, g.nightNumber, targetId, targetRole);
+       else res = await this.applyNightAction(userId, g.nightNumber, "nato_guess", 0);
+    }
+    else if (action === "bomber_explode") res = await this.applyBomberExplode(userId, g.nightNumber);
+    else res = await this.applyNightAction(userId, g.nightNumber, action as NightActionType, targetId ?? 0);
+
+    if (res.alert) return Response.json({ ok: false, error: res.text });
+    return Response.json({ ok: true });
   }
 
   private targetLabel(game: GameState, targetId: number, action: NightActionType, actor?: Player | null): string {
@@ -7126,11 +7132,6 @@ function inferChatId(update: TgUpdate): number | null {
 }
 
 
-// =============================================================================
-// EXPORTS
-// =============================================================================
-
-
 async function verifyInitData(initData: string | null, token: string) {
   if (!initData) return null;
   const q = new URLSearchParams(initData);
@@ -7139,53 +7140,56 @@ async function verifyInitData(initData: string | null, token: string) {
   q.delete("hash");
   const keys = [...q.keys()].sort();
   const dataCheckString = keys.map(k => `${k}=${q.get(k)}`).join("\n");
-  
+
   const encoder = new TextEncoder();
   const secretKey = await crypto.subtle.importKey("raw", encoder.encode("WebAppData"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const secretHash = await crypto.subtle.sign("HMAC", secretKey, encoder.encode(token));
   const finalKey = await crypto.subtle.importKey("raw", secretHash, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const signature = await crypto.subtle.sign("HMAC", finalKey, encoder.encode(dataCheckString));
   const hex = [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, '0')).join('');
-  
+
   if (hex !== hash) return null;
+  // BUGFIX: reject stale/replayed init data instead of trusting it forever —
+  // Telegram issues a fresh auth_date each time the mini app is (re)opened;
+  // anything older than 24h is almost certainly a leaked/replayed payload.
+  const authDate = Number(q.get("auth_date"));
+  if (!authDate || (Date.now() / 1000 - authDate) > 86400) return null;
   try { return JSON.parse(q.get("user") || "{}"); } catch { return null; }
 }
 
 async function handleMiniappApi(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const method = request.method;
-  
+
   let initData = request.headers.get("X-Telegram-Init-Data");
   const user = await verifyInitData(initData, env.BOT_TOKEN);
-  
-  // To allow testing locally if needed, mock user if no init data:
-  // const user = { id: 12345, first_name: "Test" };
-  
-  if (!user) return json({ ok: false, error: "Unauthorized" }, 401);
+
+  if (!user || !user.id) return json({ ok: false, error: "Unauthorized" }, 401);
 
   let body: any = {};
-  if (method === "POST") body = await request.clone().json().catch(()=>({}));
+  if (method === "POST") body = await request.clone().json().catch(() => ({}));
 
-  // Handle Create Lobby (Virtual Chat Room)
+  // Handle Create Lobby (Virtual Chat Room, not tied to a Telegram group)
   if (method === "POST" && body.action === "create_lobby") {
      const virtualChatId = -1000000000 - user.id; // Synthetic ID
      const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${virtualChatId}`));
      return stub.fetch(new Request(request.url, {
          method: "POST",
-         headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name },
+         headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name || "کاربر" },
          body: JSON.stringify({ api: true, action: "create_lobby" })
      }));
   }
-  
-  // Handle Join Lobby
+
+  // Handle Join Lobby (by the 5-digit lobby code)
   if (method === "POST" && body.action === "join_lobby") {
      const code = body.code;
-     const row = await env.DB.prepare(`SELECT chat_id FROM games WHERE json_extract(state_json, '$.lobbyCode') = ? AND status = 'lobby' ORDER BY created_at DESC LIMIT 1`).bind(code).first<{chat_id: number}>();
+     if (!code) return json({ ok: false, error: "کد لابی را وارد کنید" });
+     const row = await env.DB.prepare(`SELECT chat_id FROM games WHERE json_extract(state_json, '$.lobbyCode') = ? AND status = 'lobby' ORDER BY created_at DESC LIMIT 1`).bind(String(code)).first<{chat_id: number}>();
      if (!row) return json({ ok: false, error: "لابی یافت نشد یا پر شده است" });
      const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${row.chat_id}`));
      return stub.fetch(new Request(request.url, {
          method: "POST",
-         headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name },
+         headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name || "کاربر" },
          body: JSON.stringify({ api: true, action: "join_lobby", chatId: row.chat_id })
      }));
   }
@@ -7201,12 +7205,16 @@ async function handleMiniappApi(request: Request, env: Env): Promise<Response> {
   const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${chatId}`));
   const newRequest = new Request(request.url, {
     method: request.method,
-    headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name },
+    headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name || "کاربر" },
     body: request.method === "POST" ? await request.clone().text() : null
   });
 
   return stub.fetch(newRequest);
 }
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -7214,11 +7222,18 @@ export default {
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ ok: true, service: "telegram-mafia-bot", ts: Date.now() });
     }
-    if (request.method === "GET" && url.pathname === "/setup") return setup(url, env);
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/app")) {
-       return new Response(MINIAPP_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      return new Response(MINIAPP_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
-    if (url.pathname.startsWith("/api/miniapp/")) return handleMiniappApi(request, env);
+    if (url.pathname.startsWith("/api/miniapp/")) {
+      // BUGFIX: the mini-app API talks to D1/Durable Objects, so schema
+      // must exist before it's queried — the webhook path already did this,
+      // but the miniapp path was missing it, causing "no such table" on a
+      // cold worker whose /webhook hadn't fired yet.
+      await ensureSchema(env.DB);
+      return handleMiniappApi(request, env);
+    }
+    if (request.method === "GET" && url.pathname === "/setup") return setup(url, env);
     if (request.method === "POST" && url.pathname === "/webhook") {
       const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
       if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) return new Response("unauthorized", { status: 401 });

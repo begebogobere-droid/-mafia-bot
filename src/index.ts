@@ -470,7 +470,7 @@ inputLobbyCodeEl.addEventListener('input', (e) => {
 
 document.getElementById('btnJoinLobbySubmit').addEventListener('click', async () => {
   const code = toEnDigits(document.getElementById('inputLobbyCode').value.trim());
-  if (!/^\d{5}$/.test(code)) { toast('کد لابی باید ۵ رقم انگلیسی باشد'); return; }
+  if (!/^\\d{5}$/.test(code)) { toast('کد لابی باید ۵ رقم انگلیسی باشد'); return; }
   const res = await apiPostAction({ action: 'join_lobby', api: true, code: code });
   if (res.ok && res.chatId) {
     CHAT_ID = res.chatId;

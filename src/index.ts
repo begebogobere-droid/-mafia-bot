@@ -6,7 +6,7 @@ const MINIAPP_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>مافیا مینی‌اپ</title>
+<title>𝑴𝑨𝑭𝑰𝑨</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 /* =====================================================================
@@ -1452,6 +1452,11 @@ export interface GameState {
   lobbyCode: string | null;
   dayStartedAt: number | null;
   miniAppChat: Array<{id: number, senderId: number, senderName: string, text: string, time: number, isSystem: boolean}>;
+  // True only for lobbies created directly in the mini app (chatId is a synthetic
+  // negative number, not a real Telegram group). Group-only mechanics — admin checks,
+  // permission locking/unlocking, posting to "the group" — don't apply and must be
+  // skipped, since there is no real Telegram chat behind them to call the Bot API on.
+  isVirtual: boolean;
 }
 
 export interface RoleDef {
@@ -4327,7 +4332,7 @@ export class GameRoom extends DurableObject<Env> {
                sniperShotsLeft: {}, detectiveChecked: {}, godfatherRevealed: false, natoChancesLeft: 2, paranoidAlertLeft: 2, bomberMarkedTargets: [], invincibleShieldHits: {}, gunnerGuns: {},
                gunnerNightsUsed: 0, gunnerWarGunsGiven: 0, gunnerBlackGunsGiven: 0, independentRoleType: null, savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, botPinnedMessageIds: [], winner: null,
                botUsername: "mafia_bot", botId: 0, config: { ...DEFAULT_CONFIG }, createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
-               lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [],
+               lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [], isVirtual: true,
            };
            await this.persist(true);
            return Response.json({ ok: true, chatId: vChatId });
@@ -4816,7 +4821,7 @@ export class GameRoom extends DurableObject<Env> {
       savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, botPinnedMessageIds: [], winner: null,
       botUsername: me?.username ?? null, botId: me?.id ?? null, config: { ...DEFAULT_CONFIG },
       createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
-      lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [],
+      lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [], isVirtual: false,
     };
 
     // IMPORTANT: send the lobby announcement BEFORE committing anything to storage/D1.
@@ -4998,18 +5003,21 @@ export class GameRoom extends DurableObject<Env> {
 
   private async cmdStartGame(userId: number, chatId: number): Promise<void> {
     const game = this.game;
-    if (!game || game.chatId !== chatId) { if (chatId) await this.tg.sendMessage(chatId, fa.noGame); return; }
-    if (game.status !== "lobby") { await this.tg.sendMessage(game.chatId, fa.gameAlreadyRunning); return; }
-    if (!(await this.isHostOrAdmin(userId))) { await this.tg.sendMessage(game.chatId, fa.hostOnly); return; }
-    if (game.players.length < game.config.minPlayers) { await this.tg.sendMessage(game.chatId, fa.notEnough); return; }
-    if (game.players.length > game.config.maxPlayers) { await this.tg.sendMessage(game.chatId, fa.tooMany); return; }
-    const admin = await this.assertBotAdmin(game.chatId);
+    if (!game || game.chatId !== chatId) { if (chatId) await this.tg.sendMessage(chatId, fa.noGame).catch(() => {}); return; }
+    if (game.status !== "lobby") { await this.group(fa.gameAlreadyRunning); return; }
+    if (!(await this.isHostOrAdmin(userId))) { await this.group(fa.hostOnly); return; }
+    if (game.players.length < game.config.minPlayers) { await this.group(fa.notEnough); return; }
+    if (game.players.length > game.config.maxPlayers) { await this.group(fa.tooMany); return; }
+    // Mini-app-only lobbies have no real Telegram group behind them (chatId is
+    // synthetic) — admin rights, permission locking, and group posting are all
+    // group-chat concepts that simply don't apply, so skip them entirely instead
+    // of probing/attempting Bot API calls against a chat that doesn't exist.
+    const admin = game.isVirtual ? { ok: true as const } : await this.assertBotAdmin(game.chatId);
     if (!admin.ok) {
       // FIX #3: Give a more specific error so the user knows which admin rights
       // are missing. The original fa.needAdmin message already lists them, but
       // adding a hint about what to do speeds up debugging.
-      await this.tg.sendMessage(
-        game.chatId,
+      await this.group(
         `${admin.message}\n\n💡 ربات باید دسترسی‌های زیر را داشته باشد:\n` +
         `• محدود کردن اعضا (Restrict members)\n` +
         `• حذف پیام (Delete messages)\n` +
@@ -6455,7 +6463,7 @@ export class GameRoom extends DurableObject<Env> {
 
   private async snapshotPermissions(): Promise<void> {
     const game = this.game;
-    if (!game) return;
+    if (!game || game.isVirtual) return;
     const chat = await this.tg.callSafe<TgChat>("getChat", { chat_id: game.chatId });
     if (chat.ok && chat.result.permissions) game.savedDefaultPermissions = chat.result.permissions as ChatPermissions;
     else game.savedDefaultPermissions = { ...OPEN_PERMISSIONS };
@@ -6467,7 +6475,7 @@ export class GameRoom extends DurableObject<Env> {
 
   private async lockGroup(): Promise<void> {
     const game = this.game;
-    if (!game) return;
+    if (!game || game.isVirtual) return;
     await this.tg.callSafe("setChatPermissions", { chat_id: game.chatId, permissions: LOCKED_PERMISSIONS, use_independent_chat_permissions: true });
   }
 
@@ -6479,7 +6487,7 @@ export class GameRoom extends DurableObject<Env> {
   // out of sync with the game's intended permission state.
   private async unlockForDay(): Promise<void> {
     const game = this.game;
-    if (!game) return;
+    if (!game || game.isVirtual) return;
     await this.tg.callSafe("setChatPermissions", { chat_id: game.chatId, permissions: DAY_PERMISSIONS, use_independent_chat_permissions: true });
     const failedRestrictions: string[] = [];
     for (const p of game.players) {
@@ -6493,7 +6501,7 @@ export class GameRoom extends DurableObject<Env> {
 
   private async relockAllPlayers(): Promise<void> {
     const game = this.game;
-    if (!game) return;
+    if (!game || game.isVirtual) return;
     const failedRestrictions: string[] = [];
     for (const p of game.players) {
       if (p.originalMember?.isAdmin) continue;
@@ -6505,7 +6513,7 @@ export class GameRoom extends DurableObject<Env> {
 
   private async mutePlayer(userId: number): Promise<void> {
     const game = this.game;
-    if (!game) return;
+    if (!game || game.isVirtual) return;
     const p = findPlayer(game.players, userId);
     if (p?.originalMember?.isAdmin) { await this.group(fa.cannotMuteAdmin(p.displayName)); return; }
     const res = await this.tg.callSafe("restrictChatMember", { chat_id: game.chatId, user_id: userId, permissions: LOCKED_PERMISSIONS, use_independent_chat_permissions: true });
@@ -6514,7 +6522,7 @@ export class GameRoom extends DurableObject<Env> {
 
   private async restoreAllPermissions(): Promise<void> {
     const game = this.game;
-    if (!game) return;
+    if (!game || game.isVirtual) return;
     // FIX #3: Always fall back to a known-safe default (OPEN_PERMISSIONS) when
     // a player's pre-game snapshot is missing (e.g. the game state was
     // recovered from D1 after a Durable Object reset and per-player
@@ -6932,6 +6940,7 @@ export class GameRoom extends DurableObject<Env> {
       lobbyCode: null,
       dayStartedAt: null,
       miniAppChat: [],
+      isVirtual: false,
     };
 
     await this.persist();
@@ -7044,7 +7053,17 @@ export class GameRoom extends DurableObject<Env> {
     // START GAME
     if (action === "start_game") {
         if (g.hostId !== userId) return Response.json({ ok: false, error: "شما میزبان نیستید" });
+        if (g.status !== "lobby") return Response.json({ ok: false, error: "بازی قبلاً شروع شده است" });
+        if (g.players.length < g.config.minPlayers) return Response.json({ ok: false, error: `حداقل ${g.config.minPlayers} بازیکن لازم است` });
+        if (g.players.length > g.config.maxPlayers) return Response.json({ ok: false, error: `حداکثر ${g.config.maxPlayers} بازیکن مجاز است` });
         await this.cmdStartGame(userId, g.chatId);
+        // cmdStartGame is shared with the text-command flow and reports failures by
+        // posting to the group (or, for a virtual lobby, dropping them silently) rather
+        // than returning them — so the only reliable signal here is whether the game
+        // actually left the lobby phase.
+        if (this.game && this.game.status === "lobby") {
+          return Response.json({ ok: false, error: "شروع بازی ناموفق بود؛ همه بازیکنان باید ربات را استارت کرده باشند" });
+        }
         return Response.json({ ok: true });
     }
 

@@ -227,7 +227,7 @@ nav.bottomnav button.alert .dot{ display:block; }
        </div>
        
        <div class="lobby-box" id="joinLobbyForm" style="display:none; padding-top:0;">
-          <input type="text" id="inputLobbyCode" class="input-code" placeholder="کد ۵ رقمی" maxlength="5" inputmode="numeric">
+          <input type="text" dir="ltr" id="inputLobbyCode" class="input-code" placeholder="کد ۵ رقمی" maxlength="5" inputmode="numeric">
           <button class="btn gold" id="btnJoinLobbySubmit">ورود به بازی</button>
        </div>
     </section>
@@ -236,7 +236,8 @@ nav.bottomnav button.alert .dot{ display:block; }
     <section class="view" id="view-lobby-wait">
        <div class="lobby-box" style="padding-top:20px;">
           <div class="section-title" style="justify-content:center; font-size:14px;">کد لابی شما</div>
-          <div class="lobby-code-display" id="displayLobbyCode">-----</div>
+          <div class="lobby-code-display" dir="ltr" id="displayLobbyCode">-----</div>
+          <button class="btn ghost" id="btnCopyLobbyCode" style="margin:0 0 16px; padding:10px; font-size:13px;">📋 کپی کد لابی</button>
           <p style="color: var(--ink-dim); font-size:13px; background:var(--panel); padding:10px; border-radius:10px;">این کد را به دوستان خود بدهید تا وارد بازی شوند</p>
           
           <div class="lobby-players">
@@ -453,14 +454,39 @@ document.getElementById('btnShowJoin').addEventListener('click', () => {
   document.getElementById('inputLobbyCode').focus();
 });
 
+function toEnDigits(s){
+  return String(s ?? '').replace(/[۰-۹٠-٩]/g, d => {
+    const fa = '۰۱۲۳۴۵۶۷۸۹'.indexOf(d);
+    if (fa !== -1) return String(fa);
+    const ar = '٠١٢٣٤٥٦٧٨٩'.indexOf(d);
+    return ar !== -1 ? String(ar) : d;
+  });
+}
+
+const inputLobbyCodeEl = document.getElementById('inputLobbyCode');
+inputLobbyCodeEl.addEventListener('input', (e) => {
+  e.target.value = toEnDigits(e.target.value).replace(/[^0-9]/g, '').slice(0, 5);
+});
+
 document.getElementById('btnJoinLobbySubmit').addEventListener('click', async () => {
-  const code = document.getElementById('inputLobbyCode').value.trim();
-  if (!/^\d{5}\$/.test(code)) { toast('کد لابی باید ۵ رقم باشد'); return; }
+  const code = toEnDigits(document.getElementById('inputLobbyCode').value.trim());
+  if (!/^\d{5}$/.test(code)) { toast('کد لابی باید ۵ رقم انگلیسی باشد'); return; }
   const res = await apiPostAction({ action: 'join_lobby', api: true, code: code });
   if (res.ok && res.chatId) {
     CHAT_ID = res.chatId;
     window.history.replaceState(null, null, \`?chat_id=\${CHAT_ID}\`);
     startPolling();
+  }
+});
+
+document.getElementById('btnCopyLobbyCode').addEventListener('click', async () => {
+  const code = document.getElementById('displayLobbyCode').textContent.trim();
+  if (!code || code === '-----') return;
+  try {
+    await navigator.clipboard.writeText(code);
+    toast('کد لابی کپی شد');
+  } catch (e) {
+    toast('کپی انجام نشد');
   }
 });
 
@@ -498,7 +524,7 @@ function render() {
     
     if (state.activeTab === 'lobby-init') switchTab('lobby-wait');
     
-    document.getElementById('displayLobbyCode').textContent = toFa(g.lobbyCode || '-----');
+    document.getElementById('displayLobbyCode').textContent = g.lobbyCode || '-----';
     document.getElementById('lobbyPlayerCount').textContent = toFa((g.players||[]).length);
     document.getElementById('lobbyPlayersList').innerHTML = (g.players||[]).map(p => \`
       <div class="player-row">

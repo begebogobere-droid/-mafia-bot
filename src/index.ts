@@ -4085,6 +4085,26 @@ export async function findActiveGameForUser(db: D1Database, userId: number): Pro
   ).bind(userId).first()) ?? null;
 }
 
+// Same as findActiveGameForUser but returns EVERY unfinished game row for
+// this user, not just the most recent one. Needed for the DM force-leave
+// command: because of the old create_lobby leak (fixed above, but the mess
+// it already made in D1 predates the fix), a single user could have several
+// orphaned "active" rows across different chats at once. Picking only the
+// newest one (findActiveGameForUser) and closing that would leave the older
+// rows behind, still blocking the user forever.
+export async function findAllActiveGamesForUser(db: D1Database, userId: number): Promise<{ game_id: string; chat_id: number; status: string }[]> {
+  return (
+    (await db.prepare(
+      `SELECT g.id as game_id, g.chat_id, g.status
+       FROM game_players p
+       JOIN games g ON g.id = p.game_id
+       WHERE p.user_id = ?
+         AND g.status NOT IN ('finished', 'cancelled', 'idle')
+       ORDER BY g.updated_at DESC`,
+    ).bind(userId).all<{ game_id: string; chat_id: number; status: string }>()).results ?? []
+  );
+}
+
 export async function findActiveGameForChat(db: D1Database, chatId: number): Promise<{ id: string; status: string } | null> {
   return (await db.prepare(
     `SELECT id, status FROM games
@@ -4541,16 +4561,6 @@ export class GameRoom extends DurableObject<Env> {
       if (parsed?.cmd === "start") { await this.onPrivateStart(msg, parsed.args); return; }
       if (parsed?.cmd === "help") { await this.tg.sendMessage(from.id, fa.helpPrivate); return; }
       if (parsed?.cmd === "myrole") { await this.sendMyRole(from.id); return; }
-      // NEW: self-service escape hatch, reachable entirely from the bot's DM —
-      // no group command execution needed. Triggered either by /leave or by
-      // typing the plain word "لفت" (or a couple of obvious synonyms). Finds
-      // whichever lobby this user is currently stuck/registered in (the DO
-      // routing in routePrivate() already resolves this via
-      // findActiveGameForUser before we even get here) and, if it's still in
-      // the lobby phase, removes them / closes the whole lobby — the exact
-      // same effect as the one-off D1 cleanup query, but self-service and
-      // without touching Cloudflare directly.
-      if (parsed?.cmd === "leave" || isLeaveKeyword(text)) { await this.privateLeave(from.id); return; }
       if (parsed) { await this.tg.sendMessage(from.id, fa.mafiaChatCommandsIgnored); return; }
       await this.handleMafiaNightChat(msg);
       return;
@@ -5055,22 +5065,22 @@ export class GameRoom extends DurableObject<Env> {
     await this.leavePlayer(msg.from.id, false);
   }
 
-  // DM-only escape hatch (see onMessage's private-chat branch). Deliberately
-  // narrower than cmdLeave/leavePlayer: only acts while the game is still in
-  // the lobby phase — this is a way out of a stuck/forgotten lobby, not a way
-  // to bail out of (or end, for everyone else) a game already in progress.
-  private async privateLeave(userId: number): Promise<void> {
+  // Force-closes THIS chat's game for the given user no matter what state
+  // it's in (lobby or fully mid-game) — called via direct RPC from
+  // forceCloseAllGamesForUser(), the module-level DM force-leave handler.
+  // Deliberately unconditional (unlike leavePlayer/cmdLeave, which refuse to
+  // touch anything once the game has left the lobby phase): this exists
+  // specifically to let a user nuke a game they're stuck in, real players or
+  // not, since the whole point is "get me out no matter what".
+  async forceCloseForUser(chatId: number, userId: number): Promise<boolean> {
+    if (!this.game || this.game.chatId !== chatId) {
+      await this.recoverFromD1(chatId);
+    }
     const game = this.game;
-    if (!game || !findPlayer(game.players, userId)) {
-      await this.pm(userId, "شما الان توی هیچ لابی‌ای نیستید.");
-      return;
-    }
-    if (game.status !== "lobby") {
-      await this.pm(userId, "بازی شما شروع شده؛ از پیوی نمی‌توان لابی را بست. باید داخل بازی /cancel بزنید یا از ادمین گروه بخواهید /reset کند.");
-      return;
-    }
-    await this.leavePlayer(userId, true);
-    await this.pm(userId, "✅ شما از لابی خارج شدید. اگر میزبان بودید، کل لابی بسته شد.");
+    if (!game || game.chatId !== chatId) return false;
+    if (game.hostId !== userId && !findPlayer(game.players, userId)) return false;
+    await this.cancelInternal("این بازی از طریق پیوی توسط یکی از بازیکنان به‌صورت اجباری بسته شد.");
+    return true;
   }
 
   private async leavePlayer(userId: number, fromCallback: boolean): Promise<void> {
@@ -7411,6 +7421,42 @@ async function callRoom(env: Env, chatId: number, update: TgUpdate): Promise<voi
   await (stub as DurableObjectStub<GameRoom>).handleUpdate(update);
 }
 
+// DM force-leave: closes EVERY unfinished game this user is registered in,
+// across every chat (real group or virtual mini-app room), regardless of
+// phase — lobby, night, day, doesn't matter. Not scoped to "whichever game
+// routing happens to pick" the way findActiveGameForUser (LIMIT 1) is, since
+// stale/orphaned rows can pile up across multiple chats for the same user.
+//
+// IMPORTANT: also handles multiple orphaned rows under the SAME chat_id —
+// this happened for real before the create_lobby leak was fixed (every
+// retry inserted a new games row under the same virtual chat without
+// closing the old one). Calling the room's forceCloseForUser() only touches
+// whichever single game is currently loaded in that Durable Object's memory
+// (one game_id) — it would leave older orphaned rows for that same chat
+// untouched in D1, still satisfying "not finished/cancelled/idle" and still
+// blocking the user forever. So after the DO-level cleanup, we ALSO run a
+// direct D1 UPDATE (cancelActiveGamesForChat) per chat, which closes every
+// non-finished row for that chat_id in one shot — a DB-level guarantee that
+// doesn't depend on Durable Object memory state at all.
+async function forceCloseAllGamesForUser(env: Env, userId: number): Promise<number> {
+  const rows = await findAllActiveGamesForUser(env.DB, userId);
+  const chatIds = [...new Set(rows.map((r) => r.chat_id))];
+  for (const chatId of chatIds) {
+    try {
+      const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${chatId}`));
+      await (stub as DurableObjectStub<GameRoom>).forceCloseForUser(chatId, userId);
+    } catch (err) {
+      console.error("forceCloseAllGamesForUser: DO cleanup failed for chat", chatId, err);
+    }
+    // Belt-and-suspenders DB-level guarantee — runs even if the DO call above
+    // threw, and catches any older orphaned rows the DO call alone can't reach.
+    await cancelActiveGamesForChat(env.DB, chatId).catch((err) => {
+      console.error("forceCloseAllGamesForUser: D1 cleanup failed for chat", chatId, err);
+    });
+  }
+  return chatIds.length;
+}
+
 async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   const msg = update.message;
   const cq = update.callback_query;
@@ -7421,6 +7467,22 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   await markStarted(env.DB, from.id);
   const text = msg?.text ?? "";
   const parsed = text ? parseCommand(text) : null;
+
+  // NEW: DM-only "force leave" — handled here, BEFORE routing to any single
+  // game, so it isn't limited to whichever one game findActiveGameForUser's
+  // LIMIT 1 happens to pick. Closes EVERY unfinished game this user is in
+  // (any chat, any phase — lobby or mid-game) unconditionally.
+  if (parsed?.cmd === "leave" || (text && isLeaveKeyword(text))) {
+    const closed = await forceCloseAllGamesForUser(env, from.id);
+    await tg.sendMessage(
+      from.id,
+      closed > 0
+        ? `✅ ${closed} بازی/لابی که در آن‌ها بودید بسته شد.`
+        : "شما الان توی هیچ بازی یا لابی‌ای نیستید.",
+    );
+    return;
+  }
+
   let targetChat: number | null = null;
   if (parsed?.cmd === "start" && parsed.args.startsWith("join_")) { const n = Number(parsed.args.slice(5)); if (Number.isFinite(n)) targetChat = n; }
   if (targetChat === null) { const active = await findActiveGameForUser(env.DB, from.id); if (active) targetChat = active.chat_id; }

@@ -2964,12 +2964,14 @@ export function resolveNight(game: GameState): NightResolution {
     sniperTarget = a.targetId;
     const target = findPlayer(game.players, a.targetId);
     if (!target || target.status !== "alive") continue;
-    if (protectedIds.has(target.userId)) continue;
-    if (paranoidAlerts.has(actor.userId)) {
-      // Attacking paranoid - attacker dies
+    if (paranoidAlerts.has(target.userId)) {
+      // Target is an alert paranoid: paranoid is fully immune this night,
+      // no matter the target's team — the attacker (sniper) dies instead.
+      // Checked BEFORE protectedIds/team logic so nothing can bypass it.
       markDead(actor.userId, "paranoid_alert");
       continue;
     }
+    if (protectedIds.has(target.userId)) continue;
     if (target.team === "mafia") {
       // Correct target: only the mafia member dies.
       markDead(target.userId, "sniper");
@@ -2988,11 +2990,14 @@ export function resolveNight(game: GameState): NightResolution {
     if (a.type !== "johnny_kill" || !a.targetId || a.targetId <= 0) continue;
     const johnny = findPlayer(game.players, a.actorId);
     if (!johnny || johnny.status !== "alive" || johnny.independentRole !== "johnny") continue;
-    if (protectedIds.has(a.targetId)) continue;
-    if (paranoidAlerts.has(a.actorId)) {
+    if (paranoidAlerts.has(a.targetId)) {
+      // Target is an alert paranoid: paranoid is fully immune this night —
+      // Johnny (the attacker) dies instead. Checked before protectedIds so
+      // nothing can bypass it.
       markDead(a.actorId, "paranoid_alert");
       continue;
     }
+    if (protectedIds.has(a.targetId)) continue;
     markDead(a.targetId, "johnny");
   }
 
@@ -3027,10 +3032,24 @@ export function resolveNight(game: GameState): NightResolution {
     return bomber?.status === "alive" && bomber.independentRole === "bomber";
   });
   if (bomberExploded) {
+    const bomberAction = active.find((a) => {
+      if (a.type !== "bomber_explode") return false;
+      const bomber = findPlayer(game.players, a.actorId);
+      return bomber?.status === "alive" && bomber.independentRole === "bomber";
+    });
     for (const targetId of game.bomberMarkedTargets) {
       if (dead.has(targetId)) continue;
       const target = findPlayer(game.players, targetId);
       if (!target || target.status !== "alive") continue;
+      if (paranoidAlerts.has(targetId)) {
+        // Target is an alert paranoid: paranoid is fully immune this night —
+        // the bomber (attacker) dies instead, this target is spared. Other
+        // marked targets in the same explosion are unaffected.
+        if (bomberAction && !dead.has(bomberAction.actorId)) {
+          markDead(bomberAction.actorId, "paranoid_alert");
+        }
+        continue;
+      }
       markDead(targetId, "bomber");
     }
   }

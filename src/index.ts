@@ -1260,7 +1260,8 @@ export type DeathReason =
   | "left"
   | "host"
   | "joker"
-  | "admin_kill";
+  | "admin_kill"
+  | "role_leak";
 
 export type NightActionType =
   | "mafia_kill"
@@ -1452,6 +1453,11 @@ export interface GameState {
   lobbyCode: string | null;
   dayStartedAt: number | null;
   miniAppChat: Array<{id: number, senderId: number, senderName: string, text: string, time: number, isSystem: boolean}>;
+  // Anti role-leak system: per-user warning count for THIS game only (keyed
+  // by userId as a string, since GameState is persisted as JSON). Reset to
+  // empty for every new game — never shared across games. See
+  // handleGroupTextForRoleLeak / eliminateForRoleLeak.
+  roleLeakWarnings: Record<string, number>;
   // True only for lobbies created directly in the mini app (chatId is a synthetic
   // negative number, not a real Telegram group). Group-only mechanics — admin checks,
   // permission locking/unlocking, posting to "the group" — don't apply and must be
@@ -1540,6 +1546,9 @@ export interface Env {
   GAME_ROOM: DurableObjectNamespace;
   BOT_TOKEN: string;
   WEBHOOK_SECRET: string;
+  // Optional: set via `wrangler secret put DEEPSEEK_API_KEY` to override the
+  // hardcoded fallback key below without redeploying code.
+  DEEPSEEK_API_KEY?: string;
 }
 
 
@@ -1940,6 +1949,13 @@ export class Telegram {
 
   unpinChatMessage(chatId: number, messageId?: number) {
     return this.call("unpinChatMessage", {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+  }
+
+  deleteMessage(chatId: number, messageId: number) {
+    return this.call("deleteMessage", {
       chat_id: chatId,
       message_id: messageId,
     });
@@ -3570,6 +3586,19 @@ export const fa = {
   reasonLeft: "ترک گروه",
   reasonJoker: "حذف جوکر (برد)",
   reasonAdminKill: "حذف توسط مدیریت",
+  reasonRoleLeak: "نقض قوانین بازی",
+
+  roleLeakWarned(count: number, limit: number): string {
+    return `⚠️ پیام شما در گروه به دلیل احتمال لو دادن نقش/اطلاعات بازی حذف شد.\nاخطار ${count} از ${limit}.\nدر صورت تکرار، از بازی حذف خواهید شد.`;
+  },
+
+  roleLeakEliminated(limit: number): string {
+    return `🚫 به دلیل دریافت ${limit} اخطار برای لو دادن نقش، از بازی حذف شدید.`;
+  },
+
+  roleLeakGroupNotice(name: string, userId: number): string {
+    return `🚫 ${mention(userId, name)} به دلیل نقض قوانین بازی از بازی حذف شد.`;
+  },
 
   gunnerReceivedGun: "🔫 شما یک تفنگ دریافت کردید.",
 
@@ -4004,6 +4033,144 @@ export async function addKillAdmin(db: D1Database, userId: number, addedBy: numb
 }
 
 // =============================================================================
+// ANTI ROLE-LEAK SYSTEM
+//
+// Two-stage pipeline for group text messages:
+//   1) Cheap local keyword filter (this array) — pure trigger, decides
+//      nothing on its own. No match -> message is ignored, no API call.
+//   2) On a match, the message is sent to DeepSeek for real judgement.
+//      See checkRoleLeakWithAI / handleGroupTextForRoleLeak in GameRoom.
+//
+// Edit ROLE_LEAK_TRIGGER_WORDS freely; matching is case-insensitive
+// substring matching over the raw message text.
+// =============================================================================
+
+export const ROLE_LEAK_WARNING_LIMIT = 3;
+export const ROLE_LEAK_CONFIDENCE_THRESHOLD = 0.6;
+export const ROLE_LEAK_AI_TIMEOUT_MS = 4000;
+
+// Hardcoded per user's request for convenience. Prefer setting this via
+// `wrangler secret put DEEPSEEK_API_KEY` instead — if env.DEEPSEEK_API_KEY
+// is set (as a secret), it always takes priority over this fallback.
+const DEEPSEEK_API_KEY_FALLBACK = "sk-36be31427d1f434db826ddd221f45289";
+
+export const ROLE_LEAK_TRIGGER_WORDS: string[] = [
+  // نام نقش‌ها (فارسی)
+  "دکتر", "پزشک", "کارگاه", "کارآگاه", "جاسوس", "اسنایپر", "تک‌تیرانداز", "تک تیرانداز",
+  "پارانوئید", "پارانویید", "اسکورت", "مافیا", "گادفادر", "پدرخوانده", "جانی",
+  "بمب‌گذار", "بمب گذار", "بمبی", "نتو", "تفنگدار", "گانر", "مستقل",
+  // نام نقش‌ها (انگلیسی)
+  "doctor", "sniper", "godfather", "escort", "gunner", "bomber",
+  // فعل/عبارت‌های اکشن شب
+  "سیو کردم", "نجات دادم", "شب زدم", "شب رفتم سراغ", "هدف گرفتم", "شلیک کردم",
+  "زدمش", "کشتمش", "چک کردم", "تحقیق کردم", "شناسایی کردم", "انفجار دادم",
+  "علامت زدم", "بلاک کردم", "هوشیار شدم", "هوشیار بودم", "حدس زدم", "گارد دادم",
+  "محافظت کردم", "اسلحه دادم",
+  // اعتراف مستقیم
+  "من نقشم", "نقش من", "من هستم", "من بودم", "دیشب من", "شب گذشته من", "امشب من",
+  // کلمات عمومی مشکوک
+  "اطلاعات دارم", "فهمیدم کیه", "مطمئنم چون", "دیدم که", "تاییدشده", "صد در صد",
+  "از منبع مطمئن", "شب دیدمش",
+  // اشاره غیرمستقیم به نتیجه اکشن
+  "پیام گرفتم", "به من گفتن", "نتیجه گرفتم", "جواب اومد", "تاییدیه گرفتم",
+  // اشاره به تیم مافیا
+  "هم‌تیمی", "هم‌تیمیم", "تیممون", "دوستم توی بازی", "رفقای شب",
+  // واکنش‌های هیجانی بعد از اطلاعات
+  "وای فهمیدم", "وای دیدم", "باورت نمیشه کی", "شوکه شدم از", "الان فهمیدم کی",
+  // اشاره به دفاع در برابر حمله
+  "جون سالم به در بردم", "نجات پیدا کردم", "حمله بهم شد ولی", "امشب هدف بودم ولی",
+  // اشاره به محدودیت استفاده
+  "دیگه ندارم", "بار آخرم بود", "تمومه ظرفیتم", "فقط یه بار دیگه دارم",
+];
+
+export function containsRoleLeakTrigger(text: string): boolean {
+  const lower = text.toLowerCase();
+  return ROLE_LEAK_TRIGGER_WORDS.some((word) => lower.includes(word.toLowerCase()));
+}
+
+// Names of only the roles actually in play THIS game (from assignRoles),
+// not every possible role — used to scope the DeepSeek system prompt.
+export function activeRoleNamesForGame(game: GameState): string[] {
+  const names = new Set<string>();
+  for (const p of game.players) {
+    if (p.role) names.add(ROLES[p.role].name);
+    if (p.independentRole) names.add(INDEPENDENT_ROLES[p.independentRole].name);
+  }
+  return [...names];
+}
+
+export interface RoleLeakVerdict {
+  leak: boolean;
+  confidence: number;
+  reason: string;
+}
+
+// Calls DeepSeek to judge whether `text` leaks a role/night-action. Returns
+// null on ANY failure (timeout, network error, bad/unparseable response) so
+// the caller can fail open — a broken API must never block or crash the game.
+export async function checkRoleLeakWithAI(
+  env: Env,
+  text: string,
+  activeRoleNames: string[],
+): Promise<RoleLeakVerdict | null> {
+  const apiKey = env.DEEPSEEK_API_KEY || DEEPSEEK_API_KEY_FALLBACK;
+  if (!apiKey) return null;
+
+  const systemPrompt =
+    "تو یه ناظر بازی مافیا هستی. وظیفه‌ت اینه که بررسی کنی آیا یک پیام توی چت گروه، نقش بازی یکی از بازیکن‌ها رو مستقیم یا غیرمستقیم لو می‌ده یا نه.\n" +
+    `نقش‌های فعال در این بازی: ${activeRoleNames.length ? activeRoleNames.join("، ") : "نامشخص"}\n` +
+    "مهم: تو نمی‌دونی کدوم بازیکن چه نقشی داره و نباید حدس بزنی یا نامی از بازیکن خاص در جواب بیاری. فقط باید تشخیص بدی خودِ متن پیام چیزی درباره نقش/اکشن شبانه گوینده یا شخص دیگه فاش می‌کنه یا نه.\n" +
+    "مواردی که لو دادن حساب می‌شه: اعتراف مستقیم به نقش، اشاره به اکشن شب انجام‌شده، اشاره به نتیجه قابلیت نقش، اشاره به محدودیت استفاده نقش، اشاره به هم‌تیمی بودن در تیم مافیا.\n" +
+    "مواردی که لو دادن حساب نمی‌شه: حدس و گمان عمومی، استدلال منطقی بر اساس رفتار بیرونی بازی، بحث کلی درباره قوانین.\n" +
+    'فقط این JSON رو برگردون، بدون هیچ متن اضافه: {"leak": true/false, "confidence": 0 تا 1, "reason": "دلیل کوتاه فارسی"}';
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ROLE_LEAK_AI_TIMEOUT_MS);
+
+  try {
+    const res = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        temperature: 0,
+        max_tokens: 200,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: text },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) return null;
+
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const raw = data.choices?.[0]?.message?.content;
+    if (!raw) return null;
+
+    const parsed = JSON.parse(raw) as Partial<RoleLeakVerdict>;
+    if (typeof parsed.leak !== "boolean" || typeof parsed.confidence !== "number") return null;
+
+    return {
+      leak: parsed.leak,
+      confidence: parsed.confidence,
+      reason: typeof parsed.reason === "string" ? parsed.reason : "",
+    };
+  } catch (err) {
+    // Timeout (AbortError), network failure, or JSON parse error — fail open.
+    console.error("checkRoleLeakWithAI failed, leaving message untouched", err);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// =============================================================================
 // DATABASE FUNCTIONS
 // =============================================================================
 
@@ -4420,6 +4587,7 @@ export class GameRoom extends DurableObject<Env> {
                gunnerNightsUsed: 0, gunnerWarGunsGiven: 0, gunnerBlackGunsGiven: 0, independentRoleType: null, savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, botPinnedMessageIds: [], winner: null,
                botUsername: "mafia_bot", botId: 0, config: { ...DEFAULT_CONFIG }, createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
                lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [], isVirtual: true,
+               roleLeakWarnings: {},
            };
            await this.persist(true);
            await this.scheduleAlarm(this.game.phaseEndsAt ?? ts + DEFAULT_CONFIG.lobbySeconds * 1000);
@@ -4587,7 +4755,12 @@ export class GameRoom extends DurableObject<Env> {
 
     if (msg.chat.type !== "supergroup" && msg.chat.type !== "group") return;
     const parsed = parseCommand(text);
-    if (!parsed) return;
+    if (!parsed) {
+      // Plain (non-command) group text — run it through the anti role-leak
+      // pipeline before dropping it, same as before.
+      await this.handleGroupTextForRoleLeak(msg);
+      return;
+    }
 
     switch (parsed.cmd) {
       case "new": case "mafia": case "newgame": await this.cmdNew(msg); break;
@@ -4919,6 +5092,7 @@ export class GameRoom extends DurableObject<Env> {
       botUsername: me?.username ?? null, botId: me?.id ?? null, config: { ...DEFAULT_CONFIG },
       createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
       lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [], isVirtual: false,
+      roleLeakWarnings: {},
     };
 
     // IMPORTANT: send the lobby announcement BEFORE committing anything to storage/D1.
@@ -6489,6 +6663,77 @@ export class GameRoom extends DurableObject<Env> {
     if (winner) await this.finish(winner);
   }
 
+  // Anti role-leak pipeline, run on every plain (non-command) group message.
+  // Stage 1 (local keyword filter) happens first and is free — only a match
+  // triggers the DeepSeek call. See ROLE_LEAK_TRIGGER_WORDS / checkRoleLeakWithAI.
+  private async handleGroupTextForRoleLeak(msg: TgMessage): Promise<void> {
+    const from = msg.from;
+    const text = msg.text ?? "";
+    if (!from || !text) return;
+
+    const game = this.game;
+    if (!game || !isActiveStatus(game.status)) return;
+
+    const player = findPlayer(game.players, from.id);
+    if (!player || player.status !== "alive" || !player.role) return; // not a live player in this game — nothing to check.
+
+    if (!containsRoleLeakTrigger(text)) return; // stage 1 filter: no trigger word, no API call.
+
+    const verdict = await checkRoleLeakWithAI(this.env, text, activeRoleNamesForGame(game));
+    // Fail open on timeout/error/low confidence: the message is left untouched
+    // and nothing else happens, so a broken API can never block the game.
+    if (!verdict || !verdict.leak || verdict.confidence < ROLE_LEAK_CONFIDENCE_THRESHOLD) return;
+
+    const delRes = await this.tg.callSafe("deleteMessage", { chat_id: game.chatId, message_id: msg.message_id });
+    if (!delRes.ok) console.error("role-leak deleteMessage failed", delRes.error.description);
+
+    const key = String(from.id);
+    const count = (game.roleLeakWarnings[key] ?? 0) + 1;
+    game.roleLeakWarnings[key] = count;
+    await this.persist(true);
+
+    // Internal-only diagnostic log (raw AI verdict + message text). Never
+    // surfaced in the group or any user-facing output.
+    console.log("role-leak detected", {
+      chatId: game.chatId, userId: from.id, warnCount: count,
+      confidence: verdict.confidence, aiReason: verdict.reason, text,
+    });
+
+    await this.pm(from.id, fa.roleLeakWarned(count, ROLE_LEAK_WARNING_LIMIT));
+
+    if (count >= ROLE_LEAK_WARNING_LIMIT) {
+      await this.eliminateForRoleLeak(player.userId);
+    }
+  }
+
+  // Removes a player immediately for accumulating ROLE_LEAK_WARNING_LIMIT
+  // role-leak warnings. Deliberately mirrors cmdKill's elimination exactly
+  // (same applyDeaths/notifyLecterSuccession/mutePlayer path) so this is an
+  // unconditional admin-style removal — NOT a role action — and is never
+  // affected by protective roles like Doctor or Paranoid.
+  private async eliminateForRoleLeak(userId: number): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    const player = findPlayer(game.players, userId);
+    if (!player || player.status !== "alive" || !player.role) return;
+
+    game.players = applyDeaths(
+      game.players,
+      [{ userId: player.userId, reason: "role_leak", revealedRole: player.role, revealedIndependentRole: player.independentRole }],
+      game.phase,
+      game.phase === "night" ? game.nightNumber : game.dayNumber,
+    );
+    await this.notifyLecterSuccession([{ userId: player.userId, reason: "role_leak", revealedRole: player.role }]);
+    await this.mutePlayer(player.userId);
+    await this.pm(player.userId, fa.roleLeakEliminated(ROLE_LEAK_WARNING_LIMIT));
+    await this.persist(true);
+    // Group only learns "removed for a rules violation" — never the internal
+    // reason, filtered words, or the message content that triggered it.
+    await this.group(fa.roleLeakGroupNotice(player.displayName, player.userId));
+    const winner = checkWinner(game.players);
+    if (winner) await this.finish(winner);
+  }
+
   private async cmdAddKill(msg: TgMessage): Promise<void> {
     const from = msg.from;
     if (!from) return;
@@ -6878,6 +7123,8 @@ export class GameRoom extends DurableObject<Env> {
         const snapshot = JSON.parse(gameRow.state_json) as GameState;
         if (snapshot && typeof snapshot === "object" && snapshot.id === gameRow.id) {
           this.game = snapshot;
+          // Safety default for games saved before roleLeakWarnings existed.
+          if (!this.game.roleLeakWarnings) this.game.roleLeakWarnings = {};
           await this.persist();
           if (isActiveStatus(this.game.status)) await this.ensureAlarm();
           return;
@@ -7056,6 +7303,7 @@ export class GameRoom extends DurableObject<Env> {
       dayStartedAt: null,
       miniAppChat: [],
       isVirtual: false,
+      roleLeakWarnings: {}, // not persisted per-column to D1; unavoidable gap on cold recovery
     };
 
     await this.persist();

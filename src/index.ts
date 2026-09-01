@@ -6675,7 +6675,7 @@ export class GameRoom extends DurableObject<Env> {
     if (!game || !isActiveStatus(game.status)) return;
 
     const player = findPlayer(game.players, from.id);
-    if (!player || player.status !== "alive" || !player.role) return; // not a live player in this game — nothing to check.
+    if (!player || player.status !== "alive" || (!player.role && !player.independentRole)) return; // not a live player in this game — nothing to check.
 
     if (!containsRoleLeakTrigger(text)) return; // stage 1 filter: no trigger word, no API call.
 
@@ -6715,7 +6715,7 @@ export class GameRoom extends DurableObject<Env> {
     const game = this.game;
     if (!game) return;
     const player = findPlayer(game.players, userId);
-    if (!player || player.status !== "alive" || !player.role) return;
+    if (!player || player.status !== "alive" || (!player.role && !player.independentRole)) return;
 
     game.players = applyDeaths(
       game.players,

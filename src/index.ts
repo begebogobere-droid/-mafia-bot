@@ -1546,9 +1546,9 @@ export interface Env {
   GAME_ROOM: DurableObjectNamespace;
   BOT_TOKEN: string;
   WEBHOOK_SECRET: string;
-  // Optional: set via `wrangler secret put DEEPSEEK_API_KEY` to override the
+  // Optional: set via `wrangler secret put OPENAI_API_KEY` to override the
   // hardcoded fallback key below without redeploying code.
-  DEEPSEEK_API_KEY?: string;
+  OPENAI_API_KEY?: string;
 }
 
 
@@ -4038,7 +4038,7 @@ export async function addKillAdmin(db: D1Database, userId: number, addedBy: numb
 // Two-stage pipeline for group text messages:
 //   1) Cheap local keyword filter (this array) — pure trigger, decides
 //      nothing on its own. No match -> message is ignored, no API call.
-//   2) On a match, the message is sent to DeepSeek for real judgement.
+//   2) On a match, the message is sent to OpenAI for real judgement.
 //      See checkRoleLeakWithAI / handleGroupTextForRoleLeak in GameRoom.
 //
 // Edit ROLE_LEAK_TRIGGER_WORDS freely; matching is case-insensitive
@@ -4050,9 +4050,9 @@ export const ROLE_LEAK_CONFIDENCE_THRESHOLD = 0.6;
 export const ROLE_LEAK_AI_TIMEOUT_MS = 4000;
 
 // Hardcoded per user's request for convenience. Prefer setting this via
-// `wrangler secret put DEEPSEEK_API_KEY` instead — if env.DEEPSEEK_API_KEY
+// `wrangler secret put OPENAI_API_KEY` instead — if env.OPENAI_API_KEY
 // is set (as a secret), it always takes priority over this fallback.
-const DEEPSEEK_API_KEY_FALLBACK = "sk-36be31427d1f434db826ddd221f45289";
+const OPENAI_API_KEY_FALLBACK = "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";
 
 export const ROLE_LEAK_TRIGGER_WORDS: string[] = [
   // نام نقش‌ها (فارسی)
@@ -4089,7 +4089,7 @@ export function containsRoleLeakTrigger(text: string): boolean {
 }
 
 // Names of only the roles actually in play THIS game (from assignRoles),
-// not every possible role — used to scope the DeepSeek system prompt.
+// not every possible role — used to scope the OpenAI system prompt.
 export function activeRoleNamesForGame(game: GameState): string[] {
   const names = new Set<string>();
   for (const p of game.players) {
@@ -4105,7 +4105,7 @@ export interface RoleLeakVerdict {
   reason: string;
 }
 
-// Calls DeepSeek to judge whether `text` leaks a role/night-action. Returns
+// Calls OpenAI to judge whether `text` leaks a role/night-action. Returns
 // null on ANY failure (timeout, network error, bad/unparseable response) so
 // the caller can fail open — a broken API must never block or crash the game.
 export async function checkRoleLeakWithAI(
@@ -4113,7 +4113,7 @@ export async function checkRoleLeakWithAI(
   text: string,
   activeRoleNames: string[],
 ): Promise<RoleLeakVerdict | null> {
-  const apiKey = env.DEEPSEEK_API_KEY || DEEPSEEK_API_KEY_FALLBACK;
+  const apiKey = env.OPENAI_API_KEY || OPENAI_API_KEY_FALLBACK;
   if (!apiKey) return null;
 
   const systemPrompt =
@@ -4128,14 +4128,14 @@ export async function checkRoleLeakWithAI(
   const timer = setTimeout(() => controller.abort(), ROLE_LEAK_AI_TIMEOUT_MS);
 
   try {
-    const res = await fetch("https://api.deepseek.com/chat/completions", {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "deepseek-chat",
+        model: "gpt-4o-mini",
         temperature: 0,
         max_tokens: 200,
         response_format: { type: "json_object" },
@@ -4147,14 +4147,24 @@ export async function checkRoleLeakWithAI(
       signal: controller.signal,
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      console.error("checkRoleLeakWithAI: OpenAI returned non-OK status", res.status, errBody.slice(0, 500));
+      return null;
+    }
 
     const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
     const raw = data.choices?.[0]?.message?.content;
-    if (!raw) return null;
+    if (!raw) {
+      console.error("checkRoleLeakWithAI: no content in OpenAI response", JSON.stringify(data).slice(0, 500));
+      return null;
+    }
 
     const parsed = JSON.parse(raw) as Partial<RoleLeakVerdict>;
-    if (typeof parsed.leak !== "boolean" || typeof parsed.confidence !== "number") return null;
+    if (typeof parsed.leak !== "boolean" || typeof parsed.confidence !== "number") {
+      console.error("checkRoleLeakWithAI: malformed verdict JSON", raw);
+      return null;
+    }
 
     return {
       leak: parsed.leak,
@@ -6665,7 +6675,7 @@ export class GameRoom extends DurableObject<Env> {
 
   // Anti role-leak pipeline, run on every plain (non-command) group message.
   // Stage 1 (local keyword filter) happens first and is free — only a match
-  // triggers the DeepSeek call. See ROLE_LEAK_TRIGGER_WORDS / checkRoleLeakWithAI.
+  // triggers the OpenAI call. See ROLE_LEAK_TRIGGER_WORDS / checkRoleLeakWithAI.
   private async handleGroupTextForRoleLeak(msg: TgMessage): Promise<void> {
     const from = msg.from;
     const text = msg.text ?? "";

@@ -1541,14 +1541,20 @@ export function isPlayingStatus(status: GameStatus): boolean {
   );
 }
 
+// Minimal typing for the Cloudflare Workers AI binding (no external package
+// needed). Add `[ai]\nbinding = "AI"` to wrangler.toml to enable it.
+export interface Ai {
+  run(model: string, inputs: Record<string, unknown>): Promise<unknown>;
+}
+
 export interface Env {
   DB: D1Database;
   GAME_ROOM: DurableObjectNamespace;
   BOT_TOKEN: string;
   WEBHOOK_SECRET: string;
-  // Optional: set via `wrangler secret put OPENAI_API_KEY` to override the
-  // hardcoded fallback key below without redeploying code.
-  OPENAI_API_KEY?: string;
+  // Cloudflare Workers AI binding — free, no API key needed. Requires
+  // `[ai]` / `binding = "AI"` in wrangler.toml.
+  AI: Ai;
 }
 
 
@@ -4048,11 +4054,8 @@ export async function addKillAdmin(db: D1Database, userId: number, addedBy: numb
 export const ROLE_LEAK_WARNING_LIMIT = 3;
 export const ROLE_LEAK_CONFIDENCE_THRESHOLD = 0.6;
 export const ROLE_LEAK_AI_TIMEOUT_MS = 4000;
+export const ROLE_LEAK_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 
-// Hardcoded per user's request for convenience. Prefer setting this via
-// `wrangler secret put OPENAI_API_KEY` instead — if env.OPENAI_API_KEY
-// is set (as a secret), it always takes priority over this fallback.
-const OPENAI_API_KEY_FALLBACK = "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";
 
 export const ROLE_LEAK_TRIGGER_WORDS: string[] = [
   // نام نقش‌ها (فارسی)
@@ -4105,16 +4108,19 @@ export interface RoleLeakVerdict {
   reason: string;
 }
 
-// Calls OpenAI to judge whether `text` leaks a role/night-action. Returns
-// null on ANY failure (timeout, network error, bad/unparseable response) so
-// the caller can fail open — a broken API must never block or crash the game.
+// Calls Cloudflare Workers AI to judge whether `text` leaks a role/night-action.
+// Returns null on ANY failure (timeout, binding missing, bad/unparseable
+// response) so the caller can fail open — a broken model must never block
+// or crash the game.
 export async function checkRoleLeakWithAI(
   env: Env,
   text: string,
   activeRoleNames: string[],
 ): Promise<RoleLeakVerdict | null> {
-  const apiKey = env.OPENAI_API_KEY || OPENAI_API_KEY_FALLBACK;
-  if (!apiKey) return null;
+  if (!env.AI) {
+    console.error("checkRoleLeakWithAI: no AI binding on env — add [ai] binding = \"AI\" to wrangler.toml");
+    return null;
+  }
 
   const systemPrompt =
     "تو یه ناظر بازی مافیا هستی. وظیفه‌ت اینه که بررسی کنی آیا یک پیام توی چت گروه، نقش بازی یکی از بازیکن‌ها رو مستقیم یا غیرمستقیم لو می‌ده یا نه.\n" +
@@ -4122,45 +4128,41 @@ export async function checkRoleLeakWithAI(
     "مهم: تو نمی‌دونی کدوم بازیکن چه نقشی داره و نباید حدس بزنی یا نامی از بازیکن خاص در جواب بیاری. فقط باید تشخیص بدی خودِ متن پیام چیزی درباره نقش/اکشن شبانه گوینده یا شخص دیگه فاش می‌کنه یا نه.\n" +
     "مواردی که لو دادن حساب می‌شه: اعتراف مستقیم به نقش، اشاره به اکشن شب انجام‌شده، اشاره به نتیجه قابلیت نقش، اشاره به محدودیت استفاده نقش، اشاره به هم‌تیمی بودن در تیم مافیا.\n" +
     "مواردی که لو دادن حساب نمی‌شه: حدس و گمان عمومی، استدلال منطقی بر اساس رفتار بیرونی بازی، بحث کلی درباره قوانین.\n" +
-    'فقط این JSON رو برگردون، بدون هیچ متن اضافه: {"leak": true/false, "confidence": 0 تا 1, "reason": "دلیل کوتاه فارسی"}';
+    'فقط این JSON رو برگردون، بدون هیچ متن اضافه، بدون Markdown، بدون ```: {"leak": true/false, "confidence": 0 تا 1, "reason": "دلیل کوتاه فارسی"}';
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ROLE_LEAK_AI_TIMEOUT_MS);
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error("workers-ai-timeout")), ROLE_LEAK_AI_TIMEOUT_MS);
+  });
 
   try {
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        temperature: 0,
-        max_tokens: 200,
-        response_format: { type: "json_object" },
+    const result = await Promise.race([
+      env.AI.run(ROLE_LEAK_AI_MODEL, {
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: text },
         ],
+        temperature: 0,
       }),
-      signal: controller.signal,
-    });
+      timeout,
+    ]);
 
-    if (!res.ok) {
-      const errBody = await res.text().catch(() => "");
-      console.error("checkRoleLeakWithAI: OpenAI returned non-OK status", res.status, errBody.slice(0, 500));
-      return null;
+    // Workers AI chat models normally return { response: string }, but be
+    // lenient in case the shape differs across model versions.
+    let raw: string | undefined;
+    if (typeof result === "string") raw = result;
+    else if (result && typeof result === "object" && typeof (result as any).response === "string") {
+      raw = (result as any).response;
     }
-
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    const raw = data.choices?.[0]?.message?.content;
     if (!raw) {
-      console.error("checkRoleLeakWithAI: no content in OpenAI response", JSON.stringify(data).slice(0, 500));
+      console.error("checkRoleLeakWithAI: no text in Workers AI response", JSON.stringify(result).slice(0, 500));
       return null;
     }
 
-    const parsed = JSON.parse(raw) as Partial<RoleLeakVerdict>;
+    // Strip ```json ... ``` fences in case the model wraps its output.
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+
+    const parsed = JSON.parse(cleaned) as Partial<RoleLeakVerdict>;
     if (typeof parsed.leak !== "boolean" || typeof parsed.confidence !== "number") {
       console.error("checkRoleLeakWithAI: malformed verdict JSON", raw);
       return null;
@@ -4172,11 +4174,11 @@ export async function checkRoleLeakWithAI(
       reason: typeof parsed.reason === "string" ? parsed.reason : "",
     };
   } catch (err) {
-    // Timeout (AbortError), network failure, or JSON parse error — fail open.
+    // Timeout, binding error, or JSON parse error — fail open.
     console.error("checkRoleLeakWithAI failed, leaving message untouched", err);
     return null;
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timeoutId);
   }
 }
 

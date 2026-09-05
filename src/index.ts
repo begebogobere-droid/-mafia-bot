@@ -1399,21 +1399,21 @@ export const ROLES: Record<RoleId, RoleDef> = {
 // Used by sendRoleCards/sendMyRole to attach a photo to every role reveal
 // instead of sending bare text.
 export const ROLE_IMAGES: Record<RoleId | IndependentRoleId, string> = {
-  godfather: "AgACAgQAAxkBAAFTimZqnEOIJ9YmmLwZKwIu4s8yis8qEAACgQ9rG-KO4FDCIMyN5abRwgEAAwIAA3MAAz0E",
-  lecter: "AgACAgQAAxkBAAFTimBqnENpXhlJ8nFDiB0pILAXZX9fAgACgA9rG-KO4FDM_VOptFWzyQEAAwIAA3MAAz0E",
-  nato: "AgACAgQAAxkBAAFTimhqnEO5QWOGAcRoMZTtQr69L1jiMQACgg9rG-KO4FCsdLvfSyCcngEAAwIAA3MAAz0E",
-  detective: "AgACAgQAAxkBAAFTiqlqnET0ARDqDJu0h6UEmLwEOeVf1AACkA9rG-KO4FC-zQSL3SEL8QEAAwIAA3MAAz0E",
-  doctor: "AgACAgQAAxkBAAFTin5qnEQse8flph2tYsQ24g4WjtU20QACjQ9rG-KO4FAgYdV6Zp4TDQEAAwIAA3MAAz0E",
-  sniper: "AgACAgQAAxkBAAFTinRqnEQFIgdo5fCSLwzrL92udCey4gACiQ9rG-KO4FBW6LqD9ecnEAEAAwIAA3MAAz0E",
-  mayor: "AgACAgQAAxkBAAFTittqnEUiMtshhCFZ4aEbxQIFIw5LNgACkg9rG-KO4FA1mpSSu631aQEAAwIAA3MAAz0E",
-  gunner: "AgACAgQAAxkBAAFTinZqnEQY2XRYweeq-amlZy1YBvFWuwACjA9rG-KO4FBChmezGnZmvgEAAwIAA3MAAz0E",
-  invincible: "AgACAgQAAxkBAAFTioBqnEQ-3-y-ofZm4YuEpQgehP314QACjg9rG-KO4FCqbaJT4fDxkQEAAwIAA3MAAz0E",
-  escort: "AgACAgQAAxkBAAFTippqnETb0aiohnLEiJ_pR_Lp22VvQQACjw9rG-KO4FBzQG23_yiRZAEAAwIAA3MAAz0E",
-  paranoid: "AgACAgQAAxkBAAFTisdqnEUQz472hpf2jh85FckUNweMYgACkQ9rG-KO4FDcwa6qNRhAXAEAAwIAA3MAAz0E",
-  johnny: "AgACAgQAAxkBAAFTimpqnEPP6fXlWSg_-pQ7IExGsaNzzgACgw9rG-KO4FBA8Stj5M7tZAEAAwIAA3MAAz0E",
-  joker: "AgACAgQAAxkBAAFTik5qnEMLGVQlkb7DQ52bkFBffO-gAQAC0A9rG8lZ4VD4l1dDAcwdsgEAAwIAA3MAAz0E",
-  bomber: "AgACAgQAAxkBAAFTim5qnEPnxbSSqtYp7x2mlnXcleV9OwAChA9rG-KO4FA6xHp_j3GF-wEAAwIAA3MAAz0E",
-  lonewolf: "AgACAgQAAxkBAAFTilpqnENRE2ovQypKBsGci4Tv6x-XvwACfw9rG-KO4FA6oB3H2y0RJwEAAwIAA3MAAz0E",
+  godfather: "AgACAgQAAxkBAAJZ4WqcVgABxrF2Y_X2ETXk9FqhLPJHDQACgQ9rG-KO4FB2bnvLWh91KQEAAwIAA3kAAz0E",
+  lecter: "AgACAgQAAxkBAAJZ4GqcVgABIc8C746gSLlxHB79f0-dEQACgA9rG-KO4FBNDQ50OdB65gEAAwIAA3kAAz0E",
+  nato: "AgACAgQAAxkBAAJZ4mqcVgAB6LCXW0PNNOtis-FmdB7FhQACgg9rG-KO4FC7FMU_Gx6qkwEAAwIAA3kAAz0E",
+  detective: "AgACAgQAAxkBAAJZ6mqcVgAB5BOf14whoWoDB_r0OXNAfQACkA9rG-KO4FCWWcPW2vQy-QEAAwIAA3kAAz0E",
+  doctor: "AgACAgQAAxkBAAJZ52qcVgABWjUqzdjNn6NMD--0cMmd_gACjQ9rG-KO4FBCqAGDk4nhQQEAAwIAA3kAAz0E",
+  sniper: "AgACAgQAAxkBAAJZ5WqcVgABiwxTcl3TbN0XjwUGh8BkrwACiQ9rG-KO4FAP_ebnatkd_wEAAwIAA3kAAz0E",
+  mayor: "AgACAgQAAxkBAAJZ0GqcU_xJtvvLKGpgRwzntFghtsh4AAKSD2sb4o7gUBGXnyEWbZv7AQADAgADeQADPQQ",
+  gunner: "AgACAgQAAxkBAAJZ5mqcVgAB28qrXfD5HzCgHsAfjZ0z-QACjA9rG-KO4FDGG0WcBsiPoQEAAwIAA3kAAz0E",
+  invincible: "AgACAgQAAxkBAAJZ6GqcVgABH9HHe25X1eR1WTC7KTjJmwACjg9rG-KO4FDDETvik3PTXgEAAwIAA3kAAz0E",
+  escort: "AgACAgQAAxkBAAJZ6WqcVgABUEaSeZsaSTps7HZ9TNFoKwACjw9rG-KO4FDwNJ4Bb7amywEAAwIAA3kAAz0E",
+  paranoid: "AgACAgQAAxkBAAJZ2GqcVLQ9GP7tTpJguU2pba7Y_4CGAAKRD2sb4o7gUG9EW53Km8R2AQADAgADeQADPQQ",
+  johnny: "AgACAgQAAxkBAAJZ42qcVgABkgR7iApjUt6j7T8adM-JpQACgw9rG-KO4FAIFwXDH-vELgEAAwIAA3kAAz0E",
+  joker: "AgACAgQAAxkBAAJZ3mqcVgABrHr9geTW94SZPOY_KlwMOgAC0A9rG8lZ4VBs_MJFgwEKOQEAAwIAA3kAAz0E",
+  bomber: "AgACAgQAAxkBAAJZ5GqcVgAB3nRNlu8thfQOtb7eQC_ZCQAChA9rG-KO4FCP3Rz_GI27jAEAAwIAA3kAAz0E",
+  lonewolf: "AgACAgQAAxkBAAJZ32qcVgABEbN522LvEso9WnJKhH4b_gACfw9rG-KO4FDT4n5Z0OMVcAEAAwIAA3kAAz0E",
 };
 
 // Returns the file_id for a player's role image — independent players
@@ -3626,20 +3626,8 @@ export class GameRoom extends DurableObject<Env> {
       await upsertUser(this.env.DB, from, true);
       const parsed = parseCommand(text);
       if (parsed?.cmd === "start") { await this.onPrivateStart(msg, parsed.args); return; }
-      if (parsed?.cmd === "help") { await this.tg.sendMessage(from.id, fa.helpPrivate); return; }
+      if (parsed?.cmd === "help") { await this.tg.sendMessage(from.id, fa.helpPrivate, { reply_markup: mainReplyKeyboard() }); return; }
       if (parsed?.cmd === "myrole") { await this.sendMyRole(from.id); return; }
-      // TEMP: admin-only helper — reply to a photo you already sent this
-      // bot with /getfileid to get the file_id AS SEEN BY THIS BOT. file_ids
-      // are per-bot: an id obtained via a different bot (e.g. @RawDataBot)
-      // is not valid here and sendPhoto will fail with "wrong file_id" for
-      // it. Remove once ROLE_IMAGES is fully populated with ids collected
-      // this way.
-      if (parsed?.cmd === "getfileid") {
-        const photo = msg.reply_to_message?.photo?.at(-1);
-        if (!photo) { await this.tg.sendMessage(from.id, "یک عکس به من بفرست، بعد با ریپلای روی همان عکس /getfileid را بزن."); return; }
-        await this.tg.sendMessage(from.id, `<code>${photo.file_id}</code>`);
-        return;
-      }
       if (parsed) { await this.tg.sendMessage(from.id, fa.mafiaChatCommandsIgnored); return; }
       if (await this.handleNoteFlow(from.id, text)) return;
       await this.handleMafiaNightChat(msg);
@@ -3723,13 +3711,13 @@ export class GameRoom extends DurableObject<Env> {
     const from = msg.from!;
     if (args.startsWith("join_")) {
       const chatId = Number(args.slice(5));
-      if (!Number.isFinite(chatId)) { await this.tg.sendMessage(from.id, fa.privateStart); return; }
+      if (!Number.isFinite(chatId)) { await this.tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() }); return; }
       await this.joinFromPrivate(from, chatId);
       return;
     }
     const game = this.game;
     if (game && isActiveStatus(game.status) && findPlayer(game.players, from.id)) { await this.sendMyRole(from.id); return; }
-    await this.tg.sendMessage(from.id, fa.privateStart);
+    await this.tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() });
   }
 
   private async onCallback(cq: TgCallbackQuery): Promise<void> {
@@ -5620,9 +5608,9 @@ export class GameRoom extends DurableObject<Env> {
 
   private async sendMyRole(userId: number): Promise<void> {
     const game = this.game;
-    if (!game || !isActiveStatus(game.status)) { await this.tg.sendMessage(userId, fa.notPlaying); return; }
+    if (!game || !isActiveStatus(game.status)) { await this.tg.sendMessage(userId, fa.notPlaying, { reply_markup: mainReplyKeyboard() }); return; }
     const p = findPlayer(game.players, userId);
-    if (!p) { await this.tg.sendMessage(userId, fa.notPlaying); return; }
+    if (!p) { await this.tg.sendMessage(userId, fa.notPlaying, { reply_markup: mainReplyKeyboard() }); return; }
     // Attach the persistent Reply Keyboard (📝 یادداشت button) here — this
     // is the main private-chat entry point (/start and /myrole both land
     // here) while a game is active, so this is the natural single place to
@@ -6505,21 +6493,21 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   if (targetChat === null) { const active = await findActiveGameForUser(env.DB, from.id); if (active) targetChat = active.chat_id; }
   if (targetChat !== null) { await callRoom(env, targetChat, update); return; }
   if (cq) { await tg.answerCallbackQuery(cq.id, "بازی فعالی پیدا نشد.", true); return; }
-  if (parsed?.cmd === "help") { await tg.sendMessage(from.id, fa.helpPrivate); return; }
-  if (parsed?.cmd === "myrole") { await tg.sendMessage(from.id, fa.notPlaying); return; }
-  // TEMP: admin-only helper — works even with no active game, since this is
-  // the branch a user with no active game actually reaches. Reply to a
-  // photo you already sent this bot with /getfileid to get the file_id AS
-  // SEEN BY THIS BOT (file_ids are per-bot; an id obtained via a different
-  // bot, e.g. @RawDataBot, is not valid here). Remove once ROLE_IMAGES is
-  // fully populated with ids collected this way.
-  if (parsed?.cmd === "getfileid") {
-    const photo = msg?.reply_to_message?.photo?.at(-1);
-    if (!photo) { await tg.sendMessage(from.id, "یک عکس به من بفرست، بعد با ریپلای روی همان عکس /getfileid را بزن."); return; }
-    await tg.sendMessage(from.id, `<code>${photo.file_id}</code>`);
-    return;
-  }
-  await tg.sendMessage(from.id, fa.privateStart);
+  if (parsed?.cmd === "help") { await tg.sendMessage(from.id, fa.helpPrivate, { reply_markup: mainReplyKeyboard() }); return; }
+  if (parsed?.cmd === "myrole") { await tg.sendMessage(from.id, fa.notPlaying, { reply_markup: mainReplyKeyboard() }); return; }
+  // BUGFIX: the "📝 یادداشت" button is now shown from the very first /start
+  // (see below), before the user has any active game — but this branch (no
+  // active game found) is exactly where a press of that button lands, since
+  // findActiveGameForUser found nothing and callRoom/GameRoom.handleNoteFlow
+  // is never reached. Without this check, pressing the button here fell
+  // through to the generic fa.privateStart reply instead of telling the
+  // user the feature needs an active game.
+  if (msg?.text?.trim() === NOTE_BUTTON_LABEL) { await tg.sendMessage(from.id, fa.noteOnlyInGame, { reply_markup: mainReplyKeyboard() }); return; }
+  // The "📝 یادداشت" Reply Keyboard button is attached here (private-start
+  // with no active game) so it's present from the very first /start,
+  // permanently — not only once the user is inside an active game (a Reply
+  // Keyboard persists client-side once sent, until explicitly removed).
+  await tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() });
 }
 
 async function setup(url: URL, env: Env): Promise<Response> {

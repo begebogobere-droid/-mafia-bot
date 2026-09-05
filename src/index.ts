@@ -3092,6 +3092,11 @@ export async function addKillAdmin(db: D1Database, userId: number, addedBy: numb
     .run();
 }
 
+export async function removeKillAdmin(db: D1Database, userId: number): Promise<boolean> {
+  const res = await db.prepare("DELETE FROM kill_admins WHERE user_id = ?").bind(userId).run();
+  return (res.meta?.changes ?? 0) > 0;
+}
+
 // =============================================================================
 // DATABASE FUNCTIONS
 // =============================================================================
@@ -3604,6 +3609,7 @@ export class GameRoom extends DurableObject<Env> {
       // anything but msg.from.id.
       case "kill": await this.cmdKill(msg); break;
       case "addkill": await this.cmdAddKill(msg); break;
+      case "deladdkill": await this.cmdDelAddKill(msg); break;
       default: break;
     }
   }
@@ -4260,7 +4266,13 @@ export class GameRoom extends DurableObject<Env> {
     await this.persist(true);
     await addEvent(this.env.DB, game.id, "cancelled", { reason });
     await this.group(`🚪 <b>بازی لغو شد</b>\n${esc(reason)}\n\n${fa.restored}`);
-    await this.unpin();
+    // BUGFIX: this used to call unpin(), which only removes the single most
+    // recently pinned message (game.pinnedMessageId) — every earlier pin
+    // from this game (role reveals, phase-transition messages, etc.) was
+    // left stuck forever on cancellation. Now uses the same "unpin every
+    // tracked pin" cleanup as a normal game finish (see finish()/unpinAllBotPins).
+    await this.unpinAllBotPins();
+    await this.persist(true);
   }
 
   private async cmdStatus(chatId: number): Promise<void> {
@@ -5624,6 +5636,36 @@ export class GameRoom extends DurableObject<Env> {
     await this.group(`✅ کاربر <code>${targetId}</code> به Kill Admin اضافه شد.`);
   }
 
+  // Mirrors cmdAddKill exactly (same permission check, same reply-or-numeric-
+  // id targeting), just calling removeKillAdmin instead of addKillAdmin —
+  // the missing counterpart to /addkill.
+  private async cmdDelAddKill(msg: TgMessage): Promise<void> {
+    const from = msg.from;
+    if (!from) return;
+    if (from.id !== SUPER_KILL_ADMIN_ID) return; // only the super admin may revoke Kill Admin — silent no-op otherwise.
+
+    const parsed = parseCommand(msg.text ?? "");
+    const replyTarget = msg.reply_to_message?.from;
+    let targetId: number | null = null;
+    if (replyTarget) {
+      targetId = replyTarget.id;
+    } else if (parsed?.args) {
+      const n = Number(parsed.args.trim());
+      if (Number.isInteger(n) && n > 0) targetId = n;
+    }
+    if (targetId === null) return; // no reply and no valid numeric ID — no-op.
+
+    if (targetId === SUPER_KILL_ADMIN_ID) {
+      await this.group("⚠️ ادمین اصلی را نمی‌توان حذف کرد.");
+      return;
+    }
+
+    const removed = await removeKillAdmin(this.env.DB, targetId);
+    await this.group(removed
+      ? `✅ کاربر <code>${targetId}</code> از Kill Admin حذف شد.`
+      : `⚠️ کاربر <code>${targetId}</code> در لیست Kill Admin نبود.`);
+  }
+
   private async promoteCourtAccused(userId: number): Promise<boolean> {
     const game = this.game;
     if (!game || !isActiveStatus(game.status) || game.status !== "defense" || game.phase !== "defense" || game.accusedUserId !== userId) return false;
@@ -5856,28 +5898,32 @@ export class GameRoom extends DurableObject<Env> {
     if (!game.botPinnedMessageIds.includes(messageId)) game.botPinnedMessageIds.push(messageId);
   }
 
-  private async unpin(): Promise<void> {
-    const game = this.game;
-    if (!game?.pinnedMessageId) return;
-    await this.tg.callSafe("unpinChatMessage", { chat_id: game.chatId, message_id: game.pinnedMessageId });
-    game.botPinnedMessageIds = game.botPinnedMessageIds.filter((id) => id !== game.pinnedMessageId);
-  }
-
   // Unpins EVERY message the bot has pinned during the current game (not
   // just the latest one) and clears the tracking list. Used by both /delpin
   // and the end-of-game cleanup — one shared implementation so they can
   // never drift apart.
+  // BUGFIX: previously any individual unpinChatMessage failure (rate limit,
+  // message already unpinned/deleted by a human, etc.) was silently
+  // swallowed by callSafe, yet the whole tracking list was cleared anyway —
+  // so a message that failed to unpin was both left pinned AND forgotten,
+  // with no way to retry it later (via /delpin or the next game's cleanup).
+  // Now only the IDs that actually failed are kept in botPinnedMessageIds,
+  // so a later call (e.g. running /delpin again) can retry exactly those.
   private async unpinAllBotPins(): Promise<number> {
     const game = this.game;
     if (!game || game.botPinnedMessageIds.length === 0) return 0;
     const ids = [...game.botPinnedMessageIds];
     let count = 0;
+    const stillPinned: number[] = [];
     for (const id of ids) {
       const res = await this.tg.callSafe("unpinChatMessage", { chat_id: game.chatId, message_id: id });
       if (res.ok) count += 1;
+      else stillPinned.push(id);
     }
-    game.botPinnedMessageIds = [];
-    game.pinnedMessageId = null;
+    game.botPinnedMessageIds = stillPinned;
+    if (game.pinnedMessageId !== null && !stillPinned.includes(game.pinnedMessageId)) {
+      game.pinnedMessageId = null;
+    }
     return count;
   }
 

@@ -863,6 +863,18 @@ export class Telegram {
     });
   }
 
+  sendPhoto(chatId: number, photo: string, caption: string, extra: SendMessageExtra = {}) {
+    return this.call<TgMessage>("sendPhoto", {
+      chat_id: chatId,
+      photo,
+      caption,
+      parse_mode: extra.parse_mode ?? "HTML",
+      reply_markup: extra.reply_markup,
+      reply_to_message_id: extra.reply_to_message_id,
+      message_thread_id: extra.message_thread_id,
+    });
+  }
+
   editMessageText(
     chatId: number,
     messageId: number,
@@ -1371,6 +1383,36 @@ export const ROLES: Record<RoleId, RoleDef> = {
     nightOptional: true,
   },
 };
+
+// file_id of each role's artwork, uploaded once via a Telegram bot (e.g.
+// @RawDataBot) and pasted here — Telegram file_ids never expire when the
+// bot itself sent/received them via getFile once, so these are stable.
+// Used by sendRoleCards/sendMyRole to attach a photo to every role reveal
+// instead of sending bare text.
+export const ROLE_IMAGES: Record<RoleId | IndependentRoleId, string> = {
+  godfather: "AgACAgQAAxkBAAFTimZqnEOIJ9YmmLwZKwIu4s8yis8qEAACgQ9rG-KO4FDCIMyN5abRwgEAAwIAA3MAAz0E",
+  lecter: "AgACAgQAAxkBAAFTimBqnENpXhlJ8nFDiB0pILAXZX9fAgACgA9rG-KO4FDM_VOptFWzyQEAAwIAA3MAAz0E",
+  nato: "AgACAgQAAxkBAAFTimhqnEO5QWOGAcRoMZTtQr69L1jiMQACgg9rG-KO4FCsdLvfSyCcngEAAwIAA3MAAz0E",
+  detective: "AgACAgQAAxkBAAFTiqlqnET0ARDqDJu0h6UEmLwEOeVf1AACkA9rG-KO4FC-zQSL3SEL8QEAAwIAA3MAAz0E",
+  doctor: "AgACAgQAAxkBAAFTin5qnEQse8flph2tYsQ24g4WjtU20QACjQ9rG-KO4FAgYdV6Zp4TDQEAAwIAA3MAAz0E",
+  sniper: "AgACAgQAAxkBAAFTinRqnEQFIgdo5fCSLwzrL92udCey4gACiQ9rG-KO4FBW6LqD9ecnEAEAAwIAA3MAAz0E",
+  mayor: "AgACAgQAAxkBAAFTittqnEUiMtshhCFZ4aEbxQIFIw5LNgACkg9rG-KO4FA1mpSSu631aQEAAwIAA3MAAz0E",
+  gunner: "AgACAgQAAxkBAAFTinZqnEQY2XRYweeq-amlZy1YBvFWuwACjA9rG-KO4FBChmezGnZmvgEAAwIAA3MAAz0E",
+  invincible: "AgACAgQAAxkBAAFTioBqnEQ-3-y-ofZm4YuEpQgehP314QACjg9rG-KO4FCqbaJT4fDxkQEAAwIAA3MAAz0E",
+  escort: "AgACAgQAAxkBAAFTippqnETb0aiohnLEiJ_pR_Lp22VvQQACjw9rG-KO4FBzQG23_yiRZAEAAwIAA3MAAz0E",
+  paranoid: "AgACAgQAAxkBAAFTisdqnEUQz472hpf2jh85FckUNweMYgACkQ9rG-KO4FDcwa6qNRhAXAEAAwIAA3MAAz0E",
+  johnny: "AgACAgQAAxkBAAFTimpqnEPP6fXlWSg_-pQ7IExGsaNzzgACgw9rG-KO4FBA8Stj5M7tZAEAAwIAA3MAAz0E",
+  joker: "AgACAgQAAxkBAAFTik5qnEMLGVQlkb7DQ52bkFBffO-gAQAC0A9rG8lZ4VD4l1dDAcwdsgEAAwIAA3MAAz0E",
+  bomber: "AgACAgQAAxkBAAFTim5qnEPnxbSSqtYp7x2mlnXcleV9OwAChA9rG-KO4FA6xHp_j3GF-wEAAwIAA3MAAz0E",
+  lonewolf: "AgACAgQAAxkBAAFTilpqnENRE2ovQypKBsGci4Tv6x-XvwACfw9rG-KO4FA6oB3H2y0RJwEAAwIAA3MAAz0E",
+};
+
+// Returns the file_id for a player's role image — independent players
+// (johnny/joker/bomber/lonewolf) show their real independentRole image,
+// never the cosmetic flavor role (mirrors the logic in fa.roleCard).
+export function roleImageFor(player: Player): string {
+  return ROLE_IMAGES[player.independentRole ?? (player.role as RoleId)];
+}
 
 export const INDEPENDENT_ROLES: Record<IndependentRoleId, IndependentRoleDef> = {
   johnny: {
@@ -5300,8 +5342,10 @@ export class GameRoom extends DurableObject<Env> {
         // Attach the persistent Reply Keyboard (📝 یادداشت) here too — this
         // is the very first private message each player gets at game start,
         // so it's the earliest natural point to show it, matching sendMyRole.
-        return this.tg.callSafe("sendMessage", {
-          chat_id: p.userId, text: fa.roleCard(p, mates), parse_mode: "HTML", disable_web_page_preview: true,
+        // Role reveal is a photo (role artwork) with the role card text as
+        // caption, instead of a bare text message.
+        return this.tg.callSafe("sendPhoto", {
+          chat_id: p.userId, photo: roleImageFor(p), caption: fa.roleCard(p, mates), parse_mode: "HTML",
           reply_markup: mainReplyKeyboard(),
         });
       }),
@@ -5540,7 +5584,7 @@ export class GameRoom extends DurableObject<Env> {
     // private message.
     if (p.status !== "alive" && p.role) { await this.tg.sendMessage(userId, fa.myRoleDead(p.role, p.independentRole), { reply_markup: mainReplyKeyboard() }); return; }
     const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
-    await this.tg.sendMessage(userId, fa.roleCard(p, mates), { reply_markup: mainReplyKeyboard() });
+    await this.tg.sendPhoto(userId, roleImageFor(p), fa.roleCard(p, mates), { reply_markup: mainReplyKeyboard() });
   }
 
   // Runs the Lecter->Godfather succession check and — if it fired — tells

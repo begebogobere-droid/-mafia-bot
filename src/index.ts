@@ -2876,8 +2876,8 @@ export const fa = {
   notePromptEdit: "📝 یادداشت جدید خود را ارسال کنید (جایگزین یادداشت قبلی می‌شود):\n\nاین یادداشت فقط بعد از مرگ شما در گروه نمایش داده می‌شود.",
   noteEmpty: "متن یادداشت نمی‌تواند خالی باشد. دوباره تلاش کنید.",
   noteSaved: "✅ یادداشت شما ذخیره شد.",
-  notePublished(text: string): string {
-    return ["📝 <b>یادداشت بازیکن</b>", "", esc(text)].join("\n");
+  notePublished(userId: number, name: string, text: string): string {
+    return [`📝 <b>یادداشت بازیکن ( ${mention(userId, name)} )</b>`, "", esc(text)].join("\n");
   },
   investigation(target: string, result: string): string {
     return `🔍 استعلام ${esc(target)}: <b>${result}</b>`;
@@ -2984,11 +2984,28 @@ export const fa = {
 
   cityInquiryNotAllowed: "شما نمی‌توانید در این رأی‌گیری نظر دهید.",
 
-  // Sent privately to a voter the moment their vote is registered.
+  // Shown (as a silent-alert popup) when the user clicks the option they
+  // already have selected — no vote change happens, nothing is re-sent.
+  cityInquiryAlreadyVoted(choice: boolean): string {
+    return choice
+      ? "⚠️ شما قبلاً «بله» را انتخاب کرده‌اید."
+      : "⚠️ شما قبلاً «خیر» را انتخاب کرده‌اید.";
+  },
+
+  // Sent privately to a voter the moment their vote is registered for the
+  // first time (no prior vote existed yet this inquiry).
   cityInquiryVotePrivate(choice: boolean): string {
     return choice
       ? "نتیجه شما ثبت شد، شما با استعلام موافقت کردید."
       : "نتیجه شما ثبت شد، شما با استعلام مخالفت کردید.";
+  },
+
+  // Sent privately when a voter switches their existing vote to the other
+  // option (بله <-> خیر).
+  cityInquiryVoteChanged(choice: boolean): string {
+    return choice
+      ? "✅ رأی شما با موفقیت به «بله» تغییر کرد."
+      : "✅ رأی شما با موفقیت به «خیر» تغییر کرد.";
   },
 
   // Live running tally posted to the group as votes come in — only the
@@ -4660,13 +4677,26 @@ export class GameRoom extends DurableObject<Env> {
     if (!game || game.status !== "inquiry" || game.dayNumber !== dayNumber) return { text: fa.staleAction, alert: true };
     const player = findPlayer(game.players, userId);
     if (!player || player.status !== "alive") return { text: fa.cityInquiryNotAllowed, alert: true };
+
+    // FIX: previously this always removed+re-added the vote and always sent
+    // the private confirmation + group tally, even when the user clicked
+    // the option they already had selected — so repeated clicks on the same
+    // button kept "registering" (and announcing) the same vote over and
+    // over. Now: if their current vote already matches this choice, do
+    // nothing (no backend change, no messages) and just tell them so.
+    const existing = game.inquiryVotes.find((v) => v.voterId === userId && v.dayNumber === dayNumber);
+    if (existing && existing.choice === choice) {
+      return { text: fa.cityInquiryAlreadyVoted(choice), alert: true };
+    }
+    const isChange = !!existing;
+
     game.inquiryVotes = game.inquiryVotes.filter((v) => !(v.voterId === userId && v.dayNumber === dayNumber));
     game.inquiryVotes.push({ voterId: userId, choice, dayNumber, at: now() });
     await this.persist();
 
     // Private confirmation to the voter, plus a live-updating tally for
     // just their choice's running count posted to the group.
-    await this.pm(userId, fa.cityInquiryVotePrivate(choice));
+    await this.pm(userId, isChange ? fa.cityInquiryVoteChanged(choice) : fa.cityInquiryVotePrivate(choice));
     const count = game.inquiryVotes.filter((v) => v.dayNumber === dayNumber && v.choice === choice).length;
     await this.group(fa.cityInquiryVoteGroup(choice, count));
 
@@ -5481,7 +5511,7 @@ export class GameRoom extends DurableObject<Env> {
     for (const d of deaths) {
       const p = findPlayer(game.players, d.userId);
       if (!p || !p.note || p.notePosted) continue;
-      await this.group(fa.notePublished(p.note));
+      await this.group(fa.notePublished(p.userId, p.displayName, p.note));
       p.notePosted = true;
     }
   }

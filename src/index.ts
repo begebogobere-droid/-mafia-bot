@@ -1,1034 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
 
-
-const MINIAPP_HTML = `<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>𝑴𝑨𝑭𝑰𝑨</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-/* =====================================================================
-   MAFIA MINI APP — Design Tokens & Styling
-   ===================================================================== */
-@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap');
-
-:root{
-  --bg:#0a0b0d; --bg-2:#0d0f12;
-  --panel:rgba(255,255,255,0.045); --panel-strong:rgba(255,255,255,0.075);
-  --panel-border:rgba(255,255,255,0.09); --panel-border-strong:rgba(255,255,255,0.16);
-  --ink:#eef0f3; --ink-dim:#98a0ac; --ink-faint:#5b6270;
-  --blood:#7d2430; --blood-bright:#b23a44; --blood-glow:rgba(178,58,68,0.35);
-  --gold:#b8934c; --gold-dim:#8a713d; --good:#3f8f6f;
-  --radius-lg:20px; --radius-md:14px; --radius-sm:10px;
-  --font-display:'Vazirmatn',sans-serif; --font-mono:'JetBrains Mono',monospace;
-}
-
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
-html,body{height:100%;}
-body{ margin:0; background:var(--bg); color:var(--ink); font-family:var(--font-display); font-size:15px; line-height:1.6; overflow-x:hidden; -webkit-font-smoothing:antialiased; }
-button, input {font-family:inherit;}
-::selection{background:var(--blood);color:#fff;}
-
-/* ---------- Atmosphere (Background Glow) ---------- */
-#atmosphere{ position:fixed; inset:0; z-index:0; pointer-events:none; background:var(--bg); transition:background 1.4s ease; }
-#atmosphere.is-night{ background:radial-gradient(120% 90% at 50% -10%, rgba(30,52,90,0.35), transparent 60%), var(--bg); }
-#atmosphere.is-day{ background:radial-gradient(120% 90% at 50% -10%, rgba(120,86,32,0.28), transparent 60%), var(--bg); }
-#atmosphere::before{ content:""; position:absolute; left:50%; top:-140px; transform:translateX(-50%); width:420px; height:420px; border-radius:50%; background:radial-gradient(circle, var(--halo-color,rgba(120,140,200,0.28)) 0%, transparent 70%); animation:haloPulse 6s ease-in-out infinite; }
-@keyframes haloPulse{ 0%,100%{opacity:.55; transform:translateX(-50%) scale(1);} 50%{opacity:.9; transform:translateX(-50%) scale(1.08);} }
-#atmosphere.is-night::before{ --halo-color:rgba(90,130,210,0.3); }
-#atmosphere.is-day::before{ --halo-color:rgba(220,160,80,0.28); }
-
-.fog{ position:absolute; inset:auto 0 0 0; height:38vh; opacity:0; transition:opacity 1.2s ease; pointer-events:none; background:radial-gradient(60% 40% at 20% 100%, rgba(255,255,255,0.035), transparent 70%), radial-gradient(50% 35% at 80% 100%, rgba(255,255,255,0.03), transparent 70%); animation:fogDrift 18s ease-in-out infinite alternate; }
-#atmosphere.is-night .fog{ opacity:1; }
-@keyframes fogDrift{ from{ transform:translateX(-2%);} to{ transform:translateX(2%);} }
-
-/* ---------- Layout Shell & Header ---------- */
-#app{ position:relative; z-index:1; min-height:100vh; display:flex; flex-direction:column; padding-bottom:74px; }
-header.hdr{ position:sticky; top:0; z-index:20; padding:14px 16px 12px; background:linear-gradient(to bottom, rgba(10,11,13,0.92), rgba(10,11,13,0.75) 70%, transparent); backdrop-filter:blur(10px); }
-.hdr-row{ display:flex; align-items:center; gap:12px; }
-.hdr-disc{ width:46px; height:46px; border-radius:50%; flex:none; display:flex; align-items:center; justify-content:center; font-size:21px; background:var(--panel-strong); border:1px solid var(--panel-border-strong); box-shadow:0 0 0 1px rgba(0,0,0,0.3), 0 6px 18px -6px var(--halo-color,rgba(90,130,210,0.4)); }
-.hdr-mid{ flex:1; min-width:0; }
-.hdr-title{ font-weight:800; font-size:16px; letter-spacing:.2px; }
-.hdr-sub{ color:var(--ink-dim); font-size:12.5px; margin-top:1px; }
-.hdr-timer{ font-family:var(--font-mono); font-weight:600; font-size:20px; min-width:64px; text-align:center; padding:6px 10px; border-radius:var(--radius-sm); background:var(--panel); border:1px solid var(--panel-border); font-variant-numeric:tabular-nums; }
-.hdr-timer.low{ color:var(--blood-bright); border-color:rgba(178,58,68,0.5); animation:tick 1s steps(1) infinite; }
-@keyframes tick{ 50%{opacity:.55;} }
-.hdr-meta{ display:flex; gap:10px; margin-top:10px; font-size:12.5px; color:var(--ink-dim); }
-.hdr-chip{ display:flex; align-items:center; gap:5px; background:var(--panel); border:1px solid var(--panel-border); padding:5px 10px; border-radius:999px; }
-
-/* ---------- Views & Components ---------- */
-main{ flex:1; padding:4px 16px 24px; }
-.view{ display:none; animation:viewIn .35s ease; }
-.view.active{ display:block; }
-@keyframes viewIn{ from{ opacity:0; transform:translateY(6px);} to{ opacity:1; transform:none;} }
-.section-title{ font-size:12.5px; color:var(--ink-dim); font-weight:600; margin:18px 2px 10px; display:flex; align-items:center; gap:6px; }
-.section-title:first-child{ margin-top:6px; }
-.panel{ background:var(--panel); border:1px solid var(--panel-border); border-radius:var(--radius-lg); padding:16px; position:relative; overflow:hidden; }
-.panel + .panel{ margin-top:10px; }
-
-/* ---------- Buttons ---------- */
-.btn{ display:block; width:100%; text-align:center; border:none; cursor:pointer; padding:14px 16px; border-radius:999px; font-weight:700; font-size:14.5px; background:var(--panel-strong); color:var(--ink); border:1px solid var(--panel-border-strong); transition:transform .1s ease, opacity .15s ease; }
-.btn:active{ transform:scale(.97); }
-.btn:disabled{ opacity:0.35; cursor:not-allowed; }
-.btn.primary{ background:linear-gradient(180deg, var(--blood-bright), var(--blood)); border-color:transparent; color:#fff; box-shadow:0 8px 20px -8px var(--blood-glow); }
-.btn.ghost{ background:transparent; border-color:var(--panel-border); color:var(--ink-dim); }
-.btn.gold{ background:linear-gradient(180deg,#c9a765,var(--gold-dim)); color:#1a1408; border-color:transparent; }
-.btn-row{ display:flex; gap:8px; margin-top:12px; }
-.btn-row .btn{ flex:1; }
-
-.empty-note{ text-align:center; color:var(--ink-faint); font-size:13px; padding:26px 10px; }
-.empty-note .big{ font-size:30px; display:block; margin-bottom:8px; }
-
-/* ---------- Lobby ---------- */
-.lobby-box { text-align: center; padding: 40px 10px; }
-.lobby-code-display { font-size: 48px; font-family: var(--font-mono); letter-spacing: 12px; color: var(--gold); margin: 20px 0; font-weight: bold; text-shadow: 0 0 20px rgba(184, 147, 76, 0.4); }
-.input-code { width: 100%; padding: 16px; text-align: center; font-size: 28px; letter-spacing: 8px; border-radius: 16px; background: rgba(0,0,0,0.3); border: 2px solid var(--panel-border-strong); color: #fff; margin-bottom: 20px; font-family: var(--font-mono); font-weight: bold; outline: none; transition: border-color 0.3s; }
-.input-code:focus { border-color: var(--gold); }
-.lobby-players { margin: 30px 0; text-align: right; }
-.player-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--panel-strong); padding: 12px 16px; border-radius: var(--radius-sm); margin-bottom: 8px; border: 1px solid var(--panel-border); font-weight: 600; }
-
-/* ---------- Player Grid ---------- */
-.players-grid{ display:grid; grid-template-columns:repeat(2, 1fr); gap:10px; }
-.pcard{ background:var(--panel); border:1px solid var(--panel-border); border-radius:var(--radius-md); padding:12px 12px 11px; display:flex; flex-direction:column; gap:6px; transition:transform .15s ease, border-color .15s ease, background .15s ease; }
-.pcard[data-selectable="1"]{ cursor:pointer; }
-.pcard[data-selectable="1"]:active{ transform:scale(.97); }
-.pcard.dead{ opacity:.5; }
-.pcard.selected{ border-color:var(--blood-bright); background:rgba(178,58,68,0.12); box-shadow:0 0 0 1px var(--blood-bright) inset; }
-.pcard.is-you{ border-color:var(--gold-dim); }
-.pcard-top{ display:flex; align-items:center; justify-content:space-between; }
-.pcard-avatar{ width:34px; height:34px; border-radius:50%; background:var(--panel-strong); display:flex; align-items:center; justify-content:center; font-size:15px; border:1px solid var(--panel-border); }
-.pcard-name{ font-weight:600; font-size:13.5px; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.pcard-status{ font-size:11.5px; color:var(--ink-dim); display:flex; align-items:center; gap:4px; }
-.pcard-status.alive{ color:var(--good); }
-.pcard-status.dead{ color:var(--ink-faint); }
-.pcard-role-tag{ font-size:11px; color:var(--gold); }
-.you-badge{ font-size:10px; background:var(--gold-dim); color:#fff; padding:1px 7px; border-radius:999px; }
-
-/* ---------- Role Panel ---------- */
-.role-hero{ display:flex; align-items:center; gap:14px; }
-.role-hero-emoji{ font-size:34px; width:60px; height:60px; border-radius:16px; display:flex; align-items:center; justify-content:center; background:var(--panel-strong); border:1px solid var(--panel-border-strong); flex:none; }
-.role-hero-name{ font-weight:800; font-size:18px; }
-.role-hero-team{ font-size:12px; color:var(--ink-dim); margin-top:2px; }
-.role-desc{ margin-top:12px; font-size:13px; color:var(--ink-dim); line-height:1.85; }
-.role-stats{ display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
-.stat-pill{ font-size:11.5px; background:var(--panel-strong); border:1px solid var(--panel-border); padding:5px 10px; border-radius:999px; color:var(--ink-dim); }
-.stat-pill b{ color:var(--ink); }
-
-/* ---------- Action Targets ---------- */
-.targets{ display:flex; flex-direction:column; gap:8px; margin-top:12px; }
-.targets.nato-roles { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
-.target-row{ display:flex; align-items:center; justify-content:space-between; gap:10px; background:var(--panel); border:1px solid var(--panel-border); border-radius:var(--radius-sm); padding:11px 14px; cursor:pointer; transition:border-color .15s, background .15s; }
-.targets.nato-roles .target-row { padding: 8px 10px; }
-.target-row:active{ transform:scale(.985); }
-.target-row.picked{ border-color:var(--blood-bright); background:rgba(178,58,68,0.14); }
-.target-row .tname{ font-weight:600; font-size:13.5px; }
-.radio-dot{ width:18px; height:18px; border-radius:50%; border:2px solid var(--panel-border-strong); flex:none; position:relative; }
-.target-row.picked .radio-dot{ border-color:var(--blood-bright); }
-.target-row.picked .radio-dot::after{ content:""; position:absolute; inset:3px; border-radius:50%; background:var(--blood-bright); }
-
-/* ---------- Voting ---------- */
-.vote-bar-wrap{ margin-top:8px; }
-.vote-row{ margin-bottom:12px; cursor:pointer; }
-.vote-row:active .vote-track { transform:scale(0.99); }
-.vote-row-top{ display:flex; justify-content:space-between; align-items:center; font-size:13px; margin-bottom:5px; }
-.vote-row-top .vn{ font-weight:600; }
-.vote-row-top .vc{ color:var(--ink-dim); font-family:var(--font-mono); }
-.vote-track{ height:9px; border-radius:999px; background:var(--panel-strong); overflow:hidden; transition:transform 0.1s; }
-.vote-fill{ height:100%; background:linear-gradient(90deg, var(--gold-dim), var(--gold)); border-radius:999px; transition:width .5s ease; }
-
-/* ---------- Chat / Day Phase ---------- */
-.chat-container { display: flex; flex-direction: column; height: calc(100vh - 180px); }
-.chat-header { display: flex; justify-content: space-between; align-items: center; padding: 16px; background: var(--panel-strong); border-radius: var(--radius-lg) var(--radius-lg) 0 0; border: 1px solid var(--panel-border); border-bottom: none; }
-.speaker-name { color: var(--gold); font-weight: 800; font-size: 16px; display:flex; align-items:center; gap:8px;}
-.speaker-name.is-me { color: var(--good); }
-.speaker-timer { font-family: var(--font-mono); font-size: 22px; color: var(--ink); font-weight: bold; background: var(--bg); padding: 4px 12px; border-radius: 8px; border: 1px solid var(--panel-border); }
-.speaker-timer.urgent { color: var(--blood-bright); animation: pulse 1s infinite; }
-@keyframes pulse { 50% { opacity: 0.5; } }
-
-.chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; background: var(--panel); border-left: 1px solid var(--panel-border); border-right: 1px solid var(--panel-border); scroll-behavior: smooth; }
-.chat-msg { padding: 12px 16px; border-radius: 16px; background: var(--panel-strong); max-width: 85%; align-self: flex-start; border: 1px solid var(--panel-border); line-height: 1.5; position: relative; }
-.chat-msg.mine { background: rgba(184, 147, 76, 0.1); border-color: rgba(184, 147, 76, 0.3); align-self: flex-end; border-bottom-right-radius: 4px; }
-.chat-msg.others { border-bottom-left-radius: 4px; }
-.chat-msg.system { align-self: center; background: transparent; border: none; color: var(--ink-dim); font-size: 12px; text-align: center; width: 100%; padding: 4px; }
-.chat-msg .sender { font-size: 11.5px; color: var(--gold); margin-bottom: 4px; font-weight: bold; }
-.chat-msg.mine .sender { color: var(--good); }
-.chat-msg .time { font-size: 9px; color: var(--ink-faint); margin-top: 4px; text-align: right; }
-
-.chat-input-area { display: flex; gap: 8px; padding: 12px; background: var(--panel-strong); border-radius: 0 0 var(--radius-lg) var(--radius-lg); border: 1px solid var(--panel-border); border-top: none; }
-.chat-input-area input { flex: 1; padding: 14px 18px; border-radius: 999px; background: var(--bg); border: 1px solid var(--panel-border-strong); color: #fff; font-size: 14.5px; outline: none; transition: border-color 0.2s; }
-.chat-input-area input:focus { border-color: var(--gold-dim); }
-.chat-input-area button { padding: 0 24px; border-radius: 999px; background: var(--gold); border: none; color: #1a1408; font-weight: 800; font-size: 15px; }
-.chat-input-area input:disabled, .chat-input-area button:disabled { opacity: 0.4; cursor: not-allowed; background: var(--panel); border-color: transparent; color: var(--ink-faint); }
-
-/* ---------- Bottom Nav ---------- */
-nav.bottomnav{ position:fixed; bottom:0; left:0; right:0; z-index:30; display:flex; padding:8px 12px calc(8px + env(safe-area-inset-bottom)); gap:6px; background:rgba(10,11,13,0.92); backdrop-filter:blur(14px); border-top:1px solid var(--panel-border); }
-nav.bottomnav button{ flex:1; background:none; border:none; color:var(--ink-faint); display:flex; flex-direction:column; align-items:center; gap:3px; padding:6px 2px; border-radius:12px; font-size:10.5px; position:relative; }
-nav.bottomnav button .ico{ font-size:19px; }
-nav.bottomnav button.active{ color:var(--ink); background:var(--panel); }
-nav.bottomnav button .dot{ position:absolute; top:2px; left:50%; margin-left:9px; width:7px; height:7px; border-radius:50%; background:var(--blood-bright); display:none; }
-nav.bottomnav button.alert .dot{ display:block; }
-
-/* ---------- Toast ---------- */
-#toast{ position:fixed; bottom:88px; left:50%; transform:translateX(-50%) translateY(20px); background:var(--panel-strong); border:1px solid var(--panel-border-strong); padding:10px 18px; border-radius:999px; font-size:12.5px; z-index:50; opacity:0; transition:opacity .25s ease, transform .25s ease; pointer-events:none; backdrop-filter:blur(10px); color:#fff; }
-#toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
-
-/* ---------- Timeline & End Game ---------- */
-.tl-item{ display:flex; gap:10px; padding:10px 0; border-bottom:1px solid var(--panel-border); }
-.tl-item:last-child{ border-bottom:none; }
-.tl-icon{ width:30px; height:30px; border-radius:9px; background:var(--panel-strong); display:flex; align-items:center; justify-content:center; font-size:14px; flex:none; }
-.tl-text{ font-size:13px; color:var(--ink-dim); padding-top:4px; }
-.tl-head{ font-size:12px; font-weight:700; color:var(--ink); }
-
-.endgame-banner{ text-align:center; padding:28px 16px 22px; }
-.endgame-banner .emoji{ font-size:48px; }
-.endgame-banner h2{ margin:10px 0 2px; font-size:20px; font-weight:800; }
-.endgame-banner p{ color:var(--ink-dim); font-size:13px; margin:0; }
-.reveal-row{ display:flex; align-items:center; justify-content:space-between; padding:11px 4px; border-bottom:1px solid var(--panel-border); }
-.reveal-row:last-child{ border-bottom:none; }
-.reveal-left{ display:flex; align-items:center; gap:10px; }
-.reveal-name{ font-weight:600; font-size:13.5px; }
-.reveal-role{ font-size:12px; color:var(--gold); }
-</style>
-</head>
-<body>
-
-<div id="atmosphere"><div class="fog"></div></div>
-
-<div id="app">
-
-  <!-- Header -->
-  <header class="hdr" id="mainHeader" style="display:none;">
-    <div class="hdr-row">
-      <div class="hdr-disc" id="phaseDisc">🌙</div>
-      <div class="hdr-mid">
-        <div class="hdr-title" id="phaseTitle">در انتظار اتصال…</div>
-        <div class="hdr-sub" id="phaseSub">مافیا</div>
-      </div>
-      <div class="hdr-timer" id="timer">--:--</div>
-    </div>
-    <div class="hdr-meta">
-      <div class="hdr-chip">👥 <b id="aliveCount">–</b> بازیکن زنده</div>
-      <div class="hdr-chip" id="dayNightChip">—</div>
-    </div>
-  </header>
-
-  <main>
-    <!-- VIEW: LOBBY INIT (Create / Join) -->
-    <section class="view active" id="view-lobby-init">
-       <div class="lobby-box">
-          <div style="font-size: 70px; margin-bottom: 5px;">🎭</div>
-          <h2 style="margin-top:0; font-weight:800; font-size:24px;">بازی مافیا</h2>
-          <p style="color: var(--ink-dim); margin-bottom: 40px; font-size:14px;">لابی اختصاصی مینی‌اپ</p>
-          
-          <button class="btn primary" id="btnCreateLobby" style="margin-bottom:12px;">ساخت لابی جدید</button>
-          <button class="btn ghost" id="btnShowJoin">پیوستن به لابی</button>
-       </div>
-       
-       <div class="lobby-box" id="joinLobbyForm" style="display:none; padding-top:0;">
-          <input type="text" dir="ltr" id="inputLobbyCode" class="input-code" placeholder="کد ۵ رقمی" maxlength="5" inputmode="numeric">
-          <button class="btn gold" id="btnJoinLobbySubmit">ورود به بازی</button>
-       </div>
-    </section>
-
-    <!-- VIEW: LOBBY WAIT (Show code & players) -->
-    <section class="view" id="view-lobby-wait">
-       <div class="lobby-box" style="padding-top:20px;">
-          <div class="section-title" style="justify-content:center; font-size:14px;">کد لابی شما</div>
-          <div class="lobby-code-display" dir="ltr" id="displayLobbyCode">-----</div>
-          <button class="btn ghost" id="btnCopyLobbyCode" style="margin:0 0 16px; padding:10px; font-size:13px;">📋 کپی کد لابی</button>
-          <p style="color: var(--ink-dim); font-size:13px; background:var(--panel); padding:10px; border-radius:10px;">این کد را به دوستان خود بدهید تا وارد بازی شوند</p>
-          
-          <div class="lobby-players">
-             <div class="section-title">بازیکنان پیوسته (<span id="lobbyPlayerCount">0</span>)</div>
-             <div id="lobbyPlayersList"></div>
-          </div>
-          
-          <button class="btn primary" id="btnStartGame" style="display:none; margin-top:30px; box-shadow: 0 0 20px rgba(178,58,68,0.4);">شروع بازی</button>
-          <div id="waitingForHostMsg" style="margin-top:30px; color:var(--ink-dim); display:none;">در انتظار میزبان برای شروع بازی...</div>
-       </div>
-    </section>
-
-    <!-- VIEW: CHAT (40s Turn Based) -->
-    <section class="view" id="view-chat">
-       <div class="chat-container">
-          <div class="chat-header">
-             <div class="speaker-name" id="uiSpeakerName">---</div>
-             <div class="speaker-timer" id="uiSpeakerTimer">--:--</div>
-          </div>
-          <div class="chat-messages" id="uiChatMessages"></div>
-          
-          <form class="chat-input-area" id="chatForm">
-             <input type="text" id="uiChatInput" placeholder="فقط در نوبت خود می‌توانید صحبت کنید..." autocomplete="off" disabled>
-             <button type="submit" id="uiChatSend" disabled>ارسال</button>
-          </form>
-       </div>
-    </section>
-
-    <!-- VIEW: PLAYERS -->
-    <section class="view" id="view-players">
-      <div class="section-title">👥 بازیکنان بازی</div>
-      <div class="players-grid" id="playersGrid"></div>
-
-      <div id="deadSection" style="display:none;">
-        <div class="section-title">💀 حذف‌شده‌ها</div>
-        <div class="players-grid" id="deadGrid"></div>
-      </div>
-    </section>
-
-    <!-- VIEW: ROLE & ACTIONS -->
-    <section class="view" id="view-role">
-      <div class="panel" id="rolePanel"></div>
-      <div class="panel" id="actionPanel" style="display:none;"></div>
-    </section>
-
-    <!-- VIEW: VOTING / COURT -->
-    <section class="view" id="view-vote">
-      <div class="panel" id="votePanel"></div>
-    </section>
-
-    <!-- VIEW: TIMELINE / EVENTS -->
-    <section class="view" id="view-events">
-      <div class="section-title">📜 روند بازی</div>
-      <div class="panel" id="timelinePanel">
-        <div class="empty-note"><span class="big">🕯</span>هنوز اتفاقی ثبت نشده</div>
-      </div>
-    </section>
-  </main>
-
-  <!-- Bottom Navigation -->
-  <nav class="bottomnav" id="mainNav" style="display:none;">
-    <button data-tab="lobby-wait" id="navLobbyBtn" style="display:none;"><span class="ico">🃏</span>لابی</button>
-    <button data-tab="players" id="navPlayersBtn"><span class="ico">👥</span>بازیکنان</button>
-    <button data-tab="role" id="navRoleBtn"><span class="ico">🎭</span>نقش من<span class="dot" id="actionDot"></span></button>
-    <button data-tab="chat" id="navChatBtn"><span class="ico">💬</span>چت روز</button>
-    <button data-tab="vote" id="navVoteBtn"><span class="ico">⚖️</span>دادگاه</button>
-    <button data-tab="events" id="navEventsBtn"><span class="ico">📜</span>رویدادها</button>
-  </nav>
-
-</div>
-
-<div id="toast"></div>
-
-<script>
-/* =====================================================================
-   MAFIA MINI APP — FRONTEND LOGIC (Connected to Backend API)
-   ===================================================================== */
-
-const CONFIG = {
-  API_BASE: window.location.origin,
-  POLL_MS: 3000,
-};
-
-const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
-if (tg) { tg.ready(); tg.expand(); try{ tg.setHeaderColor('#0a0b0d'); tg.setBackgroundColor('#0a0b0d'); }catch(e){} }
-
-const qs = new URLSearchParams(location.search);
-let CHAT_ID = qs.get('chat_id') || (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || null;
-
-const ROLE_META = {
-  godfather:{name:'پدرخوانده',emoji:'🎩',team:'مافیا'},
-  lecter:{name:'دکتر لکتر',emoji:'🩺',team:'مافیا'},
-  nato:{name:'ناتو',emoji:'💣',team:'مافیا'},
-  detective:{name:'کارآگاه',emoji:'🔍',team:'شهروند'},
-  doctor:{name:'دکتر',emoji:'💉',team:'شهروند'},
-  sniper:{name:'اسنایپر',emoji:'🎯',team:'شهروند'},
-  mayor:{name:'شهردار',emoji:'🏛',team:'شهروند'},
-  gunner:{name:'تفنگدار',emoji:'🔫',team:'شهروند'},
-  invincible:{name:'رویین‌تن',emoji:'🛡',team:'شهروند'},
-  escort:{name:'اسکورت',emoji:'💋',team:'شهروند'},
-  paranoid:{name:'پارانوئید',emoji:'🧠',team:'شهروند'},
-  johnny:{name:'جانی',emoji:'🔪',team:'مستقل'},
-  joker:{name:'جوکر',emoji:'🤡',team:'مستقل'},
-  bomber:{name:'بمب‌گذار',emoji:'🧨',team:'مستقل'},
-  lonewolf:{name:'گرگ تنها',emoji:'🕵️',team:'مستقل'},
-};
-
-const ACTION_LABEL = {
-  mafia_kill: {title:'انتخاب هدف قتل', cta:'تأیید قتل', icon:'🔪'},
-  heal: {title:'انتخاب فرد برای نجات', cta:'تأیید نجات', icon:'💉'},
-  investigate: {title:'استعلام هویت', cta:'تأیید استعلام', icon:'🔍'},
-  snipe: {title:'انتخاب هدف شلیک', cta:'شلیک', icon:'🎯'},
-  escort_block: {title:'مسدودسازی', cta:'تأیید مسدودسازی', icon:'💋'},
-  nato_guess: {title:'حدس نقش', cta:'تأیید حدس', icon:'💣'},
-  paranoid_alert: {title:'هوشیاری', cta:'هوشیار می‌شوم', icon:'🧠'},
-  johnny_kill: {title:'انتخاب هدف قتل', cta:'تأیید قتل', icon:'🔪'},
-  bomber_mark: {title:'علامت‌گذاری', cta:'تأیید علامت‌گذاری', icon:'🧨'},
-  bomber_explode: {title:'انفجار', cta:'منفجر کن', icon:'💥'},
-  gunner_give_war: {title:'توزیع تفنگ جنگی', cta:'تأیید جنگی', icon:'🔫'},
-  gunner_give_black: {title:'توزیع تفنگ مشقی', cta:'تأیید مشقی', icon:'🔫'},
-  gunner_shot: {title:'شلیک با تفنگ', cta:'شلیک', icon:'🔫'},
-};
-
-let state = { game:null, you:null, selectedTarget:null, selectedRole:null, activeTab:'lobby-init', lastChatLength: 0 };
-let pollTimer = null;
-
-function toast(msg){
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  clearTimeout(t._h);
-  t._h = setTimeout(()=>t.classList.remove('show'), 2200);
-}
-
-function fmtClock(sec){
-  if (sec == null || sec < 0) return '--:--';
-  const m = Math.floor(sec/60), s = Math.floor(sec%60);
-  return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
-}
-function toFa(n){ return String(n).replace(/[0-9]/g, d => '۰۱۲۳۴۵۶۷۸۹'[d]); }
-function escapeHtml(s){ return String(s??'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-
-/* ---------------- API ---------------- */
-async function apiGetState(){
-  if (!CONFIG.API_BASE && !CHAT_ID) throw new Error('Backend not connected');
-  const res = await fetch(\`\${CONFIG.API_BASE}/api/miniapp/state?chat_id=\${encodeURIComponent(CHAT_ID || '')}\`, {
-    headers: { 'X-Telegram-Init-Data': tg ? tg.initData : '' },
-  });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
-}
-
-async function apiPostAction(body){
-  try {
-    const res = await fetch(\`\${CONFIG.API_BASE}/api/miniapp/action\`, {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json', 'X-Telegram-Init-Data': tg ? tg.initData : '' },
-      body: JSON.stringify({ chatId: CHAT_ID, ...body }),
-    });
-    const data = await res.json();
-    if (!data.ok) toast(data.error || 'خطا در ثبت اطلاعات');
-    return data;
-  } catch(e) { toast('ارتباط با سرور برقرار نشد'); return { ok:false }; }
-}
-
-/* ---------------- MAIN LOOP ---------------- */
-async function pollLoop(){
-  if (!CHAT_ID) return;
-  try {
-    const data = await apiGetState();
-    if (data.ok) {
-       state.game = data.game; 
-       state.you = data.you;
-       render();
-    }
-  } catch(e) { }
-}
-
-function startPolling(){
-  pollLoop();
-  clearInterval(pollTimer);
-  pollTimer = setInterval(()=>{ if (!document.hidden) pollLoop(); }, CONFIG.POLL_MS);
-}
-document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) pollLoop(); });
-
-/* ---------------- TAB MANAGEMENT ---------------- */
-function switchTab(tabId) {
-  state.activeTab = tabId;
-  document.querySelectorAll('.bottomnav button').forEach(b => b.classList.remove('active'));
-  const btn = document.querySelector(\`.bottomnav button[data-tab="\${tabId}"]\`);
-  if(btn) btn.classList.add('active');
-  
-  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById(\`view-\${tabId}\`).classList.add('active');
-  if (tg) tg.HapticFeedback && tg.HapticFeedback.impactOccurred('light');
-}
-
-document.querySelectorAll('.bottomnav button').forEach(btn => {
-  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
-});
-
-/* ---------------- LOBBY HANDLERS ---------------- */
-document.getElementById('btnCreateLobby').addEventListener('click', async () => {
-  const res = await apiPostAction({ action: 'create_lobby', api: true });
-  if (res.ok && res.chatId) {
-    CHAT_ID = res.chatId;
-    window.history.replaceState(null, null, \`?chat_id=\${CHAT_ID}\`);
-    startPolling();
-  }
-});
-
-document.getElementById('btnShowJoin').addEventListener('click', () => {
-  document.getElementById('joinLobbyForm').style.display = 'block';
-  document.getElementById('inputLobbyCode').focus();
-});
-
-function toEnDigits(s){
-  return String(s ?? '').replace(/[۰-۹٠-٩]/g, d => {
-    const fa = '۰۱۲۳۴۵۶۷۸۹'.indexOf(d);
-    if (fa !== -1) return String(fa);
-    const ar = '٠١٢٣٤٥٦٧٨٩'.indexOf(d);
-    return ar !== -1 ? String(ar) : d;
-  });
-}
-
-const inputLobbyCodeEl = document.getElementById('inputLobbyCode');
-inputLobbyCodeEl.addEventListener('input', (e) => {
-  e.target.value = toEnDigits(e.target.value).replace(/[^0-9]/g, '').slice(0, 5);
-});
-
-document.getElementById('btnJoinLobbySubmit').addEventListener('click', async () => {
-  const code = toEnDigits(document.getElementById('inputLobbyCode').value.trim());
-  if (!/^\\d{5}$/.test(code)) { toast('کد لابی باید ۵ رقم انگلیسی باشد'); return; }
-  const res = await apiPostAction({ action: 'join_lobby', api: true, code: code });
-  if (res.ok && res.chatId) {
-    CHAT_ID = res.chatId;
-    window.history.replaceState(null, null, \`?chat_id=\${CHAT_ID}\`);
-    startPolling();
-  }
-});
-
-document.getElementById('btnCopyLobbyCode').addEventListener('click', async () => {
-  const code = document.getElementById('displayLobbyCode').textContent.trim();
-  if (!code || code === '-----') return;
-  try {
-    await navigator.clipboard.writeText(code);
-    toast('کد لابی کپی شد');
-  } catch (e) {
-    toast('کپی انجام نشد');
-  }
-});
-
-document.getElementById('btnStartGame').addEventListener('click', async () => {
-  await apiPostAction({ action: 'start_game' });
-  pollLoop();
-});
-
-/* ---------------- RENDER ---------------- */
-const PHASE_META = {
-  lobby:{disc:'🃏', label:'لابی بازی', dn:'day'},
-  night:{disc:'🌙', label:'شب', dn:'night'},
-  inquiry:{disc:'🔎', label:'استعلام شهر', dn:'day'},
-  day:{disc:'☀️', label:'روز', dn:'day'},
-  nomination:{disc:'⚖️', label:'معرفی متهم', dn:'day'},
-  defense:{disc:'🎙', label:'دفاعیه', dn:'day'},
-  verdict:{disc:'🗳', label:'رأی نهایی دادگاه', dn:'day'},
-  resolving:{disc:'⏳', label:'در حال پردازش…', dn:'day'},
-  finished:{disc:'🏁', label:'پایان بازی', dn:'day'},
-};
-
-function render() {
-  const g = state.game, you = state.you;
-  if (!g) return;
-
-  // LOBBY PHASE
-  if (g.phase === 'lobby') {
-    document.getElementById('mainHeader').style.display = 'none';
-    document.getElementById('mainNav').style.display = 'flex';
-    document.getElementById('navLobbyBtn').style.display = 'flex';
-    document.getElementById('navRoleBtn').style.display = 'none';
-    document.getElementById('navChatBtn').style.display = 'none';
-    document.getElementById('navVoteBtn').style.display = 'none';
-    document.getElementById('navEventsBtn').style.display = 'none';
-    
-    if (state.activeTab === 'lobby-init') switchTab('lobby-wait');
-    
-    document.getElementById('displayLobbyCode').textContent = g.lobbyCode || '-----';
-    document.getElementById('lobbyPlayerCount').textContent = toFa((g.players||[]).length);
-    document.getElementById('lobbyPlayersList').innerHTML = (g.players||[]).map(p => \`
-      <div class="player-row">
-        <div style="display:flex; align-items:center; gap:8px;">
-          <span>👤</span> <span>\${escapeHtml(p.displayName)}</span>
-        </div>
-        \${p.isHost ? '<span style="font-size:11px; color:var(--gold);">میزبان</span>' : ''}
-      </div>
-    \`).join('');
-    
-    const isMeHost = (g.players||[]).some(p => p.userId === (you&&you.userId) && p.isHost);
-    document.getElementById('btnStartGame').style.display = isMeHost ? 'block' : 'none';
-    document.getElementById('waitingForHostMsg').style.display = isMeHost ? 'none' : 'block';
-    
-    return;
-  }
-
-  // IN GAME PHASES
-  document.getElementById('mainHeader').style.display = 'block';
-  document.getElementById('mainNav').style.display = 'flex';
-  document.getElementById('navLobbyBtn').style.display = 'none';
-  document.getElementById('navRoleBtn').style.display = 'flex';
-  document.getElementById('navVoteBtn').style.display = 'flex';
-  document.getElementById('navEventsBtn').style.display = 'flex';
-  
-  const isDay = g.phase === 'day';
-  document.getElementById('navChatBtn').style.display = isDay ? 'flex' : 'none';
-  
-  if (state.activeTab === 'lobby-init' || state.activeTab === 'lobby-wait') {
-    switchTab(isDay ? 'chat' : 'role');
-  }
-
-  const meta = PHASE_META[g.phase] || PHASE_META.lobby;
-  const atm = document.getElementById('atmosphere');
-  atm.className = meta.dn === 'night' ? 'is-night' : 'is-day';
-
-  document.getElementById('phaseDisc').textContent = meta.disc;
-  const dayNightNum = g.phase === 'night' ? g.nightNumber : g.dayNumber;
-  document.getElementById('phaseTitle').textContent = \`\${meta.label}\${dayNightNum ? ' ' + toFa(dayNightNum) : ''}\`;
-  document.getElementById('phaseSub').textContent = g.chatTitle || 'مافیا';
-
-  const alive = (g.players||[]).filter(p=>p.status==='alive');
-  document.getElementById('aliveCount').textContent = toFa(alive.length);
-  document.getElementById('dayNightChip').textContent = g.status === 'finished' ? 'پایان بازی' : (meta.dn === 'night' ? \`🌙 شب \${toFa(g.nightNumber||0)}\` : \`☀️ روز \${toFa(g.dayNumber||0)}\`);
-
-  renderTimer(g);
-  renderPlayers(g, you);
-  renderRole(g, you);
-  renderVote(g, you);
-  renderTimeline(g);
-  if (isDay) renderChatState(g, you);
-
-  if (g.status === 'finished') renderEndgame(g, you);
-
-  const hasAction = you && you.availableAction && you.status === 'alive';
-  document.getElementById('actionDot').classList.toggle('alert', !!hasAction);
-}
-
-let timerInterval = null;
-function renderTimer(g){
-  clearInterval(timerInterval);
-  const el = document.getElementById('timer');
-  function tick(){
-    if (!g.phaseEndsAt){ el.textContent='--:--'; el.classList.remove('low'); return; }
-    const left = Math.max(0, Math.round((g.phaseEndsAt - Date.now())/1000));
-    el.textContent = fmtClock(left);
-    el.classList.toggle('low', left <= 10);
-  }
-  tick();
-  timerInterval = setInterval(tick, 1000);
-}
-
-/* ---------------- PLAYERS ---------------- */
-function pcardHTML(p, you, selectable, selected){
-  const isYou = you && p.userId === you.userId;
-  const showRole = isYou || (p.status !== 'alive' && state.game.status === 'finished');
-  const roleInfo = showRole && (p.independentRole || p.role) ? (ROLE_META[p.independentRole || p.role] || {}) : null;
-  return \`
-  <div class="pcard \${p.status!=='alive'?'dead':''} \${isYou?'is-you':''} \${selected?'selected':''}" data-uid="\${p.userId}" data-selectable="\${selectable?1:0}">
-    <div class="pcard-top">
-      <div class="pcard-avatar">\${p.status==='alive' ? '👤' : '💀'}</div>
-      \${isYou ? '<span class="you-badge">شما</span>' : ''}
-    </div>
-    <div class="pcard-name">\${escapeHtml(p.displayName)}</div>
-    <div class="pcard-status \${p.status==='alive'?'alive':'dead'}">\${p.status==='alive' ? '🟢 زنده' : '💀 حذف‌شده'}</div>
-    \${roleInfo ? \`<div class="pcard-role-tag">\${roleInfo.emoji||''} \${roleInfo.name||''}</div>\` : ''}
-  </div>\`;
-}
-
-function renderPlayers(g, you){
-  const players = g.players || [];
-  const alive = players.filter(p=>p.status==='alive');
-  const dead = players.filter(p=>p.status!=='alive');
-  
-  const selectable = you && you.availableAction && you.status==='alive' && you.availableAction.type !== 'paranoid_alert';
-  
-  document.getElementById('playersGrid').innerHTML = alive.map(p =>
-    pcardHTML(p, you, selectable && (you.availableAction.targets||[]).includes(p.userId), state.selectedTarget===p.userId)
-  ).join('') || \`<div class="empty-note">هنوز بازیکنی نیست</div>\`;
-
-  document.getElementById('deadSection').style.display = dead.length ? 'block' : 'none';
-  document.getElementById('deadGrid').innerHTML = dead.map(p => pcardHTML(p, you, false, false)).join('');
-
-  document.querySelectorAll('#playersGrid .pcard[data-selectable="1"]').forEach(card=>{
-    card.addEventListener('click', ()=>{
-      const uid = Number(card.dataset.uid);
-      state.selectedTarget = state.selectedTarget === uid ? null : uid;
-      if (you.availableAction && you.availableAction.type === 'nato_guess') state.selectedRole = null;
-      render();
-    });
-  });
-}
-
-/* ---------------- ROLE & ACTIONS ---------------- */
-function renderRole(g, you){
-  const panel = document.getElementById('rolePanel');
-  if (!you || (!you.role && !you.independentRole)){
-    panel.innerHTML = \`<div class="empty-note"><span class="big">🎭</span>نقش شما هنوز مشخص نشده</div>\`;
-    document.getElementById('actionPanel').style.display='none';
-    return;
-  }
-  
-  const meta = ROLE_META[you.independentRole || you.role] || {name:'—',emoji:'🎭',team:'—'};
-  panel.innerHTML = \`
-    <div class="role-hero">
-      <div class="role-hero-emoji">\${meta.emoji}</div>
-      <div>
-        <div class="role-hero-name">\${meta.name}</div>
-        <div class="role-hero-team">تیم: \${meta.team}</div>
-      </div>
-    </div>
-    <div class="role-desc">\${escapeHtml(you.roleDescription || '')}</div>
-    \${renderRoleStats(you)}
-  \`;
-
-  const actionPanel = document.getElementById('actionPanel');
-  if (you.status !== 'alive'){
-    actionPanel.style.display='block';
-    actionPanel.innerHTML = \`<div class="empty-note"><span class="big">👻</span>شما دیگر در بازی نیستید</div>\`;
-    return;
-  }
-  if (!you.availableAction){
-    if (g.phase === 'night') {
-      actionPanel.style.display='block';
-      actionPanel.innerHTML = \`<div class="empty-note"><span class="big">🌒</span>در این فاز اقدامی برای شما نیست</div>\`;
-    } else {
-      actionPanel.style.display='none';
-    }
-    return;
-  }
-  
-  renderActionPanel(you, g);
-}
-
-function renderRoleStats(you){
-  const chips = [];
-  if (you.natoChancesLeft != null) chips.push(\`<span class="stat-pill">شانس حدس: <b>\${toFa(you.natoChancesLeft)}</b></span>\`);
-  if (you.paranoidAlertLeft != null) chips.push(\`<span class="stat-pill">هوشیاری باقی‌مانده: <b>\${toFa(you.paranoidAlertLeft)}</b></span>\`);
-  if (you.sniperShotsLeft != null) chips.push(\`<span class="stat-pill">تیر باقی‌مانده: <b>\${toFa(you.sniperShotsLeft)}</b></span>\`);
-  if (you.gunnerNightsLeft != null) chips.push(\`<span class="stat-pill">شب‌های توزیع باقی‌مانده: <b>\${toFa(you.gunnerNightsLeft)}</b></span>\`);
-  return chips.length ? \`<div class="role-stats">\${chips.join('')}</div>\` : '';
-}
-
-function renderActionPanel(you, g){
-  const panel = document.getElementById('actionPanel');
-  panel.style.display = 'block';
-  
-  const act = you.availableAction;
-  const info = ACTION_LABEL[act.type] || {title:'انتخاب هدف', cta:'تأیید', icon:'🎯'};
-  const targets = (g.players||[]).filter(p => (act.targets||[]).includes(p.userId));
-
-  let isConfirmDisabled = state.selectedTarget == null;
-
-  let natoRolesHtml = '';
-  if (act.type === 'nato_guess' && state.selectedTarget != null) {
-    const roles = act.guessableRoles || [];
-    isConfirmDisabled = state.selectedRole == null;
-    natoRolesHtml = \`
-      <div class="section-title">انتخاب نقش (ناتو)</div>
-      <div class="targets nato-roles">
-        \${roles.map(r => \`<div class="target-row \${state.selectedRole === r.id ? 'picked' : ''}" data-role="\${r.id}">
-          <div class="tname">\${r.emoji} \${escapeHtml(r.name)}</div>
-          <div class="radio-dot"></div>
-        </div>\`).join('')}
-      </div>
-    \`;
-  }
-
-  let bomberExplodeHtml = '';
-  if (act.type === 'bomber_mark' && act.canExplode) {
-    bomberExplodeHtml = \`<button class="btn primary" style="margin-top:16px;" id="btnExplode">💥 منفجر کردن بمب‌ها (\${toFa(act.markedCount||0)} نفر)</button>\`;
-  }
-
-  let targetsHtml = '';
-  if (act.type !== 'paranoid_alert') {
-    targetsHtml = \`
-      <div class="targets" id="targetList">
-        \${targets.map(t => \`
-          <div class="target-row \${state.selectedTarget===t.userId?'picked':''}" data-uid="\${t.userId}">
-            <div>
-              <div class="tname">\${escapeHtml(t.displayName)}\${t.userId===you.userId?' (خودم)':''}</div>
-            </div>
-            <div class="radio-dot"></div>
-          </div>\`).join('')}
-      </div>
-    \`;
-  } else {
-    isConfirmDisabled = false;
-    targetsHtml = \`<div class="empty-note" style="padding-top:0;">آیا می‌خواهید امشب هوشیار شوید؟ (در صورت حمله به شما، حمله‌کننده کشته می‌شود)</div>\`;
-  }
-
-  panel.innerHTML = \`
-    <div class="section-title" style="margin-top:0;">\${info.icon} \${info.title}</div>
-    \${targetsHtml}
-    \${natoRolesHtml}
-    \${bomberExplodeHtml}
-    <div class="btn-row">
-      \${act.skipLabel ? \`<button class="btn ghost" id="btnSkip">\${escapeHtml(act.skipLabel)}</button>\` : ''}
-      <button class="btn primary" id="btnConfirm" \${isConfirmDisabled ? 'disabled':''}>\${info.cta}</button>
-    </div>
-  \`;
-
-  if (act.type !== 'paranoid_alert') {
-    panel.querySelectorAll('#targetList .target-row').forEach(row=>{
-      row.addEventListener('click', ()=>{
-        state.selectedTarget = Number(row.dataset.uid);
-        if (act.type === 'nato_guess') state.selectedRole = null;
-        renderActionPanel(you, g);
-        renderPlayers(g, you);
-      });
-    });
-  }
-
-  if (act.type === 'nato_guess') {
-    panel.querySelectorAll('.nato-roles .target-row').forEach(row=>{
-      row.addEventListener('click', ()=>{
-        state.selectedRole = row.dataset.role;
-        renderActionPanel(you, g);
-      });
-    });
-  }
-
-  document.getElementById('btnSkip')?.addEventListener('click', async ()=>{
-    let payload = { action: act.type, targetId: null };
-    if (act.type === 'paranoid_alert') payload.targetId = 0; 
-    await apiPostAction(payload);
-    state.selectedTarget = null;
-    state.selectedRole = null;
-    toast('اقدام رد شد');
-    pollLoop();
-  });
-
-  document.getElementById('btnExplode')?.addEventListener('click', async ()=>{
-    await apiPostAction({ action: 'bomber_explode' });
-    state.selectedTarget = null;
-    toast('بمب‌ها منفجر شدند!');
-    pollLoop();
-  });
-
-  document.getElementById('btnConfirm').addEventListener('click', async ()=>{
-    if (isConfirmDisabled) return;
-    let payload = { action: act.type };
-    if (act.type === 'paranoid_alert') {
-      payload.targetId = you.userId;
-    } else {
-      payload.targetId = state.selectedTarget;
-      if (act.type === 'nato_guess') payload.targetRole = state.selectedRole;
-    }
-
-    const res = await apiPostAction(payload);
-    if (res.ok){ toast('ثبت شد'); state.selectedTarget = null; state.selectedRole = null; if (tg) tg.HapticFeedback && tg.HapticFeedback.notificationOccurred('success'); }
-    pollLoop();
-  });
-}
-
-/* ---------------- TURN BASED CHAT ---------------- */
-function renderChatState(g, you) {
-  if (g.phase !== 'day') return;
-  
-  const currentSpeakerId = g.currentSpeakerId;
-  const isMyTurn = (currentSpeakerId === (you && you.userId));
-  const currentSpeaker = (g.players||[]).find(p => p.userId === currentSpeakerId);
-  
-  const nameEl = document.getElementById('uiSpeakerName');
-  if (currentSpeaker) {
-     nameEl.innerHTML = isMyTurn ? \`🎙 شما <span style="font-size:12px; color:var(--ink-dim);">(درحال صحبت)</span>\` : \`🎙 \${escapeHtml(currentSpeaker.displayName)}\`;
-     nameEl.className = \`speaker-name \${isMyTurn ? 'is-me' : ''}\`;
-  } else {
-     nameEl.innerHTML = \`---\`;
-  }
-  
-  const timerEl = document.getElementById('uiSpeakerTimer');
-  const timeLeft = g.speakerTimeLeft || 0;
-  timerEl.textContent = \`00:\${String(timeLeft).padStart(2,'0')}\`;
-  timerEl.classList.toggle('urgent', timeLeft <= 10);
-  
-  const inputEl = document.getElementById('uiChatInput');
-  const btnEl = document.getElementById('uiChatSend');
-  
-  if (isMyTurn) {
-    inputEl.disabled = false;
-    btnEl.disabled = false;
-    if (inputEl.placeholder !== "تایپ کنید...") inputEl.placeholder = "تایپ کنید...";
-  } else {
-    inputEl.disabled = true;
-    btnEl.disabled = true;
-    if (inputEl.placeholder !== "فقط در نوبت خود می‌توانید صحبت کنید...") inputEl.placeholder = "فقط در نوبت خود می‌توانید صحبت کنید...";
-  }
-  
-  // Render Messages efficiently
-  const chatMessages = g.miniAppChat || [];
-  if (chatMessages.length !== state.lastChatLength) {
-     const container = document.getElementById('uiChatMessages');
-     container.innerHTML = chatMessages.map(msg => {
-        if (msg.isSystem) return \`<div class="chat-msg system">\${escapeHtml(msg.text)}</div>\`;
-        const isMine = you && msg.senderId === you.userId;
-        const d = new Date(msg.time);
-        const timeStr = \`\${String(d.getHours()).padStart(2,'0')}:\${String(d.getMinutes()).padStart(2,'0')}\`;
-        return \`
-          <div class="chat-msg \${isMine ? 'mine' : 'others'}">
-            <div class="sender">\${escapeHtml(msg.senderName)}</div>
-            <div class="text">\${escapeHtml(msg.text)}</div>
-            <div class="time">\${timeStr}</div>
-          </div>
-        \`;
-     }).join('');
-     container.scrollTop = container.scrollHeight;
-     state.lastChatLength = chatMessages.length;
-  }
-}
-
-document.getElementById('chatForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const input = document.getElementById('uiChatInput');
-  const text = input.value.trim();
-  if (text) {
-    input.value = '';
-    const res = await apiPostAction({ action: 'chat_send', text: text });
-    if (res.ok) pollLoop(); // immediate fetch to show my message
-  }
-});
-
-
-/* ---------------- VOTING ---------------- */
-function renderVote(g, you){
-  const panel = document.getElementById('votePanel');
-  if (g.phase === 'nomination') renderNomination(panel, g, you);
-  else if (g.phase === 'defense') renderDefense(panel, g);
-  else if (g.phase === 'verdict') renderVerdict(panel, g, you);
-  else if (g.phase === 'inquiry') renderInquiry(panel, g, you);
-  else panel.innerHTML = \`<div class="empty-note"><span class="big">⚖️</span>الان رأی‌گیری فعالی نیست</div>\`;
-}
-
-function tallyVotes(votes, players){
-  const byTarget = {};
-  (votes||[]).forEach(v=>{
-    if (v.targetId == null) return;
-    byTarget[v.targetId] = (byTarget[v.targetId]||0) + (v.weight||1);
-  });
-  const max = Math.max(1, ...Object.values(byTarget), 1);
-  return { byTarget, max };
-}
-
-function renderNomination(panel, g, you){
-  const alive = (g.players||[]).filter(p=>p.status==='alive');
-  const { byTarget, max } = tallyVotes(g.votes, alive);
-  const myVote = (g.votes||[]).find(v=>v.voterId === (you&&you.userId));
-  
-  panel.innerHTML = \`
-    <div class="section-title" style="margin-top:0;">⚖️ چه کسی باید به دادگاه برود؟</div>
-    <div class="vote-bar-wrap">
-      \${alive.map(p=>{
-        const v = byTarget[p.userId]||0;
-        return \`<div class="vote-row" data-uid="\${p.userId}">
-          <div class="vote-row-top"><span class="vn">\${escapeHtml(p.displayName)}</span><span class="vc">\${toFa(v)} رأی</span></div>
-          <div class="vote-track"><div class="vote-fill" style="width:\${(v/max)*100}%"></div></div>
-        </div>\`;
-      }).join('')}
-    </div>
-    \${you && you.status==='alive' ? \`<div class="btn-row"><button class="btn ghost" id="btnAbstain">\${myVote && myVote.targetId===null ? '✓ ممتنع' : 'ممتنع'}</button></div>\` : ''}
-  \`;
-  if (you && you.status==='alive'){
-    panel.querySelectorAll('.vote-row').forEach(row=>{
-      row.addEventListener('click', async ()=>{
-        await apiPostAction({ action:'vote_nominate', targetId: Number(row.dataset.uid) });
-        toast('رأی ثبت شد'); pollLoop();
-      });
-    });
-    document.getElementById('btnAbstain')?.addEventListener('click', async ()=>{
-      await apiPostAction({ action:'vote_nominate', targetId: null });
-      toast('ممتنع ثبت شد'); pollLoop();
-    });
-  }
-}
-
-function renderDefense(panel, g){
-  const accused = (g.players||[]).find(p=>p.userId === g.accusedUserId);
-  panel.innerHTML = \`
-    <div class="section-title" style="margin-top:0;">🎙 زمان دفاعیه</div>
-    <div class="empty-note">
-      <span class="big">🎙</span>
-      \${accused ? escapeHtml(accused.displayName) + ' در حال دفاع از خودش است' : 'در انتظار دفاعیه'}
-    </div>
-  \`;
-}
-
-function renderVerdict(panel, g, you){
-  const myVerdict = (g.verdictVotes||[]).find(v=>v.voterId === (you&&you.userId));
-  const guilty = (g.verdictVotes||[]).filter(v=>v.guilty).reduce((s,v)=>s+(v.weight||1),0);
-  const innocent = (g.verdictVotes||[]).filter(v=>!v.guilty).reduce((s,v)=>s+(v.weight||1),0);
-  const total = Math.max(1, guilty+innocent);
-  const accused = (g.players||[]).find(p=>p.userId === g.accusedUserId);
-  
-  panel.innerHTML = \`
-    <div class="section-title" style="margin-top:0;">🗳 رأی نهایی — \${accused ? escapeHtml(accused.displayName) : ''}</div>
-    <div class="vote-row">
-      <div class="vote-row-top"><span class="vn">مجرم</span><span class="vc">\${toFa(guilty)}</span></div>
-      <div class="vote-track"><div class="vote-fill" style="width:\${(guilty/total)*100}%"></div></div>
-    </div>
-    <div class="vote-row">
-      <div class="vote-row-top"><span class="vn">بی‌گناه</span><span class="vc">\${toFa(innocent)}</span></div>
-      <div class="vote-track"><div class="vote-fill" style="width:\${(innocent/total)*100}%"></div></div>
-    </div>
-    \${you && you.status==='alive' && you.userId !== g.accusedUserId ? \`
-    <div class="btn-row">
-      <button class="btn ghost" id="btnInnocent">\${myVerdict && !myVerdict.guilty ? '✓ ' : ''}بی‌گناه</button>
-      <button class="btn primary" id="btnGuilty">\${myVerdict && myVerdict.guilty ? '✓ ' : ''}مجرم</button>
-    </div>\` : ''}
-  \`;
-  if (you && you.status==='alive' && you.userId !== g.accusedUserId){
-    document.getElementById('btnGuilty')?.addEventListener('click', async ()=>{ await apiPostAction({action:'vote_verdict', guilty:true}); toast('رأی مجرم ثبت شد'); pollLoop(); });
-    document.getElementById('btnInnocent')?.addEventListener('click', async ()=>{ await apiPostAction({action:'vote_verdict', guilty:false}); toast('رأی بی‌گناه ثبت شد'); pollLoop(); });
-  }
-}
-
-function renderInquiry(panel, g, you){
-  const myVote = (g.inquiryVotes||[]).find(v=>v.voterId === (you&&you.userId));
-  panel.innerHTML = \`
-    <div class="section-title" style="margin-top:0;">🔎 استعلام شهر</div>
-    <div class="empty-note" style="padding-bottom:10px;"><span class="big">🔎</span>آیا با استعلام نقش‌های خارج شده موافقت می‌کنید؟</div>
-    \${you && you.status === 'alive' ? \`
-      <div class="btn-row">
-        <button class="btn ghost" id="btnInqNo">\${myVote && myVote.choice===false ? '✓ ' : ''}مخالفم</button>
-        <button class="btn primary" id="btnInqYes">\${myVote && myVote.choice===true ? '✓ ' : ''}موافقم</button>
-      </div>
-    \` : ''}
-  \`;
-  if (you && you.status === 'alive') {
-    document.getElementById('btnInqYes')?.addEventListener('click', async ()=>{ await apiPostAction({ action:'vote_inquiry', choice:true }); toast('رأی موافق ثبت شد'); pollLoop(); });
-    document.getElementById('btnInqNo')?.addEventListener('click', async ()=>{ await apiPostAction({ action:'vote_inquiry', choice:false }); toast('رأی مخالف ثبت شد'); pollLoop(); });
-  }
-}
-
-/* ---------------- EVENTS / TIMELINE ---------------- */
-function renderTimeline(g){
-  const panel = document.getElementById('timelinePanel');
-  const items = g.timeline || [];
-  if (!items.length){
-    panel.innerHTML = \`<div class="empty-note"><span class="big">🕯</span>هنوز اتفاقی ثبت نشده</div>\`;
-    return;
-  }
-  panel.innerHTML = items.map(it => \`
-    <div class="tl-item">
-      <div class="tl-icon">\${it.icon||'•'}</div>
-      <div>
-        <div class="tl-head">\${escapeHtml(it.head||'')}</div>
-        <div class="tl-text">\${escapeHtml(it.text||'')}</div>
-      </div>
-    </div>
-  \`).join('');
-}
-
-/* ---------------- END GAME ---------------- */
-function renderEndgame(g, you){
-  const panel = document.getElementById('votePanel');
-  const winnerLabel = { mafia:'🎭 مافیا برنده شد', town:'🏘 شهروندان برنده شدند', independent:'🃏 مستقل برنده شد' }[g.winner] || 'بازی تمام شد';
-  panel.innerHTML = \`
-    <div class="endgame-banner">
-      <div class="emoji">🏆</div>
-      <h2>\${winnerLabel}</h2>
-      <p>نتیجه نهایی بازی</p>
-    </div>
-    <div>
-      \${(g.players||[]).map(p=>{
-        const meta = ROLE_META[p.independentRole || p.role] || {};
-        return \`<div class="reveal-row">
-          <div class="reveal-left"><span>\${p.status==='alive'?'🟢':'💀'}</span><span class="reveal-name">\${escapeHtml(p.displayName)}</span></div>
-          <span class="reveal-role">\${meta.emoji||''} \${meta.name||'—'}</span>
-        </div>\`;
-      }).join('')}
-    </div>
-  \`;
-}
-
-/* ---------------- BOOT ---------------- */
-if (CHAT_ID) {
-  document.getElementById('view-lobby-init').classList.remove('active');
-  startPolling();
-}
-</script>
-</body>
-</html>
-`;
-
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS users (
   telegram_id INTEGER PRIMARY KEY,
@@ -1260,8 +231,7 @@ export type DeathReason =
   | "left"
   | "host"
   | "joker"
-  | "admin_kill"
-  | "role_leak";
+  | "admin_kill";
 
 export type NightActionType =
   | "mafia_kill"
@@ -1348,6 +318,16 @@ export interface Player {
   // "پدرخوانده (ناتو سابق)") — does not affect any game logic, abilities,
   // or the succession system itself.
   promotedFrom?: "lecter" | "nato";
+  // Player-authored private note, only ever shown after this player dies
+  // (see publishNotes). Never exposed while alive, never includes role/
+  // side/death-reason info — purely the player's own text.
+  note?: string | null;
+  notePosted?: boolean;
+  // Transient flag: set while we're waiting for this player's next private
+  // text message to be saved as their note (set by the "📝 یادداشت" button,
+  // cleared as soon as the note is captured). Not meaningful once the game
+  // ends and never displayed anywhere.
+  awaitingNote?: boolean;
 }
 
 export interface NightAction {
@@ -1453,11 +433,6 @@ export interface GameState {
   lobbyCode: string | null;
   dayStartedAt: number | null;
   miniAppChat: Array<{id: number, senderId: number, senderName: string, text: string, time: number, isSystem: boolean}>;
-  // Anti role-leak system: per-user warning count for THIS game only (keyed
-  // by userId as a string, since GameState is persisted as JSON). Reset to
-  // empty for every new game — never shared across games. See
-  // handleGroupTextForRoleLeak / eliminateForRoleLeak.
-  roleLeakWarnings: Record<string, number>;
   // True only for lobbies created directly in the mini app (chatId is a synthetic
   // negative number, not a real Telegram group). Group-only mechanics — admin checks,
   // permission locking/unlocking, posting to "the group" — don't apply and must be
@@ -1541,20 +516,11 @@ export function isPlayingStatus(status: GameStatus): boolean {
   );
 }
 
-// Minimal typing for the Cloudflare Workers AI binding (no external package
-// needed). Add `[ai]\nbinding = "AI"` to wrangler.toml to enable it.
-export interface Ai {
-  run(model: string, inputs: Record<string, unknown>): Promise<unknown>;
-}
-
 export interface Env {
   DB: D1Database;
   GAME_ROOM: DurableObjectNamespace;
   BOT_TOKEN: string;
   WEBHOOK_SECRET: string;
-  // Cloudflare Workers AI binding — free, no API key needed. Requires
-  // `[ai]` / `binding = "AI"` in wrangler.toml.
-  AI: Ai;
 }
 
 
@@ -1795,11 +761,23 @@ export interface InlineKeyboardButton {
 
 export type InlineKeyboard = InlineKeyboardButton[][];
 
+// Real persistent Telegram Reply Keyboard (bottom-of-screen button grid) —
+// distinct from InlineKeyboard (buttons attached under one message). Used
+// only for the "📝 یادداشت" note button (see mainReplyKeyboard). Once sent,
+// Telegram keeps showing it to the user on every future message in that
+// chat until it's explicitly replaced or removed, so we only need to send
+// it, not re-send it with every message.
+export interface ReplyKeyboardMarkup {
+  keyboard: { text: string }[][];
+  resize_keyboard?: boolean;
+  is_persistent?: boolean;
+}
+
 export interface SendMessageExtra {
   parse_mode?: "HTML" | "Markdown" | "MarkdownV2";
   reply_markup?: {
     inline_keyboard: InlineKeyboard;
-  };
+  } | ReplyKeyboardMarkup;
   disable_notification?: boolean;
   disable_web_page_preview?: boolean;
   reply_to_message_id?: number;
@@ -2095,6 +1073,20 @@ export function memberToSaved(
 // =============================================================================
 // KEYBOARDS
 // =============================================================================
+
+// Label for the persistent private-chat Reply Keyboard's Note button (see
+// ReplyKeyboardMarkup). Matched verbatim against incoming private text in
+// onMessage to start/edit the note flow, so this constant is the single
+// source of truth for the button's label.
+export const NOTE_BUTTON_LABEL = "📝 یادداشت";
+
+export function mainReplyKeyboard(): ReplyKeyboardMarkup {
+  return {
+    keyboard: [[{ text: NOTE_BUTTON_LABEL }]],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+}
 
 export function playerButtons(
   players: Player[],
@@ -2602,20 +1594,49 @@ export function checkWinner(players: Player[]): Team | null {
 export function checkIndependentWinner(players: Player[], game: GameState): Team | null {
   const alive = living(players);
   const indie = alive.filter(p => p.independentRole);
-  
+
   for (const p of indie) {
     if (p.independentRole === "joker") {
       // Joker wins by being lynched - this is checked in the verdict phase
       continue;
     }
-    if (p.independentRole === "lonewolf" || p.independentRole === "bomber") {
-      // Lonewolf and bomber win outright if they're the only one left alive
+    // Johnny and Bomber: outright win the moment only 2 players remain
+    // alive and one of them is this player, regardless of which side/team
+    // the other survivor belongs to. Checked before the "last one standing"
+    // rule below (and must be checked by callers BEFORE checkWinner, so a
+    // mafia/town win never pre-empts it — see call sites).
+    if (p.independentRole === "johnny" || p.independentRole === "bomber") {
+      if (alive.length === 2 && alive.some((a) => a.userId === p.userId)) {
+        return "independent";
+      }
+    }
+    if (p.independentRole === "lonewolf" || p.independentRole === "bomber" || p.independentRole === "johnny") {
+      // Lonewolf, bomber, and johnny win outright if they're the only one left alive
       if (alive.length === 1 && p.userId === alive[0]?.userId) {
         return "independent";
       }
     }
   }
-  
+
+  return null;
+}
+
+// Identifies which living independent player (if any) just met the
+// "only 2 players alive, I'm one of them" or "I'm the sole survivor"
+// outright win condition — used purely to pick the right dedicated
+// victory message (johnnyWins/bomberWins) once checkIndependentWinner
+// has already returned "independent". Does not itself decide the winner.
+export function findOutrightIndependentWinner(players: Player[]): Player | null {
+  const alive = living(players);
+  const indie = alive.filter((p) => p.independentRole);
+  for (const p of indie) {
+    if (p.independentRole === "johnny" || p.independentRole === "bomber") {
+      if (alive.length === 2 && alive.some((a) => a.userId === p.userId)) return p;
+    }
+    if (p.independentRole === "lonewolf" || p.independentRole === "bomber" || p.independentRole === "johnny") {
+      if (alive.length === 1 && p.userId === alive[0]?.userId) return p;
+    }
+  }
   return null;
 }
 
@@ -3592,19 +2613,6 @@ export const fa = {
   reasonLeft: "ترک گروه",
   reasonJoker: "حذف جوکر (برد)",
   reasonAdminKill: "حذف توسط مدیریت",
-  reasonRoleLeak: "نقض قوانین بازی",
-
-  roleLeakWarned(count: number, limit: number): string {
-    return `⚠️ پیام شما در گروه به دلیل احتمال لو دادن نقش/اطلاعات بازی حذف شد.\nاخطار ${count} از ${limit}.\nدر صورت تکرار، از بازی حذف خواهید شد.`;
-  },
-
-  roleLeakEliminated(limit: number): string {
-    return `🚫 به دلیل دریافت ${limit} اخطار برای لو دادن نقش، از بازی حذف شدید.`;
-  },
-
-  roleLeakGroupNotice(name: string, userId: number): string {
-    return `🚫 ${mention(userId, name)} به دلیل نقض قوانین بازی از بازی حذف شد.`;
-  },
 
   gunnerReceivedGun: "🔫 شما یک تفنگ دریافت کردید.",
 
@@ -3782,6 +2790,22 @@ export const fa = {
     ].join("\n");
   },
 
+  johnnyWins(name: string): string {
+    return [
+      "🏆 <b>🔪 جانی برنده شد!</b>",
+      "",
+      `فقط ۲ بازیکن زنده باقی ماندند و ${esc(name)} یکی از آن‌ها بود — جانی شرط برد خود را محقق کرد.`,
+    ].join("\n");
+  },
+
+  bomberWins(name: string): string {
+    return [
+      "🏆 <b>🧨 بمب‌گذار برنده شد!</b>",
+      "",
+      `فقط ۲ بازیکن زنده باقی ماندند و ${esc(name)} یکی از آن‌ها بود — بمب‌گذار شرط برد خود را محقق کرد.`,
+    ].join("\n");
+  },
+
   status(game: GameState): string {
     const alive = game.players.filter((p) => p.status === "alive");
     const dead = game.players.filter((p) => p.status !== "alive");
@@ -3841,6 +2865,19 @@ export const fa = {
   },
   mafiaChatMessage(sender: string, text: string): string {
     return [`👤 <b>${esc(sender)}</b>`, "", esc(text)].join("\n");
+  },
+
+  // "📝 یادداشت" Reply Keyboard button flow (see NOTE_BUTTON_LABEL /
+  // mainReplyKeyboard). Note text itself is player-authored and is echoed
+  // back verbatim (via esc()) — never enriched with role/side/death info.
+  noteOnlyInGame: "این قابلیت فقط مربوط به یک بازی فعال است.",
+  noteDeadCantSet: "💀 بازیکن حذف‌شده نمی‌تواند یادداشت جدید ثبت کند.",
+  notePromptNew: "📝 یادداشت خود را ارسال کنید:\n\nاین یادداشت فقط بعد از مرگ شما در گروه نمایش داده می‌شود.",
+  notePromptEdit: "📝 یادداشت جدید خود را ارسال کنید (جایگزین یادداشت قبلی می‌شود):\n\nاین یادداشت فقط بعد از مرگ شما در گروه نمایش داده می‌شود.",
+  noteEmpty: "متن یادداشت نمی‌تواند خالی باشد. دوباره تلاش کنید.",
+  noteSaved: "✅ یادداشت شما ذخیره شد.",
+  notePublished(text: string): string {
+    return ["📝 <b>یادداشت بازیکن</b>", "", esc(text)].join("\n");
   },
   investigation(target: string, result: string): string {
     return `🔍 استعلام ${esc(target)}: <b>${result}</b>`;
@@ -4036,150 +3073,6 @@ export async function addKillAdmin(db: D1Database, userId: number, addedBy: numb
     .prepare("INSERT INTO kill_admins (user_id, added_by, created_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO NOTHING")
     .bind(userId, addedBy, Date.now())
     .run();
-}
-
-// =============================================================================
-// ANTI ROLE-LEAK SYSTEM
-//
-// Two-stage pipeline for group text messages:
-//   1) Cheap local keyword filter (this array) — pure trigger, decides
-//      nothing on its own. No match -> message is ignored, no API call.
-//   2) On a match, the message is sent to OpenAI for real judgement.
-//      See checkRoleLeakWithAI / handleGroupTextForRoleLeak in GameRoom.
-//
-// Edit ROLE_LEAK_TRIGGER_WORDS freely; matching is case-insensitive
-// substring matching over the raw message text.
-// =============================================================================
-
-export const ROLE_LEAK_WARNING_LIMIT = 3;
-export const ROLE_LEAK_CONFIDENCE_THRESHOLD = 0.6;
-export const ROLE_LEAK_AI_TIMEOUT_MS = 4000;
-export const ROLE_LEAK_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct";
-
-
-export const ROLE_LEAK_TRIGGER_WORDS: string[] = [
-  // نام نقش‌ها (فارسی)
-  "دکتر", "پزشک", "کارگاه", "کارآگاه", "جاسوس", "اسنایپر", "تک‌تیرانداز", "تک تیرانداز",
-  "پارانوئید", "پارانویید", "اسکورت", "مافیا", "گادفادر", "پدرخوانده", "جانی",
-  "بمب‌گذار", "بمب گذار", "بمبی", "نتو", "تفنگدار", "گانر", "مستقل",
-  // نام نقش‌ها (انگلیسی)
-  "doctor", "sniper", "godfather", "escort", "gunner", "bomber",
-  // فعل/عبارت‌های اکشن شب
-  "سیو کردم", "نجات دادم", "شب زدم", "شب رفتم سراغ", "هدف گرفتم", "شلیک کردم",
-  "زدمش", "کشتمش", "چک کردم", "تحقیق کردم", "شناسایی کردم", "انفجار دادم",
-  "علامت زدم", "بلاک کردم", "هوشیار شدم", "هوشیار بودم", "حدس زدم", "گارد دادم",
-  "محافظت کردم", "اسلحه دادم",
-  // اعتراف مستقیم
-  "من نقشم", "نقش من", "من هستم", "من بودم", "دیشب من", "شب گذشته من", "امشب من",
-  // کلمات عمومی مشکوک
-  "اطلاعات دارم", "فهمیدم کیه", "مطمئنم چون", "دیدم که", "تاییدشده", "صد در صد",
-  "از منبع مطمئن", "شب دیدمش",
-  // اشاره غیرمستقیم به نتیجه اکشن
-  "پیام گرفتم", "به من گفتن", "نتیجه گرفتم", "جواب اومد", "تاییدیه گرفتم",
-  // اشاره به تیم مافیا
-  "هم‌تیمی", "هم‌تیمیم", "تیممون", "دوستم توی بازی", "رفقای شب",
-  // واکنش‌های هیجانی بعد از اطلاعات
-  "وای فهمیدم", "وای دیدم", "باورت نمیشه کی", "شوکه شدم از", "الان فهمیدم کی",
-  // اشاره به دفاع در برابر حمله
-  "جون سالم به در بردم", "نجات پیدا کردم", "حمله بهم شد ولی", "امشب هدف بودم ولی",
-  // اشاره به محدودیت استفاده
-  "دیگه ندارم", "بار آخرم بود", "تمومه ظرفیتم", "فقط یه بار دیگه دارم",
-];
-
-export function containsRoleLeakTrigger(text: string): boolean {
-  const lower = text.toLowerCase();
-  return ROLE_LEAK_TRIGGER_WORDS.some((word) => lower.includes(word.toLowerCase()));
-}
-
-// Names of only the roles actually in play THIS game (from assignRoles),
-// not every possible role — used to scope the OpenAI system prompt.
-export function activeRoleNamesForGame(game: GameState): string[] {
-  const names = new Set<string>();
-  for (const p of game.players) {
-    if (p.role) names.add(ROLES[p.role].name);
-    if (p.independentRole) names.add(INDEPENDENT_ROLES[p.independentRole].name);
-  }
-  return [...names];
-}
-
-export interface RoleLeakVerdict {
-  leak: boolean;
-  confidence: number;
-  reason: string;
-}
-
-// Calls Cloudflare Workers AI to judge whether `text` leaks a role/night-action.
-// Returns null on ANY failure (timeout, binding missing, bad/unparseable
-// response) so the caller can fail open — a broken model must never block
-// or crash the game.
-export async function checkRoleLeakWithAI(
-  env: Env,
-  text: string,
-  activeRoleNames: string[],
-): Promise<RoleLeakVerdict | null> {
-  if (!env.AI) {
-    console.error("checkRoleLeakWithAI: no AI binding on env — add [ai] binding = \"AI\" to wrangler.toml");
-    return null;
-  }
-
-  const systemPrompt =
-    "تو یه ناظر بازی مافیا هستی. وظیفه‌ت اینه که بررسی کنی آیا یک پیام توی چت گروه، نقش بازی یکی از بازیکن‌ها رو مستقیم یا غیرمستقیم لو می‌ده یا نه.\n" +
-    `نقش‌های فعال در این بازی: ${activeRoleNames.length ? activeRoleNames.join("، ") : "نامشخص"}\n` +
-    "مهم: تو نمی‌دونی کدوم بازیکن چه نقشی داره و نباید حدس بزنی یا نامی از بازیکن خاص در جواب بیاری. فقط باید تشخیص بدی خودِ متن پیام چیزی درباره نقش/اکشن شبانه گوینده یا شخص دیگه فاش می‌کنه یا نه.\n" +
-    "مواردی که لو دادن حساب می‌شه: اعتراف مستقیم به نقش، اشاره به اکشن شب انجام‌شده، اشاره به نتیجه قابلیت نقش، اشاره به محدودیت استفاده نقش، اشاره به هم‌تیمی بودن در تیم مافیا.\n" +
-    "مواردی که لو دادن حساب نمی‌شه: حدس و گمان عمومی، استدلال منطقی بر اساس رفتار بیرونی بازی، بحث کلی درباره قوانین.\n" +
-    'فقط این JSON رو برگردون، بدون هیچ متن اضافه، بدون Markdown، بدون ```: {"leak": true/false, "confidence": 0 تا 1, "reason": "دلیل کوتاه فارسی"}';
-
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error("workers-ai-timeout")), ROLE_LEAK_AI_TIMEOUT_MS);
-  });
-
-  try {
-    const result = await Promise.race([
-      env.AI.run(ROLE_LEAK_AI_MODEL, {
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: text },
-        ],
-        temperature: 0,
-      }),
-      timeout,
-    ]);
-
-    // Workers AI chat models normally return { response: string }, but be
-    // lenient in case the shape differs across model versions.
-    let raw: string | undefined;
-    if (typeof result === "string") raw = result;
-    else if (result && typeof result === "object" && typeof (result as any).response === "string") {
-      raw = (result as any).response;
-    }
-    if (!raw) {
-      console.error("checkRoleLeakWithAI: no text in Workers AI response", JSON.stringify(result).slice(0, 500));
-      return null;
-    }
-
-    // Strip ```json ... ``` fences in case the model wraps its output.
-    const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
-
-    const parsed = JSON.parse(cleaned) as Partial<RoleLeakVerdict>;
-    if (typeof parsed.leak !== "boolean" || typeof parsed.confidence !== "number") {
-      console.error("checkRoleLeakWithAI: malformed verdict JSON", raw);
-      return null;
-    }
-
-    return {
-      leak: parsed.leak,
-      confidence: parsed.confidence,
-      reason: typeof parsed.reason === "string" ? parsed.reason : "",
-    };
-  } catch (err) {
-    // Timeout, binding error, or JSON parse error — fail open.
-    console.error("checkRoleLeakWithAI failed, leaving message untouched", err);
-    return null;
-  } finally {
-    clearTimeout(timeoutId);
-  }
 }
 
 // =============================================================================
@@ -4535,104 +3428,6 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/miniapp/")) {
-      const userId = Number(request.headers.get("X-User-Id"));
-      const userName = request.headers.get("X-User-Name") || "کاربر";
-
-      if (url.pathname === "/api/miniapp/state") {
-        return this.handleApiState(userId);
-      }
-      if (url.pathname === "/api/miniapp/action") {
-        const body = await request.json();
-
-        if (body.api && body.action === "create_lobby") {
-           const vChatId = -1000000000 - userId;
-
-           // BUGFIX (root cause of the persistent "already in a game" lock):
-           // this handler used to always build a brand-new GameState with a
-           // fresh id and persist(true) it, WITHOUT ever calling
-           // scheduleAlarm/schedulePhaseTimers the way cmdNew() does for real
-           // groups. Two compounding effects:
-           //  1) An abandoned virtual lobby (created, never started, never
-           //     cancelled — e.g. a test) had no alarm armed, so it could
-           //     never auto-expire via advancePhase's lobbyExpired path. It
-           //     just sat in D1 with status "lobby" forever.
-           //  2) findActiveGameForUser() treats ANY game with status not in
-           //     ('finished','cancelled','idle') as "the user is busy" — for
-           //     the host AND for every player who joined it. So a single
-           //     forgotten test lobby permanently blocked every account that
-           //     touched it from ever joining a game again, anywhere.
-           //  3) Worse, tapping "create" again didn't fix it: since game.id
-           //     is regenerated each call, every retry just inserted ANOTHER
-           //     orphaned "lobby" row in D1 for the same virtual chat instead
-           //     of replacing the old one.
-           // Fix: reuse an existing un-started lobby for this exact virtual
-           // chat instead of recreating it, refuse to stomp on a game that's
-           // actually in progress, refuse to create a second lobby if the
-           // user is already active elsewhere (mirrors addPlayer's "busy"
-           // rule for the real /join flow), proactively close out any stale
-           // D1 row for this virtual chat before making a new one, and — the
-           // actual missing piece — arm the lobby-expiry alarm so a lobby
-           // nobody ever starts or cancels cleans itself up on its own.
-           if (this.game && this.game.chatId === vChatId && this.game.status === "lobby") {
-             return Response.json({ ok: true, chatId: vChatId });
-           }
-           if (this.game && this.game.chatId === vChatId && isActiveStatus(this.game.status)) {
-             return Response.json({ ok: false, error: "شما یک بازی متنی فعال دارید. اول آن را از داخل بازی لغو کنید." });
-           }
-           const alreadyElsewhere = await findActiveGameForUser(this.env.DB, userId);
-           if (alreadyElsewhere && alreadyElsewhere.chat_id !== vChatId) {
-             return Response.json({ ok: false, error: fa.alreadyInGame("بازی دیگر") });
-           }
-           await cancelActiveGamesForChat(this.env.DB, vChatId);
-
-           // Create a virtual room (mini-app-only lobby, not tied to a Telegram group)
-           const ts = now();
-           const host: Player = { userId, username: null, firstName: userName, displayName: userName, role: null, team: null, independentRole: null, status: "alive" as PlayerStatus, originalMember: null, joinedAt: ts };
-           this.game = {
-               id: randomId("g"), chatId: vChatId, chatTitle: "گروه مینی‌اپ", hostId: userId, status: "lobby", phase: "lobby", dayNumber: 0, nightNumber: 0,
-               phaseEndsAt: ts + DEFAULT_CONFIG.lobbySeconds * 1000, dayPhaseMaxEndsAt: null, reminderAt: null, nextTickAt: null, alarmKind: "phase_end",
-               players: [host], nightActions: [], votes: [], verdictVotes: [], inquiryVotes: [], cityInquiryCount: CITY_INQUIRY_TOTAL, pendingInquiryDeaths: null,
-               accusedUserId: null, temporaryCourtAdminUserId: null, silencedUserIds: [], blockedUserIds: [], escortBlockedUserIds: [], doctorSelfHealUsedBy: [],
-               sniperShotsLeft: {}, detectiveChecked: {}, godfatherRevealed: false, natoChancesLeft: 2, paranoidAlertLeft: 2, bomberMarkedTargets: [], invincibleShieldHits: {}, gunnerGuns: {},
-               gunnerNightsUsed: 0, gunnerWarGunsGiven: 0, gunnerBlackGunsGiven: 0, independentRoleType: null, savedDefaultPermissions: null, lastGroupMessageId: null, pinnedMessageId: null, botPinnedMessageIds: [], winner: null,
-               botUsername: "mafia_bot", botId: 0, config: { ...DEFAULT_CONFIG }, createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
-               lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [], isVirtual: true,
-               roleLeakWarnings: {},
-           };
-           await this.persist(true);
-           await this.scheduleAlarm(this.game.phaseEndsAt ?? ts + DEFAULT_CONFIG.lobbySeconds * 1000);
-           return Response.json({ ok: true, chatId: vChatId });
-        }
-
-        if (body.api && body.action === "join_lobby") {
-           if (!this.game) return Response.json({ ok: false, error: "No game" });
-           // BUGFIX (was missing in the draft): reject joins once the game has left the lobby
-           // phase, instead of silently letting a late joiner attach mid-round.
-           if (this.game.status !== "lobby") return Response.json({ ok: false, error: "بازی قبلاً شروع شده است" });
-           if (this.game.players.length >= this.game.config.maxPlayers) return Response.json({ ok: false, error: "لابی پر است" });
-           if (findPlayer(this.game.players, userId)) return Response.json({ ok: true, chatId: this.game.chatId });
-           // BUGFIX: this path never checked whether the joining user already has
-           // an active game elsewhere (real group or another virtual lobby) — the
-           // exact same "busy" rule addPlayer() enforces for /join was silently
-           // skipped here, so a user stuck/active in one game could still pile
-           // into a second one through the mini-app.
-           const alreadyElsewhere = await findActiveGameForUser(this.env.DB, userId);
-           if (alreadyElsewhere && alreadyElsewhere.chat_id !== this.game.chatId) {
-             return Response.json({ ok: false, error: fa.alreadyInGame("بازی دیگر") });
-           }
-
-           const newPlayer: Player = { userId, username: null, firstName: userName, displayName: userName, role: null, team: null, independentRole: null, status: "alive" as PlayerStatus, originalMember: null, joinedAt: now() };
-           this.game.players.push(newPlayer);
-           await this.persist(true);
-           return Response.json({ ok: true, chatId: this.game.chatId });
-        }
-
-        return this.handleApiAction(userId, userName, body);
-      }
-    }
-
     if (request.method !== "POST") return new Response("ok");
     const update = (await request.json()) as TgUpdate;
     const result = await this.handleUpdate(update);
@@ -4761,6 +3556,7 @@ export class GameRoom extends DurableObject<Env> {
       if (parsed?.cmd === "help") { await this.tg.sendMessage(from.id, fa.helpPrivate); return; }
       if (parsed?.cmd === "myrole") { await this.sendMyRole(from.id); return; }
       if (parsed) { await this.tg.sendMessage(from.id, fa.mafiaChatCommandsIgnored); return; }
+      if (await this.handleNoteFlow(from.id, text)) return;
       await this.handleMafiaNightChat(msg);
       return;
     }
@@ -4768,9 +3564,7 @@ export class GameRoom extends DurableObject<Env> {
     if (msg.chat.type !== "supergroup" && msg.chat.type !== "group") return;
     const parsed = parseCommand(text);
     if (!parsed) {
-      // Plain (non-command) group text — run it through the anti role-leak
-      // pipeline before dropping it, same as before.
-      await this.handleGroupTextForRoleLeak(msg);
+      // Plain (non-command) group text — nothing to do with it.
       return;
     }
 
@@ -5104,7 +3898,6 @@ export class GameRoom extends DurableObject<Env> {
       botUsername: me?.username ?? null, botId: me?.id ?? null, config: { ...DEFAULT_CONFIG },
       createdAt: ts, updatedAt: ts, startedAt: null, finishedAt: null,
       lobbyCode: String(Math.floor(10000 + Math.random() * 90000)), dayStartedAt: null, miniAppChat: [], isVirtual: false,
-      roleLeakWarnings: {},
     };
 
     // IMPORTANT: send the lobby announcement BEFORE committing anything to storage/D1.
@@ -5496,10 +4289,7 @@ export class GameRoom extends DurableObject<Env> {
     const game = this.game;
     if (!game) return;
     if (game.temporaryCourtAdminUserId) await this.removeTemporaryCourtAdmin(game.temporaryCourtAdminUserId);
-    const winner = checkWinner(game.players);
-    if (winner) { await this.finish(winner); return; }
-    const indieWinner = checkIndependentWinner(game.players, game);
-    if (indieWinner) { await this.finish(indieWinner); return; }
+    if (await this.checkAndHandleWin()) return;
 
     game.nightNumber += 1;
     game.dayNumber = game.nightNumber;
@@ -5530,10 +4320,7 @@ export class GameRoom extends DurableObject<Env> {
   private async enterDay(resolutionText: string): Promise<void> {
     const game = this.game;
     if (!game) return;
-    let winner = checkWinner(game.players);
-    if (winner) { await this.group(resolutionText); await this.finish(winner); return; }
-    const indieWinner = checkIndependentWinner(game.players, game);
-    if (indieWinner) { await this.group(resolutionText); await this.finish(indieWinner); return; }
+    if (await this.checkAndHandleWin(resolutionText)) return;
 
     // FIX #7: Schedule a fallback alarm BEFORE we start the (potentially-failing)
     // day phase. If anything below throws (rate-limited Telegram call to
@@ -5723,6 +4510,7 @@ export class GameRoom extends DurableObject<Env> {
     game.sniperShotsLeft = consumeSniperShots(game, game.nightActions.filter((a) => a.nightNumber === game.nightNumber && a.type === "snipe"));
     game.players = applyDeaths(game.players, res.deaths, "night", game.nightNumber);
     await this.notifyLecterSuccession(res.deaths);
+    await this.publishNotes(res.deaths);
 
     for (const a of game.nightActions) {
       if (a.nightNumber === game.nightNumber && a.type === "heal" && a.targetId === a.actorId && !game.doctorSelfHealUsedBy.includes(a.actorId)) {
@@ -5813,10 +4601,7 @@ export class GameRoom extends DurableObject<Env> {
     // and finish directly — the morning report above already covers the
     // "someone tell me who died" need, no point locking the group for a
     // vote nobody will get to act on.
-    const winner = checkWinner(game.players);
-    if (winner) { await this.finish(winner); return; }
-    const indieWinner = checkIndependentWinner(game.players, game);
-    if (indieWinner) { await this.finish(indieWinner); return; }
+    if (await this.checkAndHandleWin()) return;
 
     if (res.deaths.length > 0 && game.cityInquiryCount > 0) {
       await this.startInquiry(res.deaths, game.dayNumber);
@@ -5955,6 +4740,7 @@ export class GameRoom extends DurableObject<Env> {
       if (accused.independentRole === "joker") {
         game.players = applyDeaths(game.players, [{ userId: accusedId, reason: "joker", revealedRole: accused.role!, revealedIndependentRole: "joker" }], "verdict", game.dayNumber);
         await this.notifyLecterSuccession([{ userId: accusedId, reason: "joker", revealedRole: accused.role! }]);
+        await this.publishNotes([{ userId: accusedId, reason: "joker", revealedRole: accused.role! }]);
         await this.mutePlayer(accusedId);
         await this.persist(true);
         await this.group(fa.jokerWins(accused.displayName));
@@ -5964,6 +4750,7 @@ export class GameRoom extends DurableObject<Env> {
 
       game.players = applyDeaths(game.players, [{ userId: accusedId, reason: "lynch", revealedRole: accused.role!, revealedIndependentRole: accused.independentRole ?? undefined }], "verdict", game.dayNumber);
       await this.notifyLecterSuccession([{ userId: accusedId, reason: "lynch", revealedRole: accused.role! }]);
+      await this.publishNotes([{ userId: accusedId, reason: "lynch", revealedRole: accused.role! }]);
       await this.mutePlayer(accusedId);
     }
 
@@ -5973,11 +4760,38 @@ export class GameRoom extends DurableObject<Env> {
     await addEvent(this.env.DB, game.id, "verdict_resolved", res);
     if (accused && stillAlive) await this.group(fa.verdictResult(accused.displayName, accused.userId, res, accused.team));
 
-    let winner = checkWinner(game.players);
-    if (winner) { await this.finish(winner); return; }
-    const indieWinner = checkIndependentWinner(game.players, game);
-    if (indieWinner) { await this.finish(indieWinner); return; }
+    if (await this.checkAndHandleWin()) return;
     await this.enterNight();
+  }
+
+  // Central win check used after every death/kill/elimination point in the
+  // game. Order matters: checkIndependentWinner MUST run before checkWinner,
+  // otherwise a mafia/town team win (e.g. mafia >= town) can pre-empt an
+  // Independent (Johnny/Bomber) who has already met their own outright win
+  // condition (only 2 players alive, one of them being Johnny/Bomber — see
+  // checkIndependentWinner). This is the ONLY place that decides + announces
+  // an independent outright win before finishing, so every call site should
+  // use this instead of calling checkWinner/checkIndependentWinner/finish
+  // directly. Returns true if the game ended (caller should stop).
+  private async checkAndHandleWin(preMessage?: string): Promise<boolean> {
+    const game = this.game;
+    if (!game) return false;
+    const indieWinner = checkIndependentWinner(game.players, game);
+    const winner = indieWinner ?? checkWinner(game.players);
+    if (!winner) return false;
+    if (preMessage) await this.group(preMessage);
+    if (indieWinner) {
+      const outrightWinner = findOutrightIndependentWinner(game.players);
+      if (outrightWinner?.independentRole === "johnny") {
+        await this.group(fa.johnnyWins(outrightWinner.displayName));
+      } else if (outrightWinner?.independentRole === "bomber") {
+        await this.group(fa.bomberWins(outrightWinner.displayName));
+      }
+      await this.finish(indieWinner);
+      return true;
+    }
+    await this.finish(winner);
+    return true;
   }
 
   private async finish(winner: Team): Promise<void> {
@@ -6211,14 +5025,12 @@ export class GameRoom extends DurableObject<Env> {
 
     game.players = applyDeaths(game.players, [{ userId: target.userId, reason: "gunner", revealedRole: target.role!, revealedIndependentRole: target.independentRole ?? undefined }], "day", game.dayNumber);
     await this.notifyLecterSuccession([{ userId: target.userId, reason: "gunner", revealedRole: target.role! }]);
+    await this.publishNotes([{ userId: target.userId, reason: "gunner", revealedRole: target.role! }]);
     await this.mutePlayer(target.userId);
     await this.persist(true);
     await this.group(fa.playerDied(target.displayName, target.userId, target.team, fa.reasonGunner));
 
-    let winner = checkWinner(game.players);
-    if (winner) { await this.finish(winner); return { text: "شلیک انجام شد", alert: false }; }
-    const indieWinner = checkIndependentWinner(game.players, game);
-    if (indieWinner) { await this.finish(indieWinner); return { text: "شلیک انجام شد", alert: false }; }
+    await this.checkAndHandleWin();
     return { text: "شلیک انجام شد", alert: false };
   }
 
@@ -6443,7 +5255,13 @@ export class GameRoom extends DurableObject<Env> {
     const results = await Promise.allSettled(
       game.players.map((p) => {
         const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
-        return this.pm(p.userId, fa.roleCard(p, mates));
+        // Attach the persistent Reply Keyboard (📝 یادداشت) here too — this
+        // is the very first private message each player gets at game start,
+        // so it's the earliest natural point to show it, matching sendMyRole.
+        return this.tg.callSafe("sendMessage", {
+          chat_id: p.userId, text: fa.roleCard(p, mates), parse_mode: "HTML", disable_web_page_preview: true,
+          reply_markup: mainReplyKeyboard(),
+        });
       }),
     );
     const failedPlayers = game.players.filter((_, i) => results[i]?.status === "rejected");
@@ -6599,14 +5417,88 @@ export class GameRoom extends DurableObject<Env> {
     if (minutes >= 1) await this.group(fa.countdownRemain(minutes));
   }
 
+  // Handles the "📝 یادداشت" Reply Keyboard button and the note-text reply
+  // that follows it. Returns true if this message was consumed by the note
+  // flow (so the caller — onMessage — must not also treat it as mafia night
+  // chat or anything else). Entirely private-chat only; never touches the
+  // group. Uses the same central game/player lookup and persist() as every
+  // other private-chat action in the game — no parallel storage.
+  private async handleNoteFlow(userId: number, text: string): Promise<boolean> {
+    const trimmed = text.trim();
+    const isButtonPress = trimmed === NOTE_BUTTON_LABEL;
+    const game = this.game;
+
+    if (isButtonPress) {
+      if (!game || !isActiveStatus(game.status)) { await this.tg.sendMessage(userId, fa.noteOnlyInGame); return true; }
+      const p = findPlayer(game.players, userId);
+      if (!p) { await this.tg.sendMessage(userId, fa.noteOnlyInGame); return true; }
+      if (p.status !== "alive") { await this.tg.sendMessage(userId, fa.noteDeadCantSet); return true; }
+      p.awaitingNote = true;
+      await this.persist(true);
+      await this.tg.sendMessage(userId, p.note ? fa.notePromptEdit : fa.notePromptNew);
+      return true;
+    }
+
+    // Not the button — only consume this message if we're actually waiting
+    // on this player's note text right now.
+    if (!game || !isActiveStatus(game.status)) return false;
+    const p = findPlayer(game.players, userId);
+    if (!p || !p.awaitingNote) return false;
+
+    if (p.status !== "alive") {
+      // Player died between pressing the button and sending the text —
+      // don't record a note they're no longer allowed to set.
+      p.awaitingNote = false;
+      await this.persist(true);
+      await this.tg.sendMessage(userId, fa.noteDeadCantSet);
+      return true;
+    }
+
+    if (!trimmed) { await this.tg.sendMessage(userId, fa.noteEmpty); return true; }
+
+    p.note = trimmed;
+    p.notePosted = false;
+    p.awaitingNote = false;
+    await this.persist(true);
+    // Explicitly restore the main Reply Keyboard so the note-taking prompt
+    // never leaves the user's keyboard in an inconsistent state (it wasn't
+    // touched, but re-sending it here is a cheap guarantee, not a new
+    // parallel keyboard system).
+    await this.tg.sendMessage(userId, fa.noteSaved, { reply_markup: mainReplyKeyboard() });
+    return true;
+  }
+
+  // Publishes any just-died player's saved note to the group, exactly once
+  // each (guarded by notePosted), with zero extra info (no role/side/death
+  // reason — see fa.notePublished). Called right after every applyDeaths()
+  // call, mirroring notifyLecterSuccession's placement — the single set of
+  // call sites that already covers every death path in the game (night
+  // resolution, lynch, joker self-elimination, gunner shot, host/left
+  // removal, kill-admin).
+  private async publishNotes(deaths: DeathRecord[]): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    for (const d of deaths) {
+      const p = findPlayer(game.players, d.userId);
+      if (!p || !p.note || p.notePosted) continue;
+      await this.group(fa.notePublished(p.note));
+      p.notePosted = true;
+    }
+  }
+
   private async sendMyRole(userId: number): Promise<void> {
     const game = this.game;
     if (!game || !isActiveStatus(game.status)) { await this.tg.sendMessage(userId, fa.notPlaying); return; }
     const p = findPlayer(game.players, userId);
     if (!p) { await this.tg.sendMessage(userId, fa.notPlaying); return; }
-    if (p.status !== "alive" && p.role) { await this.tg.sendMessage(userId, fa.myRoleDead(p.role, p.independentRole)); return; }
+    // Attach the persistent Reply Keyboard (📝 یادداشت button) here — this
+    // is the main private-chat entry point (/start and /myrole both land
+    // here) while a game is active, so this is the natural single place to
+    // make sure it's showing, without re-sending it on every unrelated
+    // private message.
+    if (p.status !== "alive" && p.role) { await this.tg.sendMessage(userId, fa.myRoleDead(p.role, p.independentRole), { reply_markup: mainReplyKeyboard() }); return; }
     const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
-    await this.tg.sendMessage(userId, fa.roleCard(p, mates));
+    await this.tg.sendMessage(userId, fa.roleCard(p, mates), { reply_markup: mainReplyKeyboard() });
   }
 
   // Runs the Lecter->Godfather succession check and — if it fired — tells
@@ -6629,11 +5521,16 @@ export class GameRoom extends DurableObject<Env> {
     if (!p || p.status !== "alive" || !p.role) return;
     game.players = applyDeaths(game.players, [{ userId, reason, revealedRole: p.role, revealedIndependentRole: p.independentRole }], game.phase, game.phase === "night" ? game.nightNumber : game.dayNumber);
     await this.notifyLecterSuccession([{ userId, reason, revealedRole: p.role }]);
+    await this.publishNotes([{ userId, reason, revealedRole: p.role }]);
     await this.mutePlayer(userId);
     await this.persist(true);
     await this.group(fa.playerDied(p.displayName, p.userId, p.team, reason === "left" ? fa.reasonLeft : fa.reasonLynch));
-    let winner = checkWinner(game.players);
-    if (winner) await this.finish(winner);
+    // BUGFIX: this previously only called checkWinner (mafia/town), never
+    // checkIndependentWinner — so a player leaving/being removed could
+    // silently skip an Independent (Johnny/Bomber) win that the death just
+    // triggered. Now goes through the same central win check as every
+    // other death path.
+    await this.checkAndHandleWin();
   }
 
   // ===========================================================================
@@ -6668,82 +5565,13 @@ export class GameRoom extends DurableObject<Env> {
       game.phase === "night" ? game.nightNumber : game.dayNumber,
     );
     await this.notifyLecterSuccession([{ userId: player.userId, reason: "admin_kill", revealedRole: player.role }]);
+    await this.publishNotes([{ userId: player.userId, reason: "admin_kill", revealedRole: player.role }]);
     await this.mutePlayer(player.userId);
     await this.persist(true);
     await this.group(fa.playerDied(player.displayName, player.userId, player.team, fa.reasonAdminKill));
-    const winner = checkWinner(game.players);
-    if (winner) await this.finish(winner);
-  }
-
-  // Anti role-leak pipeline, run on every plain (non-command) group message.
-  // Stage 1 (local keyword filter) happens first and is free — only a match
-  // triggers the OpenAI call. See ROLE_LEAK_TRIGGER_WORDS / checkRoleLeakWithAI.
-  private async handleGroupTextForRoleLeak(msg: TgMessage): Promise<void> {
-    const from = msg.from;
-    const text = msg.text ?? "";
-    if (!from || !text) return;
-
-    const game = this.game;
-    if (!game || !isActiveStatus(game.status)) return;
-
-    const player = findPlayer(game.players, from.id);
-    if (!player || player.status !== "alive" || (!player.role && !player.independentRole)) return; // not a live player in this game — nothing to check.
-
-    if (!containsRoleLeakTrigger(text)) return; // stage 1 filter: no trigger word, no API call.
-
-    const verdict = await checkRoleLeakWithAI(this.env, text, activeRoleNamesForGame(game));
-    // Fail open on timeout/error/low confidence: the message is left untouched
-    // and nothing else happens, so a broken API can never block the game.
-    if (!verdict || !verdict.leak || verdict.confidence < ROLE_LEAK_CONFIDENCE_THRESHOLD) return;
-
-    const delRes = await this.tg.callSafe("deleteMessage", { chat_id: game.chatId, message_id: msg.message_id });
-    if (!delRes.ok) console.error("role-leak deleteMessage failed", delRes.error.description);
-
-    const key = String(from.id);
-    const count = (game.roleLeakWarnings[key] ?? 0) + 1;
-    game.roleLeakWarnings[key] = count;
-    await this.persist(true);
-
-    // Internal-only diagnostic log (raw AI verdict + message text). Never
-    // surfaced in the group or any user-facing output.
-    console.log("role-leak detected", {
-      chatId: game.chatId, userId: from.id, warnCount: count,
-      confidence: verdict.confidence, aiReason: verdict.reason, text,
-    });
-
-    await this.pm(from.id, fa.roleLeakWarned(count, ROLE_LEAK_WARNING_LIMIT));
-
-    if (count >= ROLE_LEAK_WARNING_LIMIT) {
-      await this.eliminateForRoleLeak(player.userId);
-    }
-  }
-
-  // Removes a player immediately for accumulating ROLE_LEAK_WARNING_LIMIT
-  // role-leak warnings. Deliberately mirrors cmdKill's elimination exactly
-  // (same applyDeaths/notifyLecterSuccession/mutePlayer path) so this is an
-  // unconditional admin-style removal — NOT a role action — and is never
-  // affected by protective roles like Doctor or Paranoid.
-  private async eliminateForRoleLeak(userId: number): Promise<void> {
-    const game = this.game;
-    if (!game) return;
-    const player = findPlayer(game.players, userId);
-    if (!player || player.status !== "alive" || (!player.role && !player.independentRole)) return;
-
-    game.players = applyDeaths(
-      game.players,
-      [{ userId: player.userId, reason: "role_leak", revealedRole: player.role, revealedIndependentRole: player.independentRole }],
-      game.phase,
-      game.phase === "night" ? game.nightNumber : game.dayNumber,
-    );
-    await this.notifyLecterSuccession([{ userId: player.userId, reason: "role_leak", revealedRole: player.role }]);
-    await this.mutePlayer(player.userId);
-    await this.pm(player.userId, fa.roleLeakEliminated(ROLE_LEAK_WARNING_LIMIT));
-    await this.persist(true);
-    // Group only learns "removed for a rules violation" — never the internal
-    // reason, filtered words, or the message content that triggered it.
-    await this.group(fa.roleLeakGroupNotice(player.displayName, player.userId));
-    const winner = checkWinner(game.players);
-    if (winner) await this.finish(winner);
+    // BUGFIX: same as eliminate() above — must also check the Independent
+    // (Johnny/Bomber) win condition, not just mafia/town.
+    await this.checkAndHandleWin();
   }
 
   private async cmdAddKill(msg: TgMessage): Promise<void> {
@@ -7135,8 +5963,6 @@ export class GameRoom extends DurableObject<Env> {
         const snapshot = JSON.parse(gameRow.state_json) as GameState;
         if (snapshot && typeof snapshot === "object" && snapshot.id === gameRow.id) {
           this.game = snapshot;
-          // Safety default for games saved before roleLeakWarnings existed.
-          if (!this.game.roleLeakWarnings) this.game.roleLeakWarnings = {};
           await this.persist();
           if (isActiveStatus(this.game.status)) await this.ensureAlarm();
           return;
@@ -7315,182 +6141,10 @@ export class GameRoom extends DurableObject<Env> {
       dayStartedAt: null,
       miniAppChat: [],
       isVirtual: false,
-      roleLeakWarnings: {}, // not persisted per-column to D1; unavoidable gap on cold recovery
     };
 
     await this.persist();
     if (isActiveStatus(this.game.status)) await this.ensureAlarm();
-  }
-
-  private async handleApiState(userId: number): Promise<Response> {
-    if (!this.game) return Response.json({ ok: false, error: "No game" });
-    const g = this.game;
-    const p = findPlayer(g.players, userId);
-
-    let availableAction: any = null;
-    let youStatus = p ? p.status : 'left';
-    let roleDescription = p?.role ? (ROLES[p.role]?.description || '') : (p?.independentRole ? (INDEPENDENT_ROLES[p.independentRole]?.description || '') : '');
-
-    if (p && p.status === 'alive') {
-      if (g.status === 'night') {
-        if (p.independentRole === 'bomber') {
-            availableAction = { type: 'bomber_mark', targets: nightTargetsFor(g.players, userId, 'bomber_mark').map(x=>x.userId), canExplode: g.bomberMarkedTargets.length > 0, markedCount: g.bomberMarkedTargets.length, skipLabel: '⏭ رد کردن این شب' };
-        } else if (p.independentRole === 'johnny') {
-             availableAction = { type: 'johnny_kill', targets: nightTargetsFor(g.players, userId, 'johnny_kill').map(x=>x.userId), skipLabel: '⏭ امشب قتل نمی‌کنم' };
-        } else if (p.independentRole === 'lonewolf') {
-             availableAction = { type: 'investigate', targets: nightTargetsFor(g.players, userId, 'investigate').map(x=>x.userId), skipLabel: '⏭ رد کردن این شب' };
-        } else if (p.role === 'paranoid') {
-             if (g.paranoidAlertLeft > 0) availableAction = { type: 'paranoid_alert', skipLabel: '❌ نمی‌خواهم امشب هوشیار باشم' };
-        } else if (p.role === 'gunner') {
-             if (g.gunnerNightsUsed < 2) {
-                 const { warGiven, blackGiven } = this.gunnerNightGunStatus(g, userId, g.nightNumber);
-                 if (!warGiven) availableAction = { type: 'gunner_give_war', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive').map(x=>x.userId), skipLabel: '⏭ امشب تفنگ نمی‌دهم' };
-                 else if (!blackGiven) availableAction = { type: 'gunner_give_black', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive' && !g.nightActions.some(a=>a.actorId===userId&&a.type==="gunner_give_war"&&a.targetId===x.userId)).map(x=>x.userId) };
-             }
-        } else if (p.role === 'nato') {
-             if (g.natoChancesLeft > 0) availableAction = { type: 'nato_guess', targets: nightTargetsFor(g.players, userId, 'nato_guess').map(x=>x.userId), guessableRoles: gameRolesInPlay(g), skipLabel: '⏭ رد کردن این شب' };
-        } else {
-             const def = ROLES[p.role!];
-             if (def?.nightAction) availableAction = { type: def.nightAction, targets: nightTargetsFor(g.players, userId, def.nightAction, { includeSelf: def.id === 'doctor' || def.id === 'lecter' }).map(x=>x.userId), skipLabel: (def.nightOptional || def.id === 'doctor' || def.id === 'lecter') ? '⏭ امشب رد می‌کنم' : null };
-        }
-      } else if (g.status === 'day') {
-          const guns = g.gunnerGuns[String(userId)] ?? [];
-          if (guns.length > 0) availableAction = { type: 'gunner_shot', targets: g.players.filter(x=>x.userId !== userId && x.status === 'alive').map(x=>x.userId) };
-      }
-    }
-
-    // TURN BASED CHAT CALCULATION (40 SECONDS)
-    let currentSpeakerId = null;
-    let speakerEndsAt = null;
-    let speakerTimeLeft = 0;
-
-    if (g.status === 'day' && g.dayStartedAt) {
-       const alive = g.players.filter(x => x.status === 'alive');
-       if (alive.length > 0) {
-           const elapsed = now() - g.dayStartedAt;
-           const turnDuration = 40000;
-           const turnIndex = Math.floor(elapsed / turnDuration);
-           const speaker = alive[turnIndex % alive.length];
-           currentSpeakerId = speaker.userId;
-           speakerEndsAt = g.dayStartedAt + (turnIndex + 1) * turnDuration;
-           speakerTimeLeft = Math.max(0, Math.ceil((speakerEndsAt - now()) / 1000));
-       }
-    }
-
-    const sanitizedGame = {
-      chatId: g.chatId,
-      status: g.status,
-      phase: g.phase,
-      dayNumber: g.dayNumber,
-      nightNumber: g.nightNumber,
-      chatTitle: g.chatTitle,
-      phaseEndsAt: g.phaseEndsAt,
-      winner: g.winner,
-      accusedUserId: g.accusedUserId,
-      lobbyCode: g.lobbyCode,
-      votes: g.votes,
-      verdictVotes: g.verdictVotes,
-      inquiryVotes: g.inquiryVotes,
-      timeline: [],
-      currentSpeakerId,
-      speakerEndsAt,
-      speakerTimeLeft,
-      miniAppChat: g.miniAppChat || [],
-      players: g.players.map(x => ({
-          userId: x.userId,
-          displayName: x.displayName,
-          status: x.status,
-          isHost: x.userId === g.hostId,
-          role: g.status === 'finished' ? x.role : null,
-          independentRole: g.status === 'finished' ? x.independentRole : null,
-          deathReason: x.deathReason,
-          team: g.status === 'finished' ? x.team : null,
-      }))
-    };
-
-    return Response.json({
-      ok: true,
-      game: sanitizedGame,
-      you: p ? {
-          userId: p.userId, status: youStatus, role: p.role, independentRole: p.independentRole, team: p.team, roleDescription, availableAction,
-          natoChancesLeft: g.natoChancesLeft, paranoidAlertLeft: g.paranoidAlertLeft,
-          sniperShotsLeft: p.role === 'sniper' ? (g.sniperShotsLeft[String(userId)] ?? 0) : null,
-          gunnerNightsLeft: p.role === 'gunner' ? Math.max(0, 2 - g.gunnerNightsUsed) : null,
-      } : null
-    });
-  }
-
-  private async handleApiAction(userId: number, userName: string, body: any): Promise<Response> {
-    const { action, targetId, targetRole, guilty, choice, text } = body;
-    const g = this.game;
-    if (!g) return Response.json({ ok: false, error: "No game" });
-
-    // LEAVE / CANCEL LOBBY (mini-app previously had no way to get out of a
-    // created/joined virtual lobby at all — this is what lets a user
-    // un-stick themselves instead of being permanently locked out of every
-    // future game. Reuses leavePlayer(), the exact same logic the text/group
-    // /leave command uses: a regular player is just removed, but the host
-    // (or the last remaining player) leaving cancels the whole lobby.)
-    if (action === "leave_lobby" || action === "cancel_lobby") {
-        if (g.status !== "lobby") return Response.json({ ok: false, error: "بازی در جریان است؛ ابتدا آن را از میان بازی لغو کنید." });
-        await this.leavePlayer(userId, true);
-        return Response.json({ ok: true });
-    }
-
-    // START GAME
-    if (action === "start_game") {
-        if (g.hostId !== userId) return Response.json({ ok: false, error: "شما میزبان نیستید" });
-        if (g.status !== "lobby") return Response.json({ ok: false, error: "بازی قبلاً شروع شده است" });
-        if (g.players.length < g.config.minPlayers) return Response.json({ ok: false, error: `حداقل ${g.config.minPlayers} بازیکن لازم است` });
-        if (g.players.length > g.config.maxPlayers) return Response.json({ ok: false, error: `حداکثر ${g.config.maxPlayers} بازیکن مجاز است` });
-        await this.cmdStartGame(userId, g.chatId);
-        // cmdStartGame is shared with the text-command flow and reports failures by
-        // posting to the group (or, for a virtual lobby, dropping them silently) rather
-        // than returning them — so the only reliable signal here is whether the game
-        // actually left the lobby phase.
-        if (this.game && this.game.status === "lobby") {
-          return Response.json({ ok: false, error: "شروع بازی ناموفق بود؛ همه بازیکنان باید ربات را استارت کرده باشند" });
-        }
-        return Response.json({ ok: true });
-    }
-
-    // CHAT SEND (40s turn-based logic)
-    if (action === "chat_send") {
-        if (g.status !== 'day' || !g.dayStartedAt) return Response.json({ ok: false, error: "چت غیرفعال است" });
-        // BUGFIX: reject empty/whitespace-only messages instead of pushing blank chat bubbles.
-        if (typeof text !== "string" || !text.trim()) return Response.json({ ok: false, error: "پیام خالی است" });
-        const alive = g.players.filter(x => x.status === 'alive');
-        const turnDuration = 40000;
-        const turnIndex = Math.floor((now() - g.dayStartedAt) / turnDuration);
-        const speaker = alive[turnIndex % alive.length];
-
-        if (!speaker || speaker.userId !== userId) {
-            return Response.json({ ok: false, error: "نوبت شما نیست" });
-        }
-
-        if (!g.miniAppChat) g.miniAppChat = [];
-        g.miniAppChat.push({ id: now(), senderId: userId, senderName: userName, text: text.trim().slice(0, 500), time: now(), isSystem: false });
-        await this.persist();
-        return Response.json({ ok: true });
-    }
-
-    let res = { alert: false, text: "" };
-
-    if (action === "vote_nominate") res = await this.applyNomination(userId, g.dayNumber, targetId ?? 0);
-    else if (action === "vote_verdict") res = await this.applyVerdict(userId, g.dayNumber, guilty);
-    else if (action === "vote_inquiry") res = await this.applyInquiryVote(userId, g.dayNumber, choice);
-    else if (action === "gunner_shot") res = await this.applyGunnerShot(userId, g.dayNumber, targetId ?? 0);
-    else if (action === "gunner_give_war") res = await this.applyGunnerGiveWar(userId, g.nightNumber, targetId ?? 0);
-    else if (action === "gunner_give_black") res = await this.applyGunnerGiveBlack(userId, g.nightNumber, targetId ?? 0);
-    else if (action === "nato_guess") {
-       if (targetRole) res = await this.applyNatoRoleGuess(userId, g.nightNumber, targetId, targetRole);
-       else res = await this.applyNightAction(userId, g.nightNumber, "nato_guess", 0);
-    }
-    else if (action === "bomber_explode") res = await this.applyBomberExplode(userId, g.nightNumber);
-    else res = await this.applyNightAction(userId, g.nightNumber, action as NightActionType, targetId ?? 0);
-
-    if (res.alert) return Response.json({ ok: false, error: res.text });
-    return Response.json({ ok: true });
   }
 
   private targetLabel(game: GameState, targetId: number, action: NightActionType, actor?: Player | null): string {
@@ -7564,86 +6218,6 @@ function inferChatId(update: TgUpdate): number | null {
 }
 
 
-async function verifyInitData(initData: string | null, token: string) {
-  if (!initData) return null;
-  const q = new URLSearchParams(initData);
-  const hash = q.get("hash");
-  if (!hash) return null;
-  q.delete("hash");
-  const keys = [...q.keys()].sort();
-  const dataCheckString = keys.map(k => `${k}=${q.get(k)}`).join("\n");
-
-  const encoder = new TextEncoder();
-  const secretKey = await crypto.subtle.importKey("raw", encoder.encode("WebAppData"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const secretHash = await crypto.subtle.sign("HMAC", secretKey, encoder.encode(token));
-  const finalKey = await crypto.subtle.importKey("raw", secretHash, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const signature = await crypto.subtle.sign("HMAC", finalKey, encoder.encode(dataCheckString));
-  const hex = [...new Uint8Array(signature)].map(b => b.toString(16).padStart(2, '0')).join('');
-
-  if (hex !== hash) return null;
-  // BUGFIX: reject stale/replayed init data instead of trusting it forever —
-  // Telegram issues a fresh auth_date each time the mini app is (re)opened;
-  // anything older than 24h is almost certainly a leaked/replayed payload.
-  const authDate = Number(q.get("auth_date"));
-  if (!authDate || (Date.now() / 1000 - authDate) > 86400) return null;
-  try { return JSON.parse(q.get("user") || "{}"); } catch { return null; }
-}
-
-async function handleMiniappApi(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const method = request.method;
-
-  let initData = request.headers.get("X-Telegram-Init-Data");
-  const user = await verifyInitData(initData, env.BOT_TOKEN);
-
-  if (!user || !user.id) return json({ ok: false, error: "Unauthorized" }, 401);
-
-  let body: any = {};
-  if (method === "POST") body = await request.clone().json().catch(() => ({}));
-
-  // Handle Create Lobby (Virtual Chat Room, not tied to a Telegram group)
-  if (method === "POST" && body.action === "create_lobby") {
-     const virtualChatId = -1000000000 - user.id; // Synthetic ID
-     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${virtualChatId}`));
-     return stub.fetch(new Request(request.url, {
-         method: "POST",
-         headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name || "کاربر" },
-         body: JSON.stringify({ api: true, action: "create_lobby" })
-     }));
-  }
-
-  // Handle Join Lobby (by the 5-digit lobby code)
-  if (method === "POST" && body.action === "join_lobby") {
-     const code = body.code;
-     if (!code) return json({ ok: false, error: "کد لابی را وارد کنید" });
-     const row = await env.DB.prepare(`SELECT chat_id FROM games WHERE json_extract(state_json, '$.lobbyCode') = ? AND status = 'lobby' ORDER BY created_at DESC LIMIT 1`).bind(String(code)).first<{chat_id: number}>();
-     if (!row) return json({ ok: false, error: "لابی یافت نشد یا پر شده است" });
-     const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${row.chat_id}`));
-     return stub.fetch(new Request(request.url, {
-         method: "POST",
-         headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name || "کاربر" },
-         body: JSON.stringify({ api: true, action: "join_lobby", chatId: row.chat_id })
-     }));
-  }
-
-  let chatId = Number(url.searchParams.get("chat_id") || body.chatId);
-  if (!chatId || isNaN(chatId)) {
-      // Find active game for user
-      const active = await findActiveGameForUser(env.DB, user.id);
-      if (active) chatId = active.chat_id;
-      else return json({ ok: false, error: "No active game" });
-  }
-
-  const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${chatId}`));
-  const newRequest = new Request(request.url, {
-    method: request.method,
-    headers: { ...Object.fromEntries(request.headers), "X-User-Id": String(user.id), "X-User-Name": user.first_name || "کاربر" },
-    body: request.method === "POST" ? await request.clone().text() : null
-  });
-
-  return stub.fetch(newRequest);
-}
-
 // =============================================================================
 // EXPORTS
 // =============================================================================
@@ -7653,17 +6227,6 @@ export default {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ ok: true, service: "telegram-mafia-bot", ts: Date.now() });
-    }
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/app")) {
-      return new Response(MINIAPP_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
-    }
-    if (url.pathname.startsWith("/api/miniapp/")) {
-      // BUGFIX: the mini-app API talks to D1/Durable Objects, so schema
-      // must exist before it's queried — the webhook path already did this,
-      // but the miniapp path was missing it, causing "no such table" on a
-      // cold worker whose /webhook hadn't fired yet.
-      await ensureSchema(env.DB);
-      return handleMiniappApi(request, env);
     }
     if (request.method === "GET" && url.pathname === "/setup") return setup(url, env);
     if (request.method === "POST" && url.pathname === "/webhook") {

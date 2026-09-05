@@ -679,6 +679,14 @@ export interface TgMessageEntity {
   length: number;
 }
 
+export interface TgPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  file_size?: number;
+  width: number;
+  height: number;
+}
+
 export interface TgMessage {
   message_id: number;
   from?: TgUser;
@@ -690,6 +698,7 @@ export interface TgMessage {
   left_chat_member?: TgUser;
   reply_markup?: unknown;
   reply_to_message?: TgMessage;
+  photo?: TgPhotoSize[];
 }
 
 export interface TgCallbackQuery {
@@ -3619,6 +3628,18 @@ export class GameRoom extends DurableObject<Env> {
       if (parsed?.cmd === "start") { await this.onPrivateStart(msg, parsed.args); return; }
       if (parsed?.cmd === "help") { await this.tg.sendMessage(from.id, fa.helpPrivate); return; }
       if (parsed?.cmd === "myrole") { await this.sendMyRole(from.id); return; }
+      // TEMP: admin-only helper — reply to a photo you already sent this
+      // bot with /getfileid to get the file_id AS SEEN BY THIS BOT. file_ids
+      // are per-bot: an id obtained via a different bot (e.g. @RawDataBot)
+      // is not valid here and sendPhoto will fail with "wrong file_id" for
+      // it. Remove once ROLE_IMAGES is fully populated with ids collected
+      // this way.
+      if (parsed?.cmd === "getfileid") {
+        const photo = msg.reply_to_message?.photo?.at(-1);
+        if (!photo) { await this.tg.sendMessage(from.id, "یک عکس به من بفرست، بعد با ریپلای روی همان عکس /getfileid را بزن."); return; }
+        await this.tg.sendMessage(from.id, `<code>${photo.file_id}</code>`);
+        return;
+      }
       if (parsed) { await this.tg.sendMessage(from.id, fa.mafiaChatCommandsIgnored); return; }
       if (await this.handleNoteFlow(from.id, text)) return;
       await this.handleMafiaNightChat(msg);
@@ -5336,21 +5357,46 @@ export class GameRoom extends DurableObject<Env> {
     // the bot, Telegram rate limit) doesn't abort the entire role-distribution
     // and leave the game stuck on the "night" phase with no prompts sent.
     // Failed players can still recover their role via /myrole.
+    // NOTE: callSafe() never throws/rejects — it catches internally and
+    // resolves to {ok:false, error}. Promise.allSettled only reports a
+    // promise as "rejected" if it actually rejects, so combining it with
+    // callSafe here silently swallowed every failure (this bug predates the
+    // photo change but is easier to hit now — see below). Track failures
+    // from the resolved {ok, ...} value instead.
+    // Telegram caps photo *captions* at 1024 chars (vs 4096 for plain text
+    // messages), and the mafia role card grows with every teammate listed —
+    // so a long caption fails sendPhoto outright. Fall back to sending the
+    // photo with a trimmed caption plus the full role text as a follow-up
+    // message, so the player always gets their role even when it's long.
     const results = await Promise.allSettled(
-      game.players.map((p) => {
+      game.players.map(async (p) => {
         const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
+        const caption = fa.roleCard(p, mates);
         // Attach the persistent Reply Keyboard (📝 یادداشت) here too — this
         // is the very first private message each player gets at game start,
         // so it's the earliest natural point to show it, matching sendMyRole.
         // Role reveal is a photo (role artwork) with the role card text as
         // caption, instead of a bare text message.
-        return this.tg.callSafe("sendPhoto", {
-          chat_id: p.userId, photo: roleImageFor(p), caption: fa.roleCard(p, mates), parse_mode: "HTML",
+        if (caption.length <= 1024) {
+          return this.tg.callSafe("sendPhoto", {
+            chat_id: p.userId, photo: roleImageFor(p), caption, parse_mode: "HTML",
+            reply_markup: mainReplyKeyboard(),
+          });
+        }
+        const photoResult = await this.tg.callSafe("sendPhoto", {
+          chat_id: p.userId, photo: roleImageFor(p),
+        });
+        const textResult = await this.tg.callSafe("sendMessage", {
+          chat_id: p.userId, text: caption, parse_mode: "HTML", disable_web_page_preview: true,
           reply_markup: mainReplyKeyboard(),
         });
+        return (photoResult as { ok: boolean }).ok ? textResult : photoResult;
       }),
     );
-    const failedPlayers = game.players.filter((_, i) => results[i]?.status === "rejected");
+    const failedPlayers = game.players.filter((_, i) => {
+      const r = results[i];
+      return r?.status === "rejected" || (r?.status === "fulfilled" && (r.value as { ok: boolean } | undefined)?.ok === false);
+    });
     if (failedPlayers.length > 0) {
       console.warn(`sendRoleCards: ${failedPlayers.length}/${game.players.length} players did not receive their role card`, failedPlayers.map((p) => p.userId));
       // FIX #8: report the list of players who didn't get their role card to
@@ -5584,7 +5630,16 @@ export class GameRoom extends DurableObject<Env> {
     // private message.
     if (p.status !== "alive" && p.role) { await this.tg.sendMessage(userId, fa.myRoleDead(p.role, p.independentRole), { reply_markup: mainReplyKeyboard() }); return; }
     const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
-    await this.tg.sendPhoto(userId, roleImageFor(p), fa.roleCard(p, mates), { reply_markup: mainReplyKeyboard() });
+    const caption = fa.roleCard(p, mates);
+    // Telegram caps photo captions at 1024 chars (vs 4096 for plain text) —
+    // a long mafia role card (grows with teammate count) can exceed that,
+    // so fall back to photo + separate text message rather than throwing.
+    if (caption.length <= 1024) {
+      await this.tg.sendPhoto(userId, roleImageFor(p), caption, { reply_markup: mainReplyKeyboard() });
+    } else {
+      await this.tg.sendPhoto(userId, roleImageFor(p), "");
+      await this.tg.sendMessage(userId, caption, { reply_markup: mainReplyKeyboard() });
+    }
   }
 
   // Runs the Lecter->Godfather succession check and — if it fired — tells

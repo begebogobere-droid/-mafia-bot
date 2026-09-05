@@ -6507,6 +6507,18 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   if (cq) { await tg.answerCallbackQuery(cq.id, "بازی فعالی پیدا نشد.", true); return; }
   if (parsed?.cmd === "help") { await tg.sendMessage(from.id, fa.helpPrivate); return; }
   if (parsed?.cmd === "myrole") { await tg.sendMessage(from.id, fa.notPlaying); return; }
+  // TEMP: admin-only helper — works even with no active game, since this is
+  // the branch a user with no active game actually reaches. Reply to a
+  // photo you already sent this bot with /getfileid to get the file_id AS
+  // SEEN BY THIS BOT (file_ids are per-bot; an id obtained via a different
+  // bot, e.g. @RawDataBot, is not valid here). Remove once ROLE_IMAGES is
+  // fully populated with ids collected this way.
+  if (parsed?.cmd === "getfileid") {
+    const photo = msg?.reply_to_message?.photo?.at(-1);
+    if (!photo) { await tg.sendMessage(from.id, "یک عکس به من بفرست، بعد با ریپلای روی همان عکس /getfileid را بزن."); return; }
+    await tg.sendMessage(from.id, `<code>${photo.file_id}</code>`);
+    return;
+  }
   await tg.sendMessage(from.id, fa.privateStart);
 }
 

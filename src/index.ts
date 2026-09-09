@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
   vote_executions INTEGER NOT NULL DEFAULT 0,
   night_deaths INTEGER NOT NULL DEFAULT 0,
   role_stats_json TEXT,
+  keyboard_shown INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -127,6 +128,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
       vote_executions: "INTEGER NOT NULL DEFAULT 0",
       night_deaths: "INTEGER NOT NULL DEFAULT 0",
       role_stats_json: "TEXT",
+      keyboard_shown: "INTEGER NOT NULL DEFAULT 0",
     },
     games: {
       state_json: "TEXT",
@@ -2484,6 +2486,8 @@ export const fa = {
     "برای شروع، در گروه مورد نظر /new بزنید و از دکمهٔ ورود استفاده کنید.",
   ].join("\n"),
 
+  menuActivated: "✅ منوی اصلی فعال شد.",
+
   alreadyInGame(title: string): string {
     return `شما همین حالا در بازی «${esc(title)}» هستید. تا پایان یا لغو آن بازی نمی‌توانید وارد بازی دیگری شوید.`;
   },
@@ -3346,6 +3350,25 @@ export async function markStarted(db: D1Database, userId: number): Promise<void>
     .run();
 }
 
+// Returns true the FIRST time it's called for a given user (and flips
+// keyboard_shown to 1 so it never fires again for them), false every time
+// after. Used to guarantee the persistent reply keyboard (mainReplyKeyboard,
+// which carries the "📊 آنالیز آمار من" stats button) reaches every private
+// user exactly once, completely independent of whether they're mid-game,
+// between games, or have never played — Telegram keeps a reply keyboard
+// visible client-side once it's attached to any message, so one send is
+// enough and this must run before any game-specific routing decides what
+// (if anything) to reply with.
+export async function ensureMenuKeyboardShown(db: D1Database, userId: number): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT keyboard_shown FROM users WHERE telegram_id = ?`)
+    .bind(userId)
+    .first<{ keyboard_shown: number }>();
+  if (row && row.keyboard_shown === 1) return false;
+  await db.prepare(`UPDATE users SET keyboard_shown = 1 WHERE telegram_id = ?`).bind(userId).run();
+  return true;
+}
+
 export async function hasStartedBot(db: D1Database, userId: number): Promise<boolean> {
   const row = await db.prepare(`SELECT started_bot FROM users WHERE telegram_id = ?`).bind(userId).first<{ started_bot: number }>();
   return !!row?.started_bot;
@@ -4022,13 +4045,13 @@ export class GameRoom extends DurableObject<Env> {
     const from = msg.from!;
     if (args.startsWith("join_")) {
       const chatId = Number(args.slice(5));
-      if (!Number.isFinite(chatId)) { await this.tg.sendMessage(from.id, fa.privateStart); return; }
+      if (!Number.isFinite(chatId)) { await this.tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() }); return; }
       await this.joinFromPrivate(from, chatId);
       return;
     }
     const game = this.game;
     if (game && isActiveStatus(game.status) && findPlayer(game.players, from.id)) { await this.sendMyRole(from.id); return; }
-    await this.tg.sendMessage(from.id, fa.privateStart);
+    await this.tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() });
   }
 
   private async onCallback(cq: TgCallbackQuery): Promise<void> {
@@ -6797,6 +6820,15 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   const tg = new Telegram(env.BOT_TOKEN);
   await upsertUser(env.DB, from, true);
   await markStarted(env.DB, from.id);
+
+  // Attach the persistent reply keyboard (mainReplyKeyboard, with the stats
+  // button) exactly once per user, up front — deliberately BEFORE any
+  // game/lobby routing below, so it reaches the user no matter whether
+  // they're currently in a game, mid-lobby, or brand new.
+  if (await ensureMenuKeyboardShown(env.DB, from.id)) {
+    await tg.sendMessage(from.id, fa.menuActivated, { reply_markup: mainReplyKeyboard() });
+  }
+
   const text = msg?.text ?? "";
   const parsed = text ? parseCommand(text) : null;
 
@@ -6838,9 +6870,9 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   if (targetChat === null) { const active = await findActiveGameForUser(env.DB, from.id); if (active) targetChat = active.chat_id; }
   if (targetChat !== null) { await callRoom(env, targetChat, update); return; }
   if (cq) { await tg.answerCallbackQuery(cq.id, "بازی فعالی پیدا نشد.", true); return; }
-  if (parsed?.cmd === "help") { await tg.sendMessage(from.id, fa.helpPrivate); return; }
-  if (parsed?.cmd === "myrole") { await tg.sendMessage(from.id, fa.notPlaying); return; }
-  await tg.sendMessage(from.id, fa.privateStart);
+  if (parsed?.cmd === "help") { await tg.sendMessage(from.id, fa.helpPrivate, { reply_markup: mainReplyKeyboard() }); return; }
+  if (parsed?.cmd === "myrole") { await tg.sendMessage(from.id, fa.notPlaying, { reply_markup: mainReplyKeyboard() }); return; }
+  await tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() });
 }
 
 // Handles every "ST:..." inline-keyboard callback for the player-statistics

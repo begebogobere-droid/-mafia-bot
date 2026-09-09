@@ -10,6 +10,11 @@ CREATE TABLE IF NOT EXISTS users (
   games_played INTEGER NOT NULL DEFAULT 0,
   games_won INTEGER NOT NULL DEFAULT 0,
   recent_roles TEXT,
+  games_lost INTEGER NOT NULL DEFAULT 0,
+  deaths INTEGER NOT NULL DEFAULT 0,
+  vote_executions INTEGER NOT NULL DEFAULT 0,
+  night_deaths INTEGER NOT NULL DEFAULT 0,
+  role_stats_json TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -117,6 +122,11 @@ async function ensureSchema(db: D1Database): Promise<void> {
   const tableMigrations: Record<string, Record<string, string>> = {
     users: {
       recent_roles: "TEXT",
+      games_lost: "INTEGER NOT NULL DEFAULT 0",
+      deaths: "INTEGER NOT NULL DEFAULT 0",
+      vote_executions: "INTEGER NOT NULL DEFAULT 0",
+      night_deaths: "INTEGER NOT NULL DEFAULT 0",
+      role_stats_json: "TEXT",
     },
     games: {
       state_json: "TEXT",
@@ -679,14 +689,6 @@ export interface TgMessageEntity {
   length: number;
 }
 
-export interface TgPhotoSize {
-  file_id: string;
-  file_unique_id: string;
-  file_size?: number;
-  width: number;
-  height: number;
-}
-
 export interface TgMessage {
   message_id: number;
   from?: TgUser;
@@ -698,7 +700,6 @@ export interface TgMessage {
   left_chat_member?: TgUser;
   reply_markup?: unknown;
   reply_to_message?: TgMessage;
-  photo?: TgPhotoSize[];
 }
 
 export interface TgCallbackQuery {
@@ -1101,9 +1102,14 @@ export function memberToSaved(
 // source of truth for the button's label.
 export const NOTE_BUTTON_LABEL = "📝 یادداشت";
 
+// Label for the "player statistics" Reply Keyboard button — the ONLY
+// Statistics-related entry on the Reply Keyboard (per requirement: no
+// "آمار من"/"پروفایل"/leaderboard button, just this one).
+export const STATS_BUTTON_LABEL = "📊 آنالیز آمار من";
+
 export function mainReplyKeyboard(): ReplyKeyboardMarkup {
   return {
-    keyboard: [[{ text: NOTE_BUTTON_LABEL }]],
+    keyboard: [[{ text: NOTE_BUTTON_LABEL }], [{ text: STATS_BUTTON_LABEL }]],
     resize_keyboard: true,
     is_persistent: true,
   };
@@ -1152,6 +1158,58 @@ export function dayHostKeyboard(): InlineKeyboard {
     ],
   ];
 }
+
+// ===========================================================================
+// PLAYER STATISTICS — inline keyboards
+// ===========================================================================
+// callback_data scheme: "ST:<action>" (main/records) or "ST:roles:<page>".
+// Deliberately carries NO user id — Telegram's callback_query.from.id is the
+// authenticated identity of whoever pressed the button (not something the
+// user can forge by editing callback_data), so every stats handler reads
+// the target user directly from cq.from.id. This is what makes it
+// impossible for a user to view someone else's stats by tampering with
+// callback data (there is no other-user id in the payload to tamper with).
+export const STATS_CB_PREFIX = "ST:";
+
+export function statsMainKeyboard(): InlineKeyboard {
+  return [
+    [{ text: "🎭 آنالیز نقش‌ها", callback_data: "ST:roles:0" }],
+    [{ text: "📈 درصدها و رکوردها", callback_data: "ST:records" }],
+  ];
+}
+
+export function statsRolesKeyboard(page: number, totalPages: number): InlineKeyboard {
+  const rows: InlineKeyboard = [];
+  if (totalPages > 1) {
+    rows.push([
+      { text: "◀️", callback_data: `ST:roles:${Math.max(0, page - 1)}` },
+      { text: `${page + 1}/${totalPages}`, callback_data: `ST:roles:${page}` },
+      { text: "▶️", callback_data: `ST:roles:${Math.min(totalPages - 1, page + 1)}` },
+    ]);
+  }
+  rows.push([{ text: "🔙 بازگشت به آنالیز", callback_data: "ST:main" }]);
+  return rows;
+}
+
+export function statsRecordsKeyboard(): InlineKeyboard {
+  return [[{ text: "🔙 بازگشت به آنالیز", callback_data: "ST:main" }]];
+}
+
+// Roles with at least one game, in a stable order: most games first, ties
+// broken by the role key's own fixed declaration order in ROLES/
+// INDEPENDENT_ROLES (Object.entries preserves insertion order, and
+// Array#sort is a stable sort in the JS engines this Worker runs on), so
+// repeated renders/pagination never reorder entries arbitrarily.
+export function sortedRoleEntries(roles: RoleStatsMap): [StatRoleKey, RoleStatEntry][] {
+  const order: StatRoleKey[] = [...(Object.keys(ROLES) as RoleId[]), ...(Object.keys(INDEPENDENT_ROLES) as IndependentRoleId[])];
+  const entries = (Object.entries(roles) as [StatRoleKey, RoleStatEntry][]).filter(([, e]) => e.games > 0);
+  return entries.sort((a, b) => {
+    if (b[1].games !== a[1].games) return b[1].games - a[1].games;
+    return order.indexOf(a[0]) - order.indexOf(b[0]);
+  });
+}
+
+export const STATS_ROLES_PAGE_SIZE = 5;
 
 export function nominationKeyboard(players: Player[], voterId: number, dayNumber: number): InlineKeyboard {
   const candidates = players.filter((p) => p.status === "alive" && p.userId !== voterId);
@@ -1399,21 +1457,21 @@ export const ROLES: Record<RoleId, RoleDef> = {
 // Used by sendRoleCards/sendMyRole to attach a photo to every role reveal
 // instead of sending bare text.
 export const ROLE_IMAGES: Record<RoleId | IndependentRoleId, string> = {
-  godfather: "AgACAgQAAxkBAAJZ4WqcVgABxrF2Y_X2ETXk9FqhLPJHDQACgQ9rG-KO4FB2bnvLWh91KQEAAwIAA3kAAz0E",
-  lecter: "AgACAgQAAxkBAAJZ4GqcVgABIc8C746gSLlxHB79f0-dEQACgA9rG-KO4FBNDQ50OdB65gEAAwIAA3kAAz0E",
-  nato: "AgACAgQAAxkBAAJZ4mqcVgAB6LCXW0PNNOtis-FmdB7FhQACgg9rG-KO4FC7FMU_Gx6qkwEAAwIAA3kAAz0E",
-  detective: "AgACAgQAAxkBAAJZ6mqcVgAB5BOf14whoWoDB_r0OXNAfQACkA9rG-KO4FCWWcPW2vQy-QEAAwIAA3kAAz0E",
-  doctor: "AgACAgQAAxkBAAJZ52qcVgABWjUqzdjNn6NMD--0cMmd_gACjQ9rG-KO4FBCqAGDk4nhQQEAAwIAA3kAAz0E",
-  sniper: "AgACAgQAAxkBAAJZ5WqcVgABiwxTcl3TbN0XjwUGh8BkrwACiQ9rG-KO4FAP_ebnatkd_wEAAwIAA3kAAz0E",
-  mayor: "AgACAgQAAxkBAAJZ0GqcU_xJtvvLKGpgRwzntFghtsh4AAKSD2sb4o7gUBGXnyEWbZv7AQADAgADeQADPQQ",
-  gunner: "AgACAgQAAxkBAAJZ5mqcVgAB28qrXfD5HzCgHsAfjZ0z-QACjA9rG-KO4FDGG0WcBsiPoQEAAwIAA3kAAz0E",
-  invincible: "AgACAgQAAxkBAAJZ6GqcVgABH9HHe25X1eR1WTC7KTjJmwACjg9rG-KO4FDDETvik3PTXgEAAwIAA3kAAz0E",
-  escort: "AgACAgQAAxkBAAJZ6WqcVgABUEaSeZsaSTps7HZ9TNFoKwACjw9rG-KO4FDwNJ4Bb7amywEAAwIAA3kAAz0E",
-  paranoid: "AgACAgQAAxkBAAJZ2GqcVLQ9GP7tTpJguU2pba7Y_4CGAAKRD2sb4o7gUG9EW53Km8R2AQADAgADeQADPQQ",
-  johnny: "AgACAgQAAxkBAAJZ42qcVgABkgR7iApjUt6j7T8adM-JpQACgw9rG-KO4FAIFwXDH-vELgEAAwIAA3kAAz0E",
-  joker: "AgACAgQAAxkBAAJZ3mqcVgABrHr9geTW94SZPOY_KlwMOgAC0A9rG8lZ4VBs_MJFgwEKOQEAAwIAA3kAAz0E",
-  bomber: "AgACAgQAAxkBAAJZ5GqcVgAB3nRNlu8thfQOtb7eQC_ZCQAChA9rG-KO4FCP3Rz_GI27jAEAAwIAA3kAAz0E",
-  lonewolf: "AgACAgQAAxkBAAJZ32qcVgABEbN522LvEso9WnJKhH4b_gACfw9rG-KO4FDT4n5Z0OMVcAEAAwIAA3kAAz0E",
+  godfather: "AgACAgQAAxkBAAFTimZqnEOIJ9YmmLwZKwIu4s8yis8qEAACgQ9rG-KO4FDCIMyN5abRwgEAAwIAA3MAAz0E",
+  lecter: "AgACAgQAAxkBAAFTimBqnENpXhlJ8nFDiB0pILAXZX9fAgACgA9rG-KO4FDM_VOptFWzyQEAAwIAA3MAAz0E",
+  nato: "AgACAgQAAxkBAAFTimhqnEO5QWOGAcRoMZTtQr69L1jiMQACgg9rG-KO4FCsdLvfSyCcngEAAwIAA3MAAz0E",
+  detective: "AgACAgQAAxkBAAFTiqlqnET0ARDqDJu0h6UEmLwEOeVf1AACkA9rG-KO4FC-zQSL3SEL8QEAAwIAA3MAAz0E",
+  doctor: "AgACAgQAAxkBAAFTin5qnEQse8flph2tYsQ24g4WjtU20QACjQ9rG-KO4FAgYdV6Zp4TDQEAAwIAA3MAAz0E",
+  sniper: "AgACAgQAAxkBAAFTinRqnEQFIgdo5fCSLwzrL92udCey4gACiQ9rG-KO4FBW6LqD9ecnEAEAAwIAA3MAAz0E",
+  mayor: "AgACAgQAAxkBAAFTittqnEUiMtshhCFZ4aEbxQIFIw5LNgACkg9rG-KO4FA1mpSSu631aQEAAwIAA3MAAz0E",
+  gunner: "AgACAgQAAxkBAAFTinZqnEQY2XRYweeq-amlZy1YBvFWuwACjA9rG-KO4FBChmezGnZmvgEAAwIAA3MAAz0E",
+  invincible: "AgACAgQAAxkBAAFTioBqnEQ-3-y-ofZm4YuEpQgehP314QACjg9rG-KO4FCqbaJT4fDxkQEAAwIAA3MAAz0E",
+  escort: "AgACAgQAAxkBAAFTippqnETb0aiohnLEiJ_pR_Lp22VvQQACjw9rG-KO4FBzQG23_yiRZAEAAwIAA3MAAz0E",
+  paranoid: "AgACAgQAAxkBAAFTisdqnEUQz472hpf2jh85FckUNweMYgACkQ9rG-KO4FDcwa6qNRhAXAEAAwIAA3MAAz0E",
+  johnny: "AgACAgQAAxkBAAFTimpqnEPP6fXlWSg_-pQ7IExGsaNzzgACgw9rG-KO4FBA8Stj5M7tZAEAAwIAA3MAAz0E",
+  joker: "AgACAgQAAxkBAAFTik5qnEMLGVQlkb7DQ52bkFBffO-gAQAC0A9rG8lZ4VD4l1dDAcwdsgEAAwIAA3MAAz0E",
+  bomber: "AgACAgQAAxkBAAFTim5qnEPnxbSSqtYp7x2mlnXcleV9OwAChA9rG-KO4FA6xHp_j3GF-wEAAwIAA3MAAz0E",
+  lonewolf: "AgACAgQAAxkBAAFTilpqnENRE2ovQypKBsGci4Tv6x-XvwACfw9rG-KO4FA6oB3H2y0RJwEAAwIAA3MAAz0E",
 };
 
 // Returns the file_id for a player's role image — independent players
@@ -1593,6 +1651,14 @@ export function teamLabel(team: Team | null | undefined): string {
   if (team === "town") return "❤️ شهروندان";
   if (team === "independent") return "⚖️ مستقل";
   return "نامشخص";
+}
+
+// Emoji+name label for a Statistics role key (RoleId or IndependentRoleId) —
+// used only by the player-statistics display, mirrors roleLabel/
+// independentRoleLabel's "emoji + name" convention exactly.
+export function statRoleLabel(key: StatRoleKey): string {
+  if (key in INDEPENDENT_ROLES) return independentRoleLabel(key as IndependentRoleId);
+  return roleLabel(key as RoleId);
 }
 
 
@@ -2870,6 +2936,96 @@ export const fa = {
     ].join("\n");
   },
 
+  // ===========================================================================
+  // PLAYER STATISTICS DISPLAY (📊 آنالیز آمار من)
+  // ===========================================================================
+
+  statsSummary(displayName: string, stats: PlayerStatistics): string {
+    return [
+      "📊 <b>آنالیز آماری</b>",
+      "",
+      `👤 ${esc(displayName)}`,
+      "",
+      `🎮 تعداد بازی‌ها: ${stats.totalGames}`,
+      `🏆 بردها: ${stats.wins}`,
+      `💀 باخت‌ها: ${stats.losses}`,
+      `📈 Win Rate: ${winRatePct(stats.wins, stats.totalGames)}٪`,
+      "",
+      `☠️ تعداد مرگ‌ها: ${stats.deaths}`,
+      `🗳️ اعدام با رأی: ${stats.voteExecutions}`,
+      `🌙 مرگ شبانه: ${stats.nightDeaths}`,
+      ...(stats.totalGames === 0 ? ["", "❕ شما هنوز هیچ بازی‌ای انجام نداده‌اید."] : []),
+    ].join("\n");
+  },
+
+  statsRolesPage(displayName: string, entries: [StatRoleKey, RoleStatEntry][], page: number, totalPages: number): string {
+    const lines = [`🎭 <b>آنالیز نقش‌های ${esc(displayName)}</b>`, ""];
+    if (entries.length === 0) {
+      lines.push("❕ هنوز هیچ نقشی برای شما ثبت نشده است.");
+    } else {
+      for (const [key, entry] of entries) {
+        lines.push(
+          statRoleLabel(key),
+          `🎮 بازی: ${entry.games}`,
+          `🏆 برد: ${entry.wins}`,
+          `💀 باخت: ${entry.losses}`,
+          `📈 Win Rate: ${winRatePct(entry.wins, entry.games)}٪`,
+          "",
+        );
+      }
+      if (lines[lines.length - 1] === "") lines.pop();
+      if (totalPages > 1) lines.push("", `صفحه ${page}/${totalPages}`);
+    }
+    return lines.join("\n");
+  },
+
+  statsRecords(displayName: string, stats: PlayerStatistics): string {
+    // sortedRoleEntries already gives a stable order (games desc, ties
+    // broken by each role's fixed declaration order) — reused here so
+    // "بیشترین نقش دریافت‌شده" always agrees with the roles page's own
+    // ordering for the same underlying data.
+    const allRoleEntries = sortedRoleEntries(stats.roles);
+    const rolesWithEnoughGames = allRoleEntries.filter(([, e]) => e.games >= 2);
+
+    const lines = [`📈 <b>درصدها و رکوردهای ${esc(displayName)}</b>`, ""];
+    lines.push("📊 Win Rate کلی:", `${winRatePct(stats.wins, stats.totalGames)}٪`, "");
+
+    if (allRoleEntries.length > 0) {
+      const mostPlayed = allRoleEntries[0];
+      lines.push(
+        "🎭 بیشترین نقش دریافت‌شده:",
+        `${statRoleLabel(mostPlayed[0])} — ${mostPlayed[1].games} بار`,
+        "",
+      );
+      const mostWins = [...allRoleEntries].sort((a, b) => b[1].wins - a[1].wins)[0];
+      // (allRoleEntries is already stably ordered by sortedRoleEntries, and
+      // JS's Array#sort is stable, so ties in wins keep that same order.)
+      if (mostWins[1].wins > 0) {
+        lines.push(
+          "🏆 بیشترین برد با یک نقش:",
+          `${statRoleLabel(mostWins[0])} — ${mostWins[1].wins} برد`,
+          "",
+        );
+      }
+    }
+
+    if (rolesWithEnoughGames.length > 0) {
+      const best = [...rolesWithEnoughGames].sort((a, b) => (b[1].wins / b[1].games) - (a[1].wins / a[1].games))[0];
+      const worst = [...rolesWithEnoughGames].sort((a, b) => (a[1].wins / a[1].games) - (b[1].wins / b[1].games))[0];
+      lines.push(
+        "⭐ بهترین نقش:",
+        `${statRoleLabel(best[0])} — ${winRatePct(best[1].wins, best[1].games)}٪`,
+        "",
+        "📉 ضعیف‌ترین نقش:",
+        `${statRoleLabel(worst[0])} — ${winRatePct(worst[1].wins, worst[1].games)}٪`,
+      );
+    } else {
+      lines.push("❕ اطلاعات کافی برای محاسبه بهترین/ضعیف‌ترین نقش وجود ندارد (حداقل ۲ بازی با یک نقش لازم است).");
+    }
+
+    return lines.join("\n");
+  },
+
   helpGroup: [
     "🎭 <b>دستورهای گروه</b>",
     "/new — ساخت لابی",
@@ -3402,16 +3558,171 @@ export async function addEvent(db: D1Database, gameId: string, eventType: string
   ).bind(gameId, eventType, JSON.stringify(payload), Date.now()).run();
 }
 
+// A player's stats "role key" mirrors the exact same convention already used
+// by roleImageFor/fa.gameOver for which identity to show: independentRole
+// (johnny/joker/bomber/lonewolf) takes priority over the cosmetic flavor
+// `.role`, since for an independent player `.role` is just flavor text (see
+// roleImageFor's comment). Falls back to null if somehow neither is set
+// (should not happen for a player who was actually assigned a role).
+export type StatRoleKey = RoleId | IndependentRoleId;
+export function statRoleKeyFor(p: Player): StatRoleKey | null {
+  return p.independentRole ?? (p.role as StatRoleKey | null);
+}
+
+export interface RoleStatEntry {
+  games: number;
+  wins: number;
+  losses: number;
+}
+export type RoleStatsMap = Partial<Record<StatRoleKey, RoleStatEntry>>;
+
+// Records final per-player results for one finished game onto the persistent
+// `users` table. Called exactly once, from GameRoom.finish() — the single
+// place a game is ever finalized (see finish()'s own comment: every win path
+// — town/mafia win, independent outright win, host/admin cancellation via a
+// separate path — funnels through here). Because this reads the CURRENT
+// state_json.game.players array (each player's final `status`/`deathReason`
+// already reflects every death that happened during the game — see
+// applyDeaths, the single place that ever sets those fields), there is no
+// separate "did this death already get counted" guard needed here: this
+// function itself only ever runs once per game (finish() is not
+// re-triggerable — game.status is already "finished" and no other code path
+// calls recordFinishStats), so deriving counts fresh from final player state
+// at this one point cannot double-count.
+//
+// Win/Lose is NOT decided here — `winner` and `sharedWinnerIds` are computed
+// upstream by the existing checkWinner/checkIndependentWinner/
+// getSharedWinnerIds pipeline (see finish()) and simply passed in; this
+// function only records whatever result that pipeline already decided,
+// exactly per the "don't invent new win logic" requirement.
 export async function recordFinishStats(
   db: D1Database, players: Player[], winner: Team | null, sharedWinnerIds: number[] = [],
 ): Promise<void> {
   const shared = new Set(sharedWinnerIds);
+  const ts = Date.now();
+
+  // Pull existing role_stats_json for everyone in this game in one query so
+  // each player's role map can be merged (not clobbered) — old data for
+  // roles from previous games must survive.
+  const userIds = players.map((p) => p.userId);
+  const placeholders = userIds.map(() => "?").join(",");
+  const existingRows = userIds.length
+    ? (await db.prepare(`SELECT telegram_id, role_stats_json FROM users WHERE telegram_id IN (${placeholders})`)
+        .bind(...userIds)
+        .all<{ telegram_id: number; role_stats_json: string | null }>()).results ?? []
+    : [];
+  const existingMap = new Map<number, RoleStatsMap>();
+  for (const row of existingRows) {
+    try {
+      existingMap.set(row.telegram_id, row.role_stats_json ? (JSON.parse(row.role_stats_json) as RoleStatsMap) : {});
+    } catch {
+      existingMap.set(row.telegram_id, {});
+    }
+  }
+
+  const statements = [];
   for (const p of players) {
     const won = (winner && p.team === winner) || shared.has(p.userId) ? 1 : 0;
-    await db.prepare(
-      `UPDATE users SET games_played = games_played + 1, games_won = games_won + ?, updated_at = ? WHERE telegram_id = ?`,
-    ).bind(won, Date.now(), p.userId).run();
+
+    // Death classification — derived from this player's FINAL status/
+    // deathReason on the completed game, matching applyDeaths' DeathReason
+    // values. "left"/"host"/"admin_kill" are administrative removals, not a
+    // real in-game death, so they are excluded from deaths/voteExecutions/
+    // nightDeaths (a player removed this way also never has a role result
+    // recorded below, for the same reason).
+    const reallyDied = p.status === "dead" && !!p.deathReason && p.deathReason !== "left" && p.deathReason !== "host" && p.deathReason !== "admin_kill";
+    const isVoteExecution = reallyDied && p.deathReason === "lynch";
+    const isNightDeath = reallyDied && !isVoteExecution;
+
+    const roleKey = statRoleKeyFor(p);
+    const roleMap: RoleStatsMap = { ...(existingMap.get(p.userId) ?? {}) };
+    if (roleKey) {
+      const prev = roleMap[roleKey] ?? { games: 0, wins: 0, losses: 0 };
+      roleMap[roleKey] = {
+        games: prev.games + 1,
+        wins: prev.wins + won,
+        losses: prev.losses + (won ? 0 : 1),
+      };
+    }
+
+    statements.push(
+      db.prepare(
+        `UPDATE users SET
+           games_played = games_played + 1,
+           games_won = games_won + ?,
+           games_lost = games_lost + ?,
+           deaths = deaths + ?,
+           vote_executions = vote_executions + ?,
+           night_deaths = night_deaths + ?,
+           role_stats_json = ?,
+           updated_at = ?
+         WHERE telegram_id = ?`,
+      ).bind(
+        won,
+        won ? 0 : 1,
+        reallyDied ? 1 : 0,
+        isVoteExecution ? 1 : 0,
+        isNightDeath ? 1 : 0,
+        JSON.stringify(roleMap),
+        ts,
+        p.userId,
+      ),
+    );
   }
+  if (statements.length) await db.batch(statements);
+}
+
+export interface PlayerStatistics {
+  totalGames: number;
+  wins: number;
+  losses: number;
+  deaths: number;
+  voteExecutions: number;
+  nightDeaths: number;
+  roles: RoleStatsMap;
+}
+
+// Safe read for the stats display feature — a user row that pre-dates this
+// feature (or doesn't exist at all, e.g. never pressed /start) yields
+// all-zero defaults rather than throwing, per the "old player without
+// Statistics" requirement.
+export async function getPlayerStatistics(db: D1Database, userId: number): Promise<PlayerStatistics> {
+  const row = await db
+    .prepare(
+      `SELECT games_played, games_won, games_lost, deaths, vote_executions, night_deaths, role_stats_json
+       FROM users WHERE telegram_id = ?`,
+    )
+    .bind(userId)
+    .first<{
+      games_played: number; games_won: number; games_lost: number;
+      deaths: number; vote_executions: number; night_deaths: number;
+      role_stats_json: string | null;
+    }>();
+  if (!row) {
+    return { totalGames: 0, wins: 0, losses: 0, deaths: 0, voteExecutions: 0, nightDeaths: 0, roles: {} };
+  }
+  let roles: RoleStatsMap = {};
+  try {
+    roles = row.role_stats_json ? (JSON.parse(row.role_stats_json) as RoleStatsMap) : {};
+  } catch {
+    roles = {};
+  }
+  return {
+    totalGames: row.games_played ?? 0,
+    wins: row.games_won ?? 0,
+    losses: row.games_lost ?? 0,
+    deaths: row.deaths ?? 0,
+    voteExecutions: row.vote_executions ?? 0,
+    nightDeaths: row.night_deaths ?? 0,
+    roles,
+  };
+}
+
+// Win rate as a percentage, capped at one decimal place, never NaN/Infinity
+// for a zero-game denominator (returns "0" in that case).
+export function winRatePct(wins: number, total: number): string {
+  if (!total) return "0";
+  return (Math.round((wins / total) * 1000) / 10).toString();
 }
 
 export async function deleteLobbyPlayersNotIn(db: D1Database, gameId: string, userIds: number[]): Promise<void> {
@@ -3626,7 +3937,7 @@ export class GameRoom extends DurableObject<Env> {
       await upsertUser(this.env.DB, from, true);
       const parsed = parseCommand(text);
       if (parsed?.cmd === "start") { await this.onPrivateStart(msg, parsed.args); return; }
-      if (parsed?.cmd === "help") { await this.tg.sendMessage(from.id, fa.helpPrivate, { reply_markup: mainReplyKeyboard() }); return; }
+      if (parsed?.cmd === "help") { await this.tg.sendMessage(from.id, fa.helpPrivate); return; }
       if (parsed?.cmd === "myrole") { await this.sendMyRole(from.id); return; }
       if (parsed) { await this.tg.sendMessage(from.id, fa.mafiaChatCommandsIgnored); return; }
       if (await this.handleNoteFlow(from.id, text)) return;
@@ -3711,13 +4022,13 @@ export class GameRoom extends DurableObject<Env> {
     const from = msg.from!;
     if (args.startsWith("join_")) {
       const chatId = Number(args.slice(5));
-      if (!Number.isFinite(chatId)) { await this.tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() }); return; }
+      if (!Number.isFinite(chatId)) { await this.tg.sendMessage(from.id, fa.privateStart); return; }
       await this.joinFromPrivate(from, chatId);
       return;
     }
     const game = this.game;
     if (game && isActiveStatus(game.status) && findPlayer(game.players, from.id)) { await this.sendMyRole(from.id); return; }
-    await this.tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() });
+    await this.tg.sendMessage(from.id, fa.privateStart);
   }
 
   private async onCallback(cq: TgCallbackQuery): Promise<void> {
@@ -4016,10 +4327,14 @@ export class GameRoom extends DurableObject<Env> {
     if (!from) return;
     if (!(await this.isChatAdmin(from.id, msg.chat.id))) { await this.tg.sendMessage(msg.chat.id, fa.delpinAdminOnly); return; }
 
-    const game = this.game;
-    if (!game || game.chatId !== msg.chat.id) { await this.tg.sendMessage(msg.chat.id, fa.delpinNone); return; }
-
-    const count = await this.unpinAllBotPins();
+    // BUGFIX: this used to bail out entirely with "no pinned message found"
+    // whenever this.game was null or belonged to a different chat (e.g. no
+    // game currently running in this chat, or the DO was recreated) — but
+    // the pins /delpin needs to remove almost always come from an already-
+    // FINISHED game, which is exactly when this.game is most likely to be
+    // null/stale. /delpin no longer depends on a live game object at all;
+    // it works directly off the chat-scoped durable pin list.
+    const count = await this.unpinAllBotPins(msg.chat.id);
     await this.persist();
     await this.tg.sendMessage(msg.chat.id, count > 0 ? fa.delpinDone(count) : fa.delpinNone);
   }
@@ -4035,8 +4350,12 @@ export class GameRoom extends DurableObject<Env> {
     if (game && game.chatId === msg.chat.id) {
       if (game.temporaryCourtAdminUserId) await this.removeTemporaryCourtAdmin(game.temporaryCourtAdminUserId);
       if (isPlayingStatus(game.status)) await this.restoreAllPermissions();
-      await this.unpinAllBotPins();
     }
+    // Unconditional now (previously nested inside the `game` check above, so
+    // /reset with no live game skipped unpinning entirely) — same class of
+    // bug as /delpin: pins from an already-finished previous game must still
+    // get cleaned up even though this.game is null/stale.
+    await this.unpinAllBotPins(msg.chat.id);
 
     // Wipe every trace of this room's state — Durable Object storage (including the
     // scheduled alarm) as well as any leftover "active" rows in D1 for this chat — so
@@ -4322,7 +4641,7 @@ export class GameRoom extends DurableObject<Env> {
     // from this game (role reveals, phase-transition messages, etc.) was
     // left stuck forever on cancellation. Now uses the same "unpin every
     // tracked pin" cleanup as a normal game finish (see finish()/unpinAllBotPins).
-    await this.unpinAllBotPins();
+    await this.unpinAllBotPins(game.chatId);
     await this.persist(true);
   }
 
@@ -4894,8 +5213,7 @@ export class GameRoom extends DurableObject<Env> {
     // Central end-of-game pin cleanup — runs no matter which win condition
     // (town/mafia/independent) or other path led here, since every route to
     // game over passes through this one function.
-    await this.unpinAllBotPins();
-    game.status = "finished";
+    await this.unpinAllBotPins(game.chatId);
     game.phase = "finished";
     game.winner = winner;
     game.finishedAt = now();
@@ -5345,46 +5663,21 @@ export class GameRoom extends DurableObject<Env> {
     // the bot, Telegram rate limit) doesn't abort the entire role-distribution
     // and leave the game stuck on the "night" phase with no prompts sent.
     // Failed players can still recover their role via /myrole.
-    // NOTE: callSafe() never throws/rejects — it catches internally and
-    // resolves to {ok:false, error}. Promise.allSettled only reports a
-    // promise as "rejected" if it actually rejects, so combining it with
-    // callSafe here silently swallowed every failure (this bug predates the
-    // photo change but is easier to hit now — see below). Track failures
-    // from the resolved {ok, ...} value instead.
-    // Telegram caps photo *captions* at 1024 chars (vs 4096 for plain text
-    // messages), and the mafia role card grows with every teammate listed —
-    // so a long caption fails sendPhoto outright. Fall back to sending the
-    // photo with a trimmed caption plus the full role text as a follow-up
-    // message, so the player always gets their role even when it's long.
     const results = await Promise.allSettled(
-      game.players.map(async (p) => {
+      game.players.map((p) => {
         const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
-        const caption = fa.roleCard(p, mates);
         // Attach the persistent Reply Keyboard (📝 یادداشت) here too — this
         // is the very first private message each player gets at game start,
         // so it's the earliest natural point to show it, matching sendMyRole.
         // Role reveal is a photo (role artwork) with the role card text as
         // caption, instead of a bare text message.
-        if (caption.length <= 1024) {
-          return this.tg.callSafe("sendPhoto", {
-            chat_id: p.userId, photo: roleImageFor(p), caption, parse_mode: "HTML",
-            reply_markup: mainReplyKeyboard(),
-          });
-        }
-        const photoResult = await this.tg.callSafe("sendPhoto", {
-          chat_id: p.userId, photo: roleImageFor(p),
-        });
-        const textResult = await this.tg.callSafe("sendMessage", {
-          chat_id: p.userId, text: caption, parse_mode: "HTML", disable_web_page_preview: true,
+        return this.tg.callSafe("sendPhoto", {
+          chat_id: p.userId, photo: roleImageFor(p), caption: fa.roleCard(p, mates), parse_mode: "HTML",
           reply_markup: mainReplyKeyboard(),
         });
-        return (photoResult as { ok: boolean }).ok ? textResult : photoResult;
       }),
     );
-    const failedPlayers = game.players.filter((_, i) => {
-      const r = results[i];
-      return r?.status === "rejected" || (r?.status === "fulfilled" && (r.value as { ok: boolean } | undefined)?.ok === false);
-    });
+    const failedPlayers = game.players.filter((_, i) => results[i]?.status === "rejected");
     if (failedPlayers.length > 0) {
       console.warn(`sendRoleCards: ${failedPlayers.length}/${game.players.length} players did not receive their role card`, failedPlayers.map((p) => p.userId));
       // FIX #8: report the list of players who didn't get their role card to
@@ -5608,9 +5901,9 @@ export class GameRoom extends DurableObject<Env> {
 
   private async sendMyRole(userId: number): Promise<void> {
     const game = this.game;
-    if (!game || !isActiveStatus(game.status)) { await this.tg.sendMessage(userId, fa.notPlaying, { reply_markup: mainReplyKeyboard() }); return; }
+    if (!game || !isActiveStatus(game.status)) { await this.tg.sendMessage(userId, fa.notPlaying); return; }
     const p = findPlayer(game.players, userId);
-    if (!p) { await this.tg.sendMessage(userId, fa.notPlaying, { reply_markup: mainReplyKeyboard() }); return; }
+    if (!p) { await this.tg.sendMessage(userId, fa.notPlaying); return; }
     // Attach the persistent Reply Keyboard (📝 یادداشت button) here — this
     // is the main private-chat entry point (/start and /myrole both land
     // here) while a game is active, so this is the natural single place to
@@ -5618,16 +5911,7 @@ export class GameRoom extends DurableObject<Env> {
     // private message.
     if (p.status !== "alive" && p.role) { await this.tg.sendMessage(userId, fa.myRoleDead(p.role, p.independentRole), { reply_markup: mainReplyKeyboard() }); return; }
     const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
-    const caption = fa.roleCard(p, mates);
-    // Telegram caps photo captions at 1024 chars (vs 4096 for plain text) —
-    // a long mafia role card (grows with teammate count) can exceed that,
-    // so fall back to photo + separate text message rather than throwing.
-    if (caption.length <= 1024) {
-      await this.tg.sendPhoto(userId, roleImageFor(p), caption, { reply_markup: mainReplyKeyboard() });
-    } else {
-      await this.tg.sendPhoto(userId, roleImageFor(p), "");
-      await this.tg.sendMessage(userId, caption, { reply_markup: mainReplyKeyboard() });
-    }
+    await this.tg.sendPhoto(userId, roleImageFor(p), fa.roleCard(p, mates), { reply_markup: mainReplyKeyboard() });
   }
 
   // Runs the Lecter->Godfather succession check and — if it fired — tells
@@ -5983,33 +6267,76 @@ export class GameRoom extends DurableObject<Env> {
     await this.tg.callSafe("pinChatMessage", { chat_id: game.chatId, message_id: messageId, disable_notification: true });
     game.pinnedMessageId = messageId;
     if (!game.botPinnedMessageIds.includes(messageId)) game.botPinnedMessageIds.push(messageId);
+    // BUGFIX: also record this pin in a chat-scoped list that lives OUTSIDE
+    // any single game (see loadBotPins/saveBotPins). Previously the ONLY
+    // record of "what has this bot pinned" was game.botPinnedMessageIds,
+    // which is reset to [] every time a brand-new game/lobby is created
+    // (see cmdNew). Since finish() always re-pins the game-over announcement
+    // AFTER running its own cleanup (so players can see the result), that
+    // pin — and anything else that failed to unpin for any reason — was
+    // silently forgotten the moment the next game started: /delpin's guard
+    // only ever looked at the CURRENT game's list, so it could no longer see
+    // (and therefore could never unpin) messages pinned by a previous,
+    // already-finished game. This durable list is the fix: it persists
+    // across games for as long as the chat's GameRoom exists, so /delpin and
+    // the end-of-game cleanup always know about every pin the bot has ever
+    // left behind in this chat, not just the current game's.
+    await this.addBotPin(messageId);
   }
 
-  // Unpins EVERY message the bot has pinned during the current game (not
-  // just the latest one) and clears the tracking list. Used by both /delpin
-  // and the end-of-game cleanup — one shared implementation so they can
-  // never drift apart.
-  // BUGFIX: previously any individual unpinChatMessage failure (rate limit,
-  // message already unpinned/deleted by a human, etc.) was silently
-  // swallowed by callSafe, yet the whole tracking list was cleared anyway —
-  // so a message that failed to unpin was both left pinned AND forgotten,
-  // with no way to retry it later (via /delpin or the next game's cleanup).
-  // Now only the IDs that actually failed are kept in botPinnedMessageIds,
-  // so a later call (e.g. running /delpin again) can retry exactly those.
-  private async unpinAllBotPins(): Promise<number> {
-    const game = this.game;
-    if (!game || game.botPinnedMessageIds.length === 0) return 0;
-    const ids = [...game.botPinnedMessageIds];
+  // Chat-scoped, game-independent pin tracking. Stored under its own
+  // Durable Object storage key ("botPins") so it is NOT wiped when a new
+  // game/lobby object is created (unlike game.botPinnedMessageIds, which
+  // starts fresh — see cmdNew's newGame.botPinnedMessageIds: []). Cleared
+  // only by /reset's full-room wipe (ctx.storage.deleteAll()), which is
+  // correct since /reset already force-unpins everything first.
+  private async loadBotPins(): Promise<number[]> {
+    const stored = await this.ctx.storage.get<number[]>("botPins");
+    return stored ?? [];
+  }
+
+  private async saveBotPins(ids: number[]): Promise<void> {
+    await this.ctx.storage.put("botPins", ids);
+  }
+
+  private async addBotPin(messageId: number): Promise<void> {
+    const ids = await this.loadBotPins();
+    if (!ids.includes(messageId)) {
+      ids.push(messageId);
+      await this.saveBotPins(ids);
+    }
+  }
+
+  // Unpins EVERY message the bot has EVER pinned in this chat that hasn't
+  // been unpinned yet — sourced from the durable, game-independent list
+  // (see loadBotPins), not from any single game's in-memory
+  // botPinnedMessageIds. This is what lets /delpin and the end-of-game
+  // cleanup find and remove pins left behind by a PREVIOUS, already-finished
+  // game, which the old game-scoped-only tracking could never see again
+  // once a new game started. chatId is passed explicitly by the caller
+  // (every call site already has one on hand — game.chatId or msg.chat.id)
+  // so this still works even when this.game is null, unlike before.
+  private async unpinAllBotPins(chatId: number): Promise<number> {
+    const ids = await this.loadBotPins();
+    if (ids.length === 0) return 0;
     let count = 0;
     const stillPinned: number[] = [];
     for (const id of ids) {
-      const res = await this.tg.callSafe("unpinChatMessage", { chat_id: game.chatId, message_id: id });
+      const res = await this.tg.callSafe("unpinChatMessage", { chat_id: chatId, message_id: id });
       if (res.ok) count += 1;
       else stillPinned.push(id);
     }
-    game.botPinnedMessageIds = stillPinned;
-    if (game.pinnedMessageId !== null && !stillPinned.includes(game.pinnedMessageId)) {
-      game.pinnedMessageId = null;
+    await this.saveBotPins(stillPinned);
+    // Keep the in-memory game's mirror list consistent too, so anything
+    // reading game.botPinnedMessageIds directly still sees an accurate
+    // picture (defensive — nothing else currently reads it after this
+    // change, but this avoids leaving stale IDs there for future code).
+    const game = this.game;
+    if (game) {
+      game.botPinnedMessageIds = game.botPinnedMessageIds.filter((id) => stillPinned.includes(id));
+      if (game.pinnedMessageId !== null && !stillPinned.includes(game.pinnedMessageId)) {
+        game.pinnedMessageId = null;
+      }
     }
     return count;
   }
@@ -6488,26 +6815,77 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
     return;
   }
 
+  // "📊 آنالیز آمار من" Reply Keyboard button and its ST:* inline-keyboard
+  // callbacks — handled here, BEFORE active-game routing below, the same
+  // way the DM force-leave block above is. Statistics are entirely
+  // independent of any single game/GameRoom (they read the persistent
+  // `users` table directly), so a user who currently has an active game
+  // must still be able to check stats without the request being forwarded
+  // into that game's Durable Object, which has no idea what an ST:*
+  // callback or the stats button means.
+  if (text === STATS_BUTTON_LABEL) {
+    const stats = await getPlayerStatistics(env.DB, from.id);
+    await tg.sendMessage(from.id, fa.statsSummary(displayOf(from), stats), { reply_markup: { inline_keyboard: statsMainKeyboard() } });
+    return;
+  }
+  if (cq?.data?.startsWith(STATS_CB_PREFIX)) {
+    await handleStatsCallback(env, tg, cq);
+    return;
+  }
+
   let targetChat: number | null = null;
   if (parsed?.cmd === "start" && parsed.args.startsWith("join_")) { const n = Number(parsed.args.slice(5)); if (Number.isFinite(n)) targetChat = n; }
   if (targetChat === null) { const active = await findActiveGameForUser(env.DB, from.id); if (active) targetChat = active.chat_id; }
   if (targetChat !== null) { await callRoom(env, targetChat, update); return; }
   if (cq) { await tg.answerCallbackQuery(cq.id, "بازی فعالی پیدا نشد.", true); return; }
-  if (parsed?.cmd === "help") { await tg.sendMessage(from.id, fa.helpPrivate, { reply_markup: mainReplyKeyboard() }); return; }
-  if (parsed?.cmd === "myrole") { await tg.sendMessage(from.id, fa.notPlaying, { reply_markup: mainReplyKeyboard() }); return; }
-  // BUGFIX: the "📝 یادداشت" button is now shown from the very first /start
-  // (see below), before the user has any active game — but this branch (no
-  // active game found) is exactly where a press of that button lands, since
-  // findActiveGameForUser found nothing and callRoom/GameRoom.handleNoteFlow
-  // is never reached. Without this check, pressing the button here fell
-  // through to the generic fa.privateStart reply instead of telling the
-  // user the feature needs an active game.
-  if (msg?.text?.trim() === NOTE_BUTTON_LABEL) { await tg.sendMessage(from.id, fa.noteOnlyInGame, { reply_markup: mainReplyKeyboard() }); return; }
-  // The "📝 یادداشت" Reply Keyboard button is attached here (private-start
-  // with no active game) so it's present from the very first /start,
-  // permanently — not only once the user is inside an active game (a Reply
-  // Keyboard persists client-side once sent, until explicitly removed).
-  await tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() });
+  if (parsed?.cmd === "help") { await tg.sendMessage(from.id, fa.helpPrivate); return; }
+  if (parsed?.cmd === "myrole") { await tg.sendMessage(from.id, fa.notPlaying); return; }
+  await tg.sendMessage(from.id, fa.privateStart);
+}
+
+// Handles every "ST:..." inline-keyboard callback for the player-statistics
+// UI (main summary / roles page + pagination / records page), all via
+// editMessageText on the original message so browsing never spams new
+// messages. The displayed data always belongs to cq.from.id — see the
+// STATS_CB_PREFIX comment for why that can't be spoofed via callback_data.
+async function handleStatsCallback(env: Env, tg: Telegram, cq: TgCallbackQuery): Promise<void> {
+  const userId = cq.from.id;
+  const chatId = cq.message?.chat.id;
+  const messageId = cq.message?.message_id;
+  if (!chatId || !messageId) { await tg.answerCallbackQuery(cq.id); return; }
+
+  const data = cq.data ?? "";
+  const stats = await getPlayerStatistics(env.DB, userId);
+  const displayName = displayOf(cq.from);
+
+  if (data === "ST:main") {
+    await tg.editMessageText(chatId, messageId, fa.statsSummary(displayName, stats), { reply_markup: { inline_keyboard: statsMainKeyboard() } });
+    await tg.answerCallbackQuery(cq.id);
+    return;
+  }
+
+  if (data === "ST:records") {
+    await tg.editMessageText(chatId, messageId, fa.statsRecords(displayName, stats), { reply_markup: { inline_keyboard: statsRecordsKeyboard() } });
+    await tg.answerCallbackQuery(cq.id);
+    return;
+  }
+
+  if (data.startsWith("ST:roles:")) {
+    const requested = Number(data.slice("ST:roles:".length));
+    const allEntries = sortedRoleEntries(stats.roles);
+    const totalPages = Math.max(1, Math.ceil(allEntries.length / STATS_ROLES_PAGE_SIZE));
+    const page = Number.isFinite(requested) ? Math.min(Math.max(0, requested), totalPages - 1) : 0;
+    const pageEntries = allEntries.slice(page * STATS_ROLES_PAGE_SIZE, (page + 1) * STATS_ROLES_PAGE_SIZE);
+    await tg.editMessageText(
+      chatId, messageId,
+      fa.statsRolesPage(displayName, pageEntries, page + 1, totalPages),
+      { reply_markup: { inline_keyboard: statsRolesKeyboard(page, totalPages) } },
+    );
+    await tg.answerCallbackQuery(cq.id);
+    return;
+  }
+
+  await tg.answerCallbackQuery(cq.id);
 }
 
 async function setup(url: URL, env: Env): Promise<Response> {

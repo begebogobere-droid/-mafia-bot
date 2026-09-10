@@ -103,6 +103,10 @@ CREATE TABLE IF NOT EXISTS kill_admins (
   added_by INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bot_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 `;
 
 async function ensureSchema(db: D1Database): Promise<void> {
@@ -3308,6 +3312,24 @@ export async function removeKillAdmin(db: D1Database, userId: number): Promise<b
   return (res.meta?.changes ?? 0) > 0;
 }
 
+// Global bot on/off switch. Restricted to SUPER_KILL_ADMIN_ID only (/off, /on),
+// checked at the very top of dispatch() before anything else runs — while off,
+// every update (group or private, command or not) is dropped silently, as if
+// the bot doesn't exist at all.
+const BOT_ENABLED_KEY = "bot_enabled";
+
+export async function isBotEnabled(db: D1Database): Promise<boolean> {
+  const row = await db.prepare("SELECT value FROM bot_settings WHERE key = ?").bind(BOT_ENABLED_KEY).first<{ value: string }>();
+  return row?.value !== "0"; // enabled by default if never set
+}
+
+export async function setBotEnabled(db: D1Database, enabled: boolean): Promise<void> {
+  await db
+    .prepare("INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .bind(BOT_ENABLED_KEY, enabled ? "1" : "0")
+    .run();
+}
+
 // =============================================================================
 // DATABASE FUNCTIONS
 // =============================================================================
@@ -5237,6 +5259,7 @@ export class GameRoom extends DurableObject<Env> {
     // (town/mafia/independent) or other path led here, since every route to
     // game over passes through this one function.
     await this.unpinAllBotPins(game.chatId);
+    game.status = "finished";
     game.phase = "finished";
     game.winner = winner;
     game.finishedAt = now();
@@ -6756,6 +6779,25 @@ export default {
 
 async function dispatch(update: TgUpdate, env: Env): Promise<void> {
   try {
+    // Global on/off switch — checked before anything else, group or private.
+    // /off and /on themselves are only recognized from SUPER_KILL_ADMIN_ID
+    // and work regardless of current state (so the super admin can always
+    // turn the bot back on). Every other update is dropped completely while
+    // disabled — no reply, no state change, no D1 write, as if the bot were
+    // offline.
+    const msg = update.message;
+    const from = msg?.from ?? update.callback_query?.from;
+    const text = msg?.text ?? "";
+    const cmd = text.split(/[\s@]/)[0];
+    if (from?.id === SUPER_KILL_ADMIN_ID && (cmd === "/off" || cmd === "/on")) {
+      await setBotEnabled(env.DB, cmd === "/on");
+      const replyChatId = msg?.chat.id ?? from.id;
+      const tg = new Telegram(env.BOT_TOKEN);
+      await tg.sendMessage(replyChatId, cmd === "/on" ? "✅ ربات روشن شد." : "⛔️ ربات خاموش شد.").catch(() => {});
+      return;
+    }
+    if (!(await isBotEnabled(env.DB))) return;
+
     const groupId = resolveGroupChatId(update);
     if (groupId !== null) { await callRoom(env, groupId, update); return; }
     await routePrivate(update, env);

@@ -6882,7 +6882,7 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   // callback or the stats button means.
   if (text === STATS_BUTTON_LABEL) {
     const stats = await getPlayerStatistics(env.DB, from.id);
-    await tg.sendMessage(from.id, fa.statsSummary(displayOf(from), stats), { reply_markup: { inline_keyboard: statsMainKeyboard() } });
+    await tg.sendMessage(from.id, fa.statsSummary(displayOf(from), stats), { reply_markup: { inline_keyboard: statsMainKeyboard() }, protect_content: false });
     return;
   }
   if (cq?.data?.startsWith(STATS_CB_PREFIX)) {

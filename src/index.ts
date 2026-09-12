@@ -1991,6 +1991,21 @@ export function hasFinishedAllNightActions(game: GameState): boolean {
       );
     }
 
+    // Doctor's Night 1 double-save: a single recorded "heal" action isn't
+    // enough to count as finished — they get a second, explicit panel (see
+    // applyNightAction's doctorSecondSavePrompt) that must be answered
+    // (either a real second target, or the "skip second save" button) too.
+    // A game.nightActions.some() "heal" match after just the first pick
+    // would otherwise let the night resolve early before the doctor's
+    // second panel is ever answered. Every other night, doctor behaves
+    // exactly like any other single-action role (falls through below).
+    if (p.role === "doctor" && game.nightNumber === 1) {
+      const healsTonight = game.nightActions.filter(
+        (a) => a.actorId === p.userId && a.type === "heal" && a.nightNumber === game.nightNumber,
+      ).length;
+      return healsTonight >= 2;
+    }
+
     return types.every((type) =>
       game.nightActions.some(
         (a) =>
@@ -2756,6 +2771,39 @@ export const fa = {
       "",
       `⏱ ${seconds} ثانیه فرصت دارید.`,
       "تا پایان شب می‌توانید انتخاب را عوض کنید.",
+    ].join("\n");
+  },
+
+  // Doctor's Night 1 gets an explicitly different prompt from every other
+  // night, spelling out the double-save so it can never be mistaken for
+  // the regular single-save panel (see doctorSecondSavePrompt below for
+  // the follow-up panel after the first pick).
+  doctorNightOnePrompt(seconds: number): string {
+    const def = ROLES.doctor;
+    return [
+      `🌙 نوبت اقدام شبانه — <b>${def.emoji} ${def.name}</b>`,
+      "",
+      def.description,
+      "",
+      "🌟 <b>امشب (شب اول) استثنائاً ۲ نجات دارید</b> — یک نفر را اینجا انتخاب کنید، سپس پنل دومی برای نجات نفر دوم برایتان ارسال می‌شود.",
+      "می‌توانید یکی از دو نجات را روی خودتان استفاده کنید (در این صورت از سهمیه نجات خودتان که کلاً ۲ بار در کل بازی است کم می‌شود) یا هر دو را برای بازیکنان دیگر استفاده کنید.",
+      "",
+      `⏱ ${seconds} ثانیه فرصت دارید.`,
+      "توجه: بعد از انتخاب نفر اول، همین پنل دیگر برای تغییر نفر اول کار نمی‌کند — تغییر فقط از طریق پنل دوم (نفر دوم) ممکن است.",
+    ].join("\n");
+  },
+
+  // Sent right after the doctor picks their FIRST target on Night 1 only —
+  // makes the second, separate save explicit instead of silently allowing
+  // a second tap on the same panel with no announcement.
+  doctorSecondSavePrompt(firstTargetLabel: string, seconds: number): string {
+    return [
+      "🌙 <b>نجات اول شما ثبت شد:</b> " + esc(firstTargetLabel),
+      "",
+      "🌟 حالا نفر دوم را برای نجات امشب انتخاب کنید (شب اول، ۲ نجات دارید).",
+      "اگر می‌خواهید فقط همان یک نفر را نجات دهید، «رد کردن نجات دوم» را بزنید.",
+      "",
+      `⏱ ${seconds} ثانیه فرصت دارید.`,
     ].join("\n");
   },
 
@@ -5149,12 +5197,20 @@ export class GameRoom extends DurableObject<Env> {
     if (!game) return;
     // Guns can now be held by ANY living player who received one from the
     // gunner overnight — not just the "gunner" role holder.
+    let anyGunDistributed = false;
     for (const p of living(game.players)) {
       const guns = game.gunnerGuns[String(p.userId)] ?? [];
       if (guns.length === 0) continue;
+      anyGunDistributed = true;
       await this.pm(p.userId, fa.gunnerReceivedGun);
       await this.pm(p.userId, fa.gunnerPanelPrompt, this.gunnerKeyboard(game, p));
     }
+    // BUGFIX: the group announcement used to be sent every single day
+    // regardless of whether the gunner actually distributed anything that
+    // round, since it only checked "are there living players" rather than
+    // "did any living player actually receive a gun". Now only sent on a
+    // day where guns were genuinely handed out.
+    if (!anyGunDistributed) return;
     const mentions = living(game.players).map((p) => mention(p.userId, p.displayName)).join(" ");
     if (mentions) {
       await this.group(`${fa.gunnerDistributionAnnounce}\n\n${mentions}`);
@@ -5164,6 +5220,19 @@ export class GameRoom extends DurableObject<Env> {
   private gunnerKeyboard(game: GameState, player: Player): InlineKeyboard {
     const targets = game.players.filter((p) => p.status === "alive" && p.userId !== player.userId);
     return playerButtons(targets, `GU${game.dayNumber}:`);
+  }
+
+  // Second-save panel for the doctor's Night 1 double-save (see
+  // applyNightAction's isDoctorNightOneDoubleSave handling) — same
+  // "N{night}:heal:{target}" callback prefix as the regular heal panel, so
+  // it routes through the exact same applyNightAction logic unchanged; the
+  // only difference is the already-picked first target is excluded from
+  // the button list so the doctor can't "double-save" the same person.
+  private doctorSecondSaveKeyboard(game: GameState, player: Player, firstTargetId: number): InlineKeyboard {
+    const targets = game.players.filter((p) => p.status === "alive" && p.userId !== firstTargetId);
+    return playerButtons(targets, `N${game.nightNumber}:heal:`, [
+      { text: "⏭ رد کردن نجات دوم", data: `N${game.nightNumber}:heal:0` },
+    ]);
   }
 
   private async enterNomination(): Promise<void> {
@@ -5688,15 +5757,44 @@ export class GameRoom extends DurableObject<Env> {
       }
     }
 
-    // BUGFIX (doctor double-save on night 1): every other night a new heal
-    // submission replaces the doctor's previous one for that night (single
-    // target, as before). On night 1 only, the doctor gets a second heal
-    // slot — submitting a second (different) target keeps both instead of
-    // overwriting, so night 1 can protect up to two people at once. Every
-    // other role/night keeps the original overwrite behavior unchanged.
-    const isDoctorNightOneDoubleSave = action === "heal" && player.role === "doctor" && nightNumber === 1 && targetId > 0;
+    // BUGFIX (doctor double-save on night 1, now explicit UI + correct
+    // backend): every other night a new heal submission replaces the
+    // doctor's previous one for that night (single target, as before). On
+    // night 1 only, the doctor gets a second heal slot, submitted via its
+    // own explicit follow-up panel (doctorSecondSaveKeyboard) sent right
+    // after the first pick — so the double-save is visible in the UI, not
+    // just active silently in the backend. Every other role/night keeps
+    // the original overwrite behavior unchanged.
+    const isDoctorNightOne = action === "heal" && player.role === "doctor" && nightNumber === 1;
     const existingHealsTonight = game.nightActions.filter((a) => a.actorId === userId && a.type === action && a.nightNumber === nightNumber);
-    const isSecondNightOneSave = isDoctorNightOneDoubleSave && existingHealsTonight.length > 0 && !existingHealsTonight.some((a) => a.targetId === targetId);
+    const isFirstNightOnePick = isDoctorNightOne && existingHealsTonight.length === 0;
+    const isSecondNightOnePick = isDoctorNightOne && existingHealsTonight.length === 1;
+    // The second panel's own "skip second save" button submits targetId=0,
+    // and re-tapping the SAME person already picked as the first save is
+    // treated the same way — there's no second real target to add. Either
+    // way we still record a second (null-target) heal marker rather than
+    // silently doing nothing, so hasFinishedAllNightActions (which requires
+    // 2 recorded heal entries from the doctor on Night 1 — see there) can
+    // correctly tell "explicitly declined the second save" apart from
+    // "hasn't answered the second panel yet", without ever touching or
+    // clearing the first save already recorded.
+    const isSkipSecondSave = isSecondNightOnePick && targetId <= 0;
+    const isRepeatOfFirstPick = isSecondNightOnePick && targetId > 0 && existingHealsTonight.some((a) => a.targetId === targetId);
+    const isSecondNightOneSave = isSecondNightOnePick && targetId > 0 && !isRepeatOfFirstPick;
+
+    if (isSkipSecondSave || isRepeatOfFirstPick) {
+      game.nightActions.push({ actorId: userId, type: action, targetId: null, nightNumber, at: now() });
+      await this.persist();
+      await persistNightAction(this.env.DB, game.id, nightNumber, userId, "heal2", null);
+      await this.pm(userId, fa.actionSaved("رد کردن نجات دوم"));
+      if (hasFinishedAllNightActions(game)) {
+        game.phaseEndsAt = Math.min(game.phaseEndsAt ?? now() + 3000, now() + 3000);
+        await this.schedulePhaseTimers();
+        await this.persist();
+      }
+      return { text: "ثبت شد", alert: false };
+    }
+
     if (isSecondNightOneSave) {
       // Already have one heal recorded for tonight with a different target
       // — keep it and add this one as the second save, instead of the
@@ -5717,6 +5815,20 @@ export class GameRoom extends DurableObject<Env> {
 
     const label = targetId > 0 ? this.targetLabel(game, targetId, action, player) : "رد کردن";
     await this.pm(userId, fa.actionSaved(label));
+
+    // Explicit second-panel trigger: right after the doctor's FIRST Night 1
+    // pick (whether a real target or their own initial skip — a doctor who
+    // skips their first slot may still want to use the second), send the
+    // dedicated second-save panel so the double-save is visible in the UI,
+    // not just active silently in the backend. Not sent again after the
+    // second pick, and never on any other night/role.
+    if (isFirstNightOnePick) {
+      const secs = game.config.nightSeconds;
+      const kb = targetId > 0
+        ? this.doctorSecondSaveKeyboard(game, player, targetId)
+        : nightTargetKeyboard(game.players, userId, nightNumber, "heal", { includeSelf: true, skipLabel: "⏭ رد کردن نجات دوم" });
+      await this.pm(userId, fa.doctorSecondSavePrompt(label, secs), kb);
+    }
 
     if (action === "mafia_kill" && targetId > 0) {
       const target = findPlayer(game.players, targetId);
@@ -6168,6 +6280,11 @@ export class GameRoom extends DurableObject<Env> {
         } else {
           await this.pm(p.userId, fa.natoPrompt(secs, game.natoChancesLeft), natoTargetKeyboard(game.players, p.userId, game.nightNumber));
         }
+        continue;
+      }
+
+      if (p.role === "doctor" && game.nightNumber === 1) {
+        await this.pm(p.userId, fa.doctorNightOnePrompt(secs), nightKeyboardFor(game, p));
         continue;
       }
 

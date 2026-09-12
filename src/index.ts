@@ -209,6 +209,7 @@ export type GameStatus =
   | "idle"
   | "lobby"
   | "starting"
+  | "intro"
   | "night"
   | "inquiry"
   | "day"
@@ -221,6 +222,7 @@ export type GameStatus =
 
 export type Phase =
   | "lobby"
+  | "intro"
   | "night"
   | "inquiry"
   | "day"
@@ -404,6 +406,21 @@ export interface GameState {
   pendingInquiryDeaths: DeathRecord[] | null;
   accusedUserId: number | null;
   temporaryCourtAdminUserId: number | null;
+  // Intro (pre-Night-1 player-by-player self-introduction). introOrder is
+  // fixed once at intro start; introIndex points at whose turn it currently
+  // is. introAdminUserId mirrors temporaryCourtAdminUserId's ownership
+  // pattern (see promoteIntroPlayer/demoteIntroPlayer) — the ONE player, if
+  // any, the bot has temporarily promoted for their intro turn, so a stray
+  // callback/timer can never demote/promote the wrong player.
+  introOrder: number[];
+  introIndex: number;
+  introAdminUserId: number | null;
+  // True only when the bot itself promoted introAdminUserId (they were a
+  // plain member before their turn). False means introAdminUserId was
+  // already a real admin/creator BEFORE intro touched them, so
+  // demoteIntroPlayer must never call promoteChatMember to strip rights
+  // the bot never granted in the first place.
+  introAdminWasPromotedByBot: boolean;
   silencedUserIds: number[];
   blockedUserIds: number[];
   escortBlockedUserIds: number[];
@@ -505,6 +522,7 @@ export function isActiveStatus(status: GameStatus): boolean {
   return (
     status === "lobby" ||
     status === "starting" ||
+    status === "intro" ||
     status === "night" ||
     status === "inquiry" ||
     status === "day" ||
@@ -518,6 +536,7 @@ export function isActiveStatus(status: GameStatus): boolean {
 export function isPlayingStatus(status: GameStatus): boolean {
   return (
     status === "starting" ||
+    status === "intro" ||
     status === "night" ||
     status === "inquiry" ||
     status === "day" ||
@@ -606,7 +625,7 @@ function weightedPickIndex(weights: number[]): number {
 // shows up in the player's recent history gets penalized, and more so the
 // more recently they had it — so getting the SAME role again right away
 // is unlikely, while it's not literally impossible (keeps things random).
-function roleWeight(role: RoleId, history: RoleId[]): number {
+function roleWeight(role: GuessableRoleId, history: GuessableRoleId[]): number {
   let weight = 100;
   for (let i = 0; i < history.length; i++) {
     if (history[i] === role) {
@@ -615,6 +634,32 @@ function roleWeight(role: RoleId, history: RoleId[]): number {
     }
   }
   return Math.max(weight, 5);
+}
+
+// Same idea as roleWeight but at the *side* level (mafia / town /
+// independent) rather than the exact role — penalizes a player who has
+// been on the same side several games running, so someone who keeps
+// landing on town (in any role) is a bit less likely to land on town
+// again, without ever making it impossible. Never goes to zero.
+function sideWeight(side: Team, history: GuessableRoleId[]): number {
+  let weight = 100;
+  for (let i = 0; i < history.length; i++) {
+    if (entrySide(history[i]!) === side) {
+      const recency = i + 1;
+      weight -= 20 * recency;
+    }
+  }
+  return Math.max(weight, 10);
+}
+
+// Recovers which side a stored history entry belonged to. RoleId and
+// IndependentRoleId are disjoint string unions, so a plain membership
+// check is enough to tell them apart.
+function entrySide(entry: GuessableRoleId): Team {
+  if ((["johnny", "joker", "bomber", "lonewolf"] as const).includes(entry as IndependentRoleId)) {
+    return "independent";
+  }
+  return ROLES[entry as RoleId].team;
 }
 
 export function randomId(prefix = "g"): string {
@@ -1562,6 +1607,13 @@ export function sniperShotsFor(playerCount: number): number {
   return 2;
 }
 
+// Paranoid gets an extra alert in larger games (>=8 players): 3 instead of
+// the base 2. Only affects how many alerts the paranoid can use — no
+// effect on role composition/distribution.
+export function paranoidAlertsFor(playerCount: number): number {
+  return playerCount >= 8 ? 3 : 2;
+}
+
 export function buildRoleListNew(playerCount: number): RoleId[] {
   if (playerCount < 6 || playerCount > 12) {
     throw new Error(`unsupported player count: ${playerCount}`);
@@ -1600,14 +1652,10 @@ export function buildRoleListNew(playerCount: number): RoleId[] {
 // among the non-independent players, just via weighted-random selection
 // instead of a straight positional zip; still fully random, just less
 // repetitive.
-export function assignRoles(players: Player[], roleHistory: Record<number, RoleId[]> = {}): Player[] {
+export function assignRoles(players: Player[], roleHistory: Record<number, GuessableRoleId[]> = {}): Player[] {
   const playerCount = players.length;
   const roleList = buildRoleListNew(playerCount); // exactly playerCount - 1 entries by design
-
-  // Select independent role
   const indieRoles: IndependentRoleId[] = ["johnny", "joker", "bomber", "lonewolf"];
-  const indieIndex = Math.floor(Math.random() * indieRoles.length);
-  const indieRole = indieRoles[indieIndex];
 
   // BUGFIX: roleList (playerCount - 1 distinct roles) and the shuffled
   // player order used to be paired up by shuffling BOTH a "roleList + one
@@ -1626,19 +1674,40 @@ export function assignRoles(players: Player[], roleHistory: Record<number, RoleI
   // (night-action logic and win-checks key off `independentRole`/`team`,
   // never off `.role` for independent players) and can't disturb the real
   // composition since it never consumes a roleList slot.
+  //
+  // BUGFIX (fair side distribution): which player lands the independent
+  // slot, and which independent identity they get, used to be plain
+  // uniform random — so a player could land "independent" (or e.g.
+  // "joker" specifically) several games running. Both picks are now
+  // weighted by sideWeight/roleWeight against that player's recent
+  // history, same spirit as the roleList weighting below: still fully
+  // random and never impossible, just less repetitive.
   const shuffledPlayers = shuffle([...players]);
-  const indiePlayer = shuffledPlayers[playerCount - 1]!;
-  const rolePlayers = shuffledPlayers.slice(0, playerCount - 1);
+  const indieWeights = shuffledPlayers.map((p) => sideWeight("independent", roleHistory[p.userId] ?? []));
+  const indiePlayerIdx = weightedPickIndex(indieWeights);
+  const indiePlayer = shuffledPlayers[indiePlayerIdx]!;
+  const rolePlayers = shuffledPlayers.filter((p) => p.userId !== indiePlayer.userId);
+
+  const indieRoleWeights = indieRoles.map((r) => roleWeight(r, roleHistory[indiePlayer.userId] ?? []));
+  const indieRole = indieRoles[weightedPickIndex(indieRoleWeights)]!;
+
   const flavorRole = roleList[Math.floor(Math.random() * roleList.length)]!;
 
   // Weighted-random 1:1 assignment: go through the roles in random order
   // and, for each one, weight-pick which remaining player gets it based on
-  // how recently (if ever) they had that exact role.
+  // how recently (if ever) they had that exact role, combined with how
+  // recently they've been on that role's side at all (mafia/town) — so a
+  // player who's had several mafia roles in a row is less likely to get
+  // *any* mafia role next, not just the one exact role repeated.
   const shuffledRoles = shuffle([...roleList]);
   const remainingPlayers = [...rolePlayers];
   const roleByUserId = new Map<number, RoleId>();
   for (const role of shuffledRoles) {
-    const weights = remainingPlayers.map((p) => roleWeight(role, roleHistory[p.userId] ?? []));
+    const side = ROLES[role].team;
+    const weights = remainingPlayers.map((p) => {
+      const history = roleHistory[p.userId] ?? [];
+      return roleWeight(role, history) * (sideWeight(side, history) / 100);
+    });
     const idx = weightedPickIndex(weights);
     const chosen = remainingPlayers[idx]!;
     roleByUserId.set(chosen.userId, role);
@@ -2640,6 +2709,33 @@ export const fa = {
     ].join("\n");
   },
 
+  // ===========================================================================
+  // INTRO (pre-Night-1 turn-based self-introduction)
+  // ===========================================================================
+
+  introTurn(userId: number, name: string, seconds: number): string {
+    return [
+      "🎙 <b>نوبت معرفی</b>",
+      "",
+      `👤 ${mention(userId, name)}`,
+      "",
+      "شروع به معرفی کنید.",
+      `⏱ زمان شما: ${seconds} ثانیه`,
+    ].join("\n");
+  },
+
+  // Same wording the mafia-teammates section used to have inline in the
+  // role card — moved here so it can be sent separately, exactly at Night 1
+  // start, instead of at role distribution (see enterNight/roleCard).
+  mafiaTeamInfo(teammates: Player[]): string {
+    return [
+      "🌙 <b>شب اول آغاز شد</b>",
+      "",
+      "👥 <b>یاران شما:</b>",
+      ...teammates.map((t) => `👤 ${esc(t.displayName)} — ${roleLabel(t.role)}`),
+    ].join("\n");
+  },
+
   nightStart(night: number, seconds: number): string {
     return [
       `🌙 <b>شب ${night} آغاز شد</b>`,
@@ -2761,6 +2857,7 @@ export const fa = {
   reasonAdminKill: "حذف توسط مدیریت",
 
   gunnerReceivedGun: "🔫 شما یک تفنگ دریافت کردید.",
+  gunnerDistributionAnnounce: "🔫 تفنگدار تفنگ‌هایی را بین اعضای بازی توزیع کرده است.\nلطفاً برای مشاهده اینکه آیا تفنگ دریافت کرده‌اید یا خیر، پیام خصوصی ربات را بررسی کنید.",
 
   gunnerPanelPrompt: "🔫 می‌توانید با تفنگتان روی یکی از بازیکنان زنده شلیک کنید:",
 
@@ -3282,6 +3379,7 @@ export const fa = {
 export function phaseFa(phase: string): string {
   switch (phase) {
     case "lobby": return "لابی";
+    case "intro": return "معرفی بازیکنان";
     case "night": return "شب";
     case "inquiry": return "رأی‌گیری استعلام";
     case "day": return "روز / بحث";
@@ -3403,17 +3501,17 @@ export async function hasStartedBot(db: D1Database, userId: number): Promise<boo
 // roles so assignRoles() can weight its random pick away from roles a
 // player just had, instead of a plain uniform shuffle that lets the same
 // role land on the same person several games in a row.
-export async function getRoleHistory(db: D1Database, userIds: number[]): Promise<Record<number, RoleId[]>> {
+export async function getRoleHistory(db: D1Database, userIds: number[]): Promise<Record<number, GuessableRoleId[]>> {
   if (userIds.length === 0) return {};
   const placeholders = userIds.map(() => "?").join(",");
   const rows = await db
     .prepare(`SELECT telegram_id, recent_roles FROM users WHERE telegram_id IN (${placeholders})`)
     .bind(...userIds)
     .all<{ telegram_id: number; recent_roles: string | null }>();
-  const map: Record<number, RoleId[]> = {};
+  const map: Record<number, GuessableRoleId[]> = {};
   for (const row of rows.results ?? []) {
     try {
-      map[row.telegram_id] = row.recent_roles ? (JSON.parse(row.recent_roles) as RoleId[]) : [];
+      map[row.telegram_id] = row.recent_roles ? (JSON.parse(row.recent_roles) as GuessableRoleId[]) : [];
     } catch {
       map[row.telegram_id] = [];
     }
@@ -3427,8 +3525,8 @@ export async function getRoleHistory(db: D1Database, userIds: number[]): Promise
 // from starting, so callers should wrap this in its own try/catch.
 export async function saveRoleHistory(
   db: D1Database,
-  previousHistory: Record<number, RoleId[]>,
-  assignments: { userId: number; role: RoleId }[],
+  previousHistory: Record<number, GuessableRoleId[]>,
+  assignments: { userId: number; role: GuessableRoleId }[],
 ): Promise<void> {
   if (assignments.length === 0) return;
   const ts = Date.now();
@@ -3791,6 +3889,7 @@ const EXTEND_SECONDS = 60;
 const DEFENSE_SECONDS = 50;
 const INQUIRY_SECONDS = 30;
 const CITY_INQUIRY_TOTAL = 2;
+const INTRO_TURN_SECONDS = 30;
 
 const COURT_ADMIN_MINIMAL_RIGHTS: Record<string, boolean> = {
   is_anonymous: false,
@@ -3816,6 +3915,14 @@ const COURT_ADMIN_NO_RIGHTS: Record<string, boolean> = {
   ...COURT_ADMIN_MINIMAL_RIGHTS,
   can_manage_chat: false,
 };
+
+// Same minimal "can post in a locked group" trick as COURT_ADMIN_*, reused
+// for Intro's one-player-at-a-time speaking turn. Kept as its own named
+// constant (identical rights) rather than sharing COURT_ADMIN_* so the two
+// systems stay clearly separate in logs/diffs, per the "don't entangle
+// with court/defense logic" requirement.
+const INTRO_ADMIN_RIGHTS: Record<string, boolean> = COURT_ADMIN_MINIMAL_RIGHTS;
+const INTRO_ADMIN_NO_RIGHTS: Record<string, boolean> = COURT_ADMIN_NO_RIGHTS;
 
 
 // =============================================================================
@@ -3852,6 +3959,19 @@ export class GameRoom extends DurableObject<Env> {
       }
       if (this.game?.temporaryCourtAdminUserId && this.game.status !== "defense") {
         await this.removeTemporaryCourtAdmin(this.game.temporaryCourtAdminUserId);
+      }
+      // Same migration/self-heal for the newer intro-admin fields — older
+      // persisted state won't have them, and a stray intro-admin marker
+      // outside "intro" status (e.g. the Durable Object restarted mid-demote)
+      // should never survive into whatever phase comes next.
+      if (this.game && this.game.introOrder === undefined) {
+        this.game.introOrder = [];
+        this.game.introIndex = 0;
+        this.game.introAdminUserId = null;
+        this.game.introAdminWasPromotedByBot = false;
+      }
+      if (this.game?.introAdminUserId && this.game.status !== "intro") {
+        await this.demoteIntroPlayer(this.game.introAdminUserId);
       }
       if (this.game && isActiveStatus(this.game.status)) {
         await this.ensureAlarm();
@@ -4303,6 +4423,10 @@ export class GameRoom extends DurableObject<Env> {
       const cleared = await this.removeTemporaryCourtAdmin(this.game.temporaryCourtAdminUserId);
       if (!cleared) { await this.tg.sendMessage(msg.chat.id, "⚠️ پاک‌سازی دسترسی موقت دادگاه قبلی انجام نشد."); return; }
     }
+    if (this.game?.introAdminUserId) {
+      const introCleared = await this.demoteIntroPlayer(this.game.introAdminUserId);
+      if (!introCleared) { await this.tg.sendMessage(msg.chat.id, "⚠️ پاک‌سازی دسترسی موقت معرفی قبلی انجام نشد."); return; }
+    }
     const admin = await this.assertBotAdmin(msg.chat.id);
     if (!admin.ok) { await this.tg.sendMessage(msg.chat.id, admin.message); return; }
 
@@ -4321,7 +4445,9 @@ export class GameRoom extends DurableObject<Env> {
       phaseEndsAt: ts + DEFAULT_CONFIG.lobbySeconds * 1000, dayPhaseMaxEndsAt: null, reminderAt: null, nextTickAt: null,
       alarmKind: "phase_end", players: [host], nightActions: [], votes: [], verdictVotes: [],
       inquiryVotes: [], cityInquiryCount: CITY_INQUIRY_TOTAL, pendingInquiryDeaths: null,
-      accusedUserId: null, temporaryCourtAdminUserId: null, silencedUserIds: [], blockedUserIds: [],
+      accusedUserId: null, temporaryCourtAdminUserId: null,
+      introOrder: [], introIndex: 0, introAdminUserId: null, introAdminWasPromotedByBot: false,
+      silencedUserIds: [], blockedUserIds: [],
       escortBlockedUserIds: [], doctorSelfHealUsedBy: [], sniperShotsLeft: {}, detectiveChecked: {},
       godfatherRevealed: false,
       natoChancesLeft: 2, paranoidAlertLeft: 2, bomberMarkedTargets: [], independentRoleType: null,
@@ -4397,6 +4523,7 @@ export class GameRoom extends DurableObject<Env> {
     const game = this.game;
     if (game && game.chatId === msg.chat.id) {
       if (game.temporaryCourtAdminUserId) await this.removeTemporaryCourtAdmin(game.temporaryCourtAdminUserId);
+      if (game.introAdminUserId) await this.demoteIntroPlayer(game.introAdminUserId);
       if (isPlayingStatus(game.status)) await this.restoreAllPermissions();
     }
     // Unconditional now (previously nested inside the `game` check above, so
@@ -4603,12 +4730,13 @@ export class GameRoom extends DurableObject<Env> {
     // run /new again.
     try {
       await this.snapshotPermissions();
-      // BUGFIX (fair role distribution): weight the random assignment away
-      // from each player's recently-played roles instead of a plain
-      // uniform shuffle. Best-effort history lookup — if D1 is unreachable
-      // this just falls back to an unweighted (still fully random) draw
-      // rather than blocking the game from starting.
-      let roleHistory: Record<number, RoleId[]> = {};
+      // BUGFIX (fair role/side distribution): weight the random assignment
+      // away from each player's recently-played roles AND sides (mafia/
+      // town/independent) instead of a plain uniform shuffle. Best-effort
+      // history lookup — if D1 is unreachable this just falls back to an
+      // unweighted (still fully random) draw rather than blocking the game
+      // from starting.
+      let roleHistory: Record<number, GuessableRoleId[]> = {};
       try {
         roleHistory = await getRoleHistory(this.env.DB, game.players.map((p) => p.userId));
       } catch (err) {
@@ -4616,7 +4744,14 @@ export class GameRoom extends DurableObject<Env> {
       }
       game.players = assignRoles(game.players, roleHistory);
       try {
-        await saveRoleHistory(this.env.DB, roleHistory, game.players.map((p) => ({ userId: p.userId, role: p.role! })));
+        // Save each player's TRUE identity (their real independentRole for
+        // the independent player, not the cosmetic flavor `.role` text) so
+        // future weighting reflects what side they actually played, not
+        // just what flavor role was displayed to them.
+        await saveRoleHistory(this.env.DB, roleHistory, game.players.map((p) => ({
+          userId: p.userId,
+          role: p.independentRole ?? p.role!,
+        })));
       } catch (err) {
         console.error("saveRoleHistory failed", err);
       }
@@ -4625,7 +4760,7 @@ export class GameRoom extends DurableObject<Env> {
       game.dayNumber = 0;
       game.sniperShotsLeft = {};
       game.natoChancesLeft = 2;
-      game.paranoidAlertLeft = 2;
+      game.paranoidAlertLeft = paranoidAlertsFor(game.players.length);
       game.bomberMarkedTargets = [];
       game.invincibleShieldHits = {};
       game.gunnerGuns = {};
@@ -4653,7 +4788,7 @@ export class GameRoom extends DurableObject<Env> {
       await this.lockGroup();
       await this.group(fa.gameStarted(game.players.length, mafiaCountFor(game.players.length), game.independentRoleType));
       await this.sendRoleCards();
-      await this.enterNight();
+      await this.enterIntro();
     } catch (err) {
       console.error("cmdStartGame: failed to start game, cancelling", game.id, err);
       await this.cancelInternal(fa.startGameFailed).catch((cancelErr) => {
@@ -4673,6 +4808,7 @@ export class GameRoom extends DurableObject<Env> {
     const game = this.game;
     if (!game) return;
     if (game.temporaryCourtAdminUserId) await this.removeTemporaryCourtAdmin(game.temporaryCourtAdminUserId);
+    if (game.introAdminUserId) await this.demoteIntroPlayer(game.introAdminUserId);
     const wasPlaying = isPlayingStatus(game.status);
     game.status = "cancelled";
     game.phase = "finished";
@@ -4732,12 +4868,197 @@ export class GameRoom extends DurableObject<Env> {
     return true;
   }
 
+  // =============================================================================
+  // INTRO (pre-Night-1 turn-based self-introduction)
+  // =============================================================================
+  //
+  // Runs once, only between role distribution and Night 1: each player gets
+  // exactly one turn (fixed random-ish order decided once at intro start) to
+  // speak in the group for introSeconds. The group is locked for everyone
+  // else the whole time; only the current player is temporarily promoted to
+  // admin (see promoteIntroPlayer/demoteIntroPlayer) so they alone can post
+  // in the locked chat — mirrors the existing temporaryCourtAdminUserId
+  // pattern for the defense phase, but kept as its own separate system
+  // (introAdminUserId) so the two never interfere with each other.
+  //
+  // Reuses the SAME single-alarm/advancePhase machinery as every other
+  // phase (game.phaseEndsAt + game.alarmKind, dispatched through
+  // advancePhase()) instead of a parallel timer system, so all the existing
+  // race-condition protections (the `transitioning` mutex, the "alarm is
+  // only ever a hint, re-checked against phaseEndsAt" guard) apply here for
+  // free.
+
+  private async enterIntro(): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    game.status = "intro";
+    game.phase = "intro";
+    // Fixed turn order, decided once — reuses the existing shuffle() helper
+    // (crypto-random Fisher-Yates), same as role assignment.
+    game.introOrder = shuffle(game.players.map((p) => p.userId));
+    game.introIndex = 0;
+    game.introAdminUserId = null;
+    game.introAdminWasPromotedByBot = false;
+    await this.relockAllPlayers();
+    await this.lockGroup();
+    await this.persist(true);
+    await this.advanceIntroTurn();
+  }
+
+  // Advances to the next player's intro turn, or — once every player has
+  // had theirs — finishes Intro and enters Night 1. Called both by the
+  // alarm (30s elapsed for the current player) and by /skip.
+  private async advanceIntroTurn(): Promise<void> {
+    const game = this.game;
+    if (!game || game.status !== "intro") return;
+
+    // Demote whoever was just speaking BEFORE promoting/announcing the next
+    // player, so at no point can two players be intro-admin at once.
+    if (game.introAdminUserId !== null) {
+      await this.demoteIntroPlayer(game.introAdminUserId);
+    }
+
+    if (game.introIndex >= game.introOrder.length) {
+      // Intro fully finished: no intro state should survive into Night 1.
+      game.introOrder = [];
+      game.introIndex = 0;
+      game.introAdminUserId = null;
+      game.introAdminWasPromotedByBot = false;
+      await this.lockGroup();
+      await this.persist(true);
+      await this.enterNight();
+      return;
+    }
+
+    const userId = game.introOrder[game.introIndex]!;
+    game.introIndex += 1;
+    const player = findPlayer(game.players, userId);
+    // Player left/was removed between intro starting and their turn coming
+    // up — skip them without wasting a timer window, move straight to the
+    // next one instead of leaving the game stuck waiting on nobody.
+    if (!player || player.status === "left") {
+      await this.advanceIntroTurn();
+      return;
+    }
+
+    const secs = INTRO_TURN_SECONDS;
+    // Promote BEFORE announcing/starting the timer, so the player is
+    // already able to speak for the entire announced window (see doc #3:
+    // "قبل از شروع ۳۰ ثانیه، Player A باید Admin شده باشد").
+    const promoted = await this.promoteIntroPlayer(userId);
+    if (!promoted) {
+      // Promotion failed (rare — e.g. Telegram hiccup): still give this
+      // player their timer window rather than hanging the whole game, even
+      // though they may not actually be able to post in the locked group.
+      console.error("advanceIntroTurn: promotion failed, continuing without it", game.id, userId);
+    }
+    game.phaseEndsAt = now() + secs * 1000;
+    game.reminderAt = null;
+    await this.persist(true);
+    await this.schedulePhaseTimers();
+    await this.group(fa.introTurn(userId, player.displayName, secs));
+  }
+
+  // Mirrors promoteCourtAccused: temporarily promotes exactly one player so
+  // they can post in the locked group, recording ownership in
+  // introAdminUserId first so a crash mid-promotion can't leave the game
+  // thinking no one (or the wrong person) is intro-admin.
+  private async promoteIntroPlayer(userId: number): Promise<boolean> {
+    const game = this.game;
+    if (!game || game.isVirtual) return false;
+    if (game.introAdminUserId !== null && game.introAdminUserId !== userId) return false;
+
+    const membership = await this.tg.callSafe<TgChatMember>("getChatMember", { chat_id: game.chatId, user_id: userId });
+    if (!membership.ok || membership.result.user.id !== userId || membership.result.status === "left" || membership.result.status === "kicked") return false;
+    // Already a real admin/creator — they can already post; nothing to do,
+    // but still record ownership so demoteIntroPlayer knows NOT to demote a
+    // pre-existing real admin (see doc #3's "مالکیت تغییرات خودش را بداند").
+    if (membership.result.status === "administrator" || membership.result.status === "creator") {
+      game.introAdminUserId = userId;
+      game.introAdminWasPromotedByBot = false;
+      await this.persist();
+      return true;
+    }
+
+    game.introAdminUserId = userId;
+    game.introAdminWasPromotedByBot = false;
+    try { await this.persist(); } catch (err) { game.introAdminUserId = null; console.error("intro admin marker persist failed", game.id, userId, err); return false; }
+
+    let promoted = await this.tg.callSafe("promoteChatMember", { chat_id: game.chatId, user_id: userId, ...INTRO_ADMIN_RIGHTS });
+    if (!promoted.ok) { await sleep(200); promoted = await this.tg.callSafe("promoteChatMember", { chat_id: game.chatId, user_id: userId, ...INTRO_ADMIN_RIGHTS }); }
+    if (!promoted.ok) {
+      if (game.introAdminUserId === userId) { game.introAdminUserId = null; try { await this.persist(); } catch (err) { console.error("intro admin marker rollback failed", game.id, userId, err); } }
+      console.error("intro temporary promotion failed", game.id, userId, promoted.error.description);
+      return false;
+    }
+    game.introAdminWasPromotedByBot = true;
+    try { await this.persist(); } catch (err) { console.error("intro promoted-flag persist failed", game.id, userId, err); }
+    return true;
+  }
+
+  // Mirrors removeTemporaryCourtAdmin: demotes ONLY the player Intro itself
+  // promoted (never a pre-existing real admin — see the "already admin"
+  // branch above, which still sets introAdminUserId so this function can
+  // recognize and skip demoting them). expectedUserId guards against a
+  // stale/late call trying to touch a player who is no longer the current
+  // intro-admin (the race the spec's "Timer Safety" section warns about).
+  private async demoteIntroPlayer(expectedUserId: number): Promise<boolean> {
+    const game = this.game;
+    if (!game) return true;
+    const currentId = game.introAdminUserId;
+    if (currentId === null) return true;
+    if (currentId !== expectedUserId) return false;
+
+    // Never call promoteChatMember to strip rights the bot didn't itself
+    // grant — if this player was already a real admin/creator before their
+    // intro turn, just clear our own bookkeeping and leave them alone.
+    if (!game.introAdminWasPromotedByBot) {
+      game.introAdminUserId = null;
+      try { await this.persist(); } catch (err) { console.error("intro marker persist failed (pre-existing admin, no demotion)", game.id, currentId, err); }
+      return true;
+    }
+
+    const membership = await this.tg.callSafe<TgChatMember>("getChatMember", { chat_id: game.chatId, user_id: currentId });
+    // Left/kicked/already a plain member — nothing to demote, just clear
+    // our own bookkeeping.
+    if (membership.ok && (membership.result.status === "left" || membership.result.status === "kicked" || membership.result.status === "member" || membership.result.status === "restricted")) {
+      game.introAdminUserId = null;
+      try { await this.persist(); } catch (err) { console.error("intro cleared-marker persist failed", game.id, currentId, err); }
+      return true;
+    }
+    if (membership.ok && membership.result.status === "creator") {
+      game.introAdminUserId = null;
+      try { await this.persist(); } catch (err) { console.error("intro marker persist failed (creator, no demotion)", game.id, currentId, err); }
+      return true;
+    }
+
+    let demotionError: string | null = null;
+    let demotedOk = false;
+    for (let attempt = 0; attempt < 3 && !demotedOk; attempt++) {
+      const demoted = await this.tg.callSafe("promoteChatMember", { chat_id: game.chatId, user_id: currentId, ...INTRO_ADMIN_NO_RIGHTS });
+      demotedOk = demoted.ok;
+      demotionError = demoted.ok ? null : demoted.error.description;
+      if (!demotedOk && attempt < 2) await sleep(300 * (attempt + 1));
+    }
+    if (!demotedOk) {
+      console.error("intro temporary demotion failed after retries", game.id, currentId, demotionError ?? "unknown");
+      game.introAdminUserId = null;
+      try { await this.persist(); } catch (err) { console.error("intro demotion marker persist failed", game.id, currentId, err); }
+      return false;
+    }
+
+    game.introAdminUserId = null;
+    try { await this.persist(); } catch (err) { console.error("intro demotion marker persist failed", game.id, currentId, err); }
+    return true;
+  }
+
   private async enterNight(): Promise<void> {
     const game = this.game;
     if (!game) return;
     if (game.temporaryCourtAdminUserId) await this.removeTemporaryCourtAdmin(game.temporaryCourtAdminUserId);
     if (await this.checkAndHandleWin()) return;
 
+    const isFirstNight = game.nightNumber === 0;
     game.nightNumber += 1;
     game.dayNumber = game.nightNumber;
     game.status = "night";
@@ -4761,7 +5082,31 @@ export class GameRoom extends DurableObject<Env> {
     await this.schedulePhaseTimers();
     const sent = await this.group(fa.nightStart(game.nightNumber, game.config.nightSeconds));
     if (sent) await this.pin(sent.message_id);
+    // Mafia teammates are revealed exactly here — the instant Night 1
+    // actually starts — never earlier (not at role distribution, not
+    // during Intro). Sent individually by each mafia player's own real
+    // numeric userId (never by array index/username/display name), so
+    // each mafia player only ever receives their OWN team's info.
+    if (isFirstNight) await this.sendMafiaTeamInfo();
     await this.sendNightPrompts();
+  }
+
+  // Sends each living-or-dead mafia player (team === "mafia") their
+  // teammates list via PM, keyed strictly by their real Telegram userId.
+  // Independent/town players never receive this. Best-effort per player
+  // (Promise.allSettled) so one blocked PM can't stop the others or crash
+  // the Night 1 transition — same resilience pattern as sendRoleCards.
+  private async sendMafiaTeamInfo(): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    const mafia = game.players.filter((p) => p.team === "mafia");
+    if (mafia.length < 2) return; // nothing to announce with 0-1 mafia members
+    await Promise.allSettled(
+      mafia.map((p) => {
+        const teammates = mafia.filter((x) => x.userId !== p.userId);
+        return this.pm(p.userId, fa.mafiaTeamInfo(teammates));
+      }),
+    );
   }
 
   private async enterDay(resolutionText: string): Promise<void> {
@@ -4809,6 +5154,10 @@ export class GameRoom extends DurableObject<Env> {
       if (guns.length === 0) continue;
       await this.pm(p.userId, fa.gunnerReceivedGun);
       await this.pm(p.userId, fa.gunnerPanelPrompt, this.gunnerKeyboard(game, p));
+    }
+    const mentions = living(game.players).map((p) => mention(p.userId, p.displayName)).join(" ");
+    if (mentions) {
+      await this.group(`${fa.gunnerDistributionAnnounce}\n\n${mentions}`);
     }
   }
 
@@ -4934,6 +5283,7 @@ export class GameRoom extends DurableObject<Env> {
         alarmKind: game.alarmKind,
       });
       if (game.status === "lobby") { await this.cancelInternal(fa.lobbyExpired); return; }
+      if (game.status === "intro") { await this.advanceIntroTurn(); return; }
       if (game.status === "night") { await this.resolveNightPhase(); return; }
       if (game.status === "inquiry") { await this.resolveInquiryPhase(); return; }
       if (game.status === "day") { await this.enterNomination(); return; }
@@ -4960,7 +5310,7 @@ export class GameRoom extends DurableObject<Env> {
     await this.publishNotes(res.deaths);
 
     for (const a of game.nightActions) {
-      if (a.nightNumber === game.nightNumber && a.type === "heal" && a.targetId === a.actorId && !game.doctorSelfHealUsedBy.includes(a.actorId)) {
+      if (a.nightNumber === game.nightNumber && a.type === "heal" && a.targetId === a.actorId) {
         game.doctorSelfHealUsedBy.push(a.actorId);
       }
     }
@@ -5258,6 +5608,7 @@ export class GameRoom extends DurableObject<Env> {
     const game = this.game;
     if (!game) return;
     if (game.temporaryCourtAdminUserId) await this.removeTemporaryCourtAdmin(game.temporaryCourtAdminUserId);
+    if (game.introAdminUserId) await this.demoteIntroPlayer(game.introAdminUserId);
     // Central end-of-game pin cleanup — runs no matter which win condition
     // (town/mafia/independent) or other path led here, since every route to
     // game over passes through this one function.
@@ -5306,7 +5657,12 @@ export class GameRoom extends DurableObject<Env> {
         if (target.team !== "mafia") return { text: fa.lecterTownTarget, alert: true };
       }
       if (action === "heal" && player.role === "doctor" && targetId === userId) {
-        if (game.doctorSelfHealUsedBy.includes(userId)) return { text: "نجات خودتان را قبلاً استفاده کرده‌اید.", alert: true };
+        // BUGFIX (doctor self-heal): lifetime self-heal cap raised from 1 to
+        // 2 uses total across the whole game (tracked the same way as
+        // before — doctorSelfHealUsedBy just now allows up to 2 entries per
+        // user instead of 1).
+        const selfHealsUsed = game.doctorSelfHealUsedBy.filter((id) => id === userId).length;
+        if (selfHealsUsed >= 2) return { text: "نجات خودتان را قبلاً استفاده کرده‌اید.", alert: true };
       }
       if (action === "investigate" && player.independentRole === "lonewolf") {
         // FIX: this one-check-per-target restriction is specific to Lonewolf.
@@ -5332,10 +5688,32 @@ export class GameRoom extends DurableObject<Env> {
       }
     }
 
-    game.nightActions = game.nightActions.filter((a) => !(a.actorId === userId && a.type === action && a.nightNumber === nightNumber));
-    game.nightActions.push({ actorId: userId, type: action, targetId: targetId > 0 ? targetId : null, nightNumber, at: now() });
+    // BUGFIX (doctor double-save on night 1): every other night a new heal
+    // submission replaces the doctor's previous one for that night (single
+    // target, as before). On night 1 only, the doctor gets a second heal
+    // slot — submitting a second (different) target keeps both instead of
+    // overwriting, so night 1 can protect up to two people at once. Every
+    // other role/night keeps the original overwrite behavior unchanged.
+    const isDoctorNightOneDoubleSave = action === "heal" && player.role === "doctor" && nightNumber === 1 && targetId > 0;
+    const existingHealsTonight = game.nightActions.filter((a) => a.actorId === userId && a.type === action && a.nightNumber === nightNumber);
+    const isSecondNightOneSave = isDoctorNightOneDoubleSave && existingHealsTonight.length > 0 && !existingHealsTonight.some((a) => a.targetId === targetId);
+    if (isSecondNightOneSave) {
+      // Already have one heal recorded for tonight with a different target
+      // — keep it and add this one as the second save, instead of the
+      // normal single-slot overwrite.
+      game.nightActions.push({ actorId: userId, type: action, targetId, nightNumber, at: now() });
+    } else {
+      game.nightActions = game.nightActions.filter((a) => !(a.actorId === userId && a.type === action && a.nightNumber === nightNumber));
+      game.nightActions.push({ actorId: userId, type: action, targetId: targetId > 0 ? targetId : null, nightNumber, at: now() });
+    }
     await this.persist();
-    await persistNightAction(this.env.DB, game.id, nightNumber, userId, action, targetId > 0 ? targetId : null);
+    // D1's night_actions table has a UNIQUE(game_id, night_number, actor_id,
+    // action_type) upsert key, so the doctor's second night-1 heal would
+    // otherwise silently overwrite the first row. Persist it under a
+    // distinct action_type ("heal2") so both survive in D1 too; in-memory
+    // game.nightActions (what resolveNight actually reads during live play)
+    // always keeps the real "heal" type regardless.
+    await persistNightAction(this.env.DB, game.id, nightNumber, userId, isSecondNightOneSave ? "heal2" : action, targetId > 0 ? targetId : null);
 
     const label = targetId > 0 ? this.targetLabel(game, targetId, action, player) : "رد کردن";
     await this.pm(userId, fa.actionSaved(label));
@@ -5712,15 +6090,24 @@ export class GameRoom extends DurableObject<Env> {
     // and leave the game stuck on the "night" phase with no prompts sent.
     // Failed players can still recover their role via /myrole.
     const results = await Promise.allSettled(
-      game.players.map((p) => {
-        const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
-        // Attach the persistent Reply Keyboard (📝 یادداشت) here too — this
-        // is the very first private message each player gets at game start,
-        // so it's the earliest natural point to show it, matching sendMyRole.
-        // Role reveal is a photo (role artwork) with the role card text as
-        // caption, instead of a bare text message.
-        return this.tg.callSafe("sendPhoto", {
-          chat_id: p.userId, photo: roleImageFor(p), caption: fa.roleCard(p, mates), parse_mode: "HTML",
+      game.players.map(async (p) => {
+        // BUGFIX (no early mafia reveal): teammates used to be shown here,
+        // right at role distribution — before Intro and before Night 1.
+        // Mafia teammates must only be revealed once Night 1 actually
+        // starts (see fa.mafiaTeamInfo, sent from enterNight), so this is
+        // always empty at role-distribution time now.
+        const mates: Player[] = [];
+        // Role reveal: the role artwork is sent as its own photo (no
+        // caption), then the role card text is sent as a separate message
+        // right after — caption keeps hitting Telegram's caption length cap
+        // on long role descriptions (e.g. روئین‌تن), while a plain text
+        // message has a much higher limit.
+        const photoRes = await this.tg.callSafe("sendPhoto", {
+          chat_id: p.userId, photo: roleImageFor(p),
+        });
+        if (!photoRes.ok) throw photoRes.error;
+        return this.tg.callSafe("sendMessage", {
+          chat_id: p.userId, text: fa.roleCard(p, mates), parse_mode: "HTML",
           reply_markup: mainReplyKeyboard(),
         });
       }),
@@ -5958,8 +6345,15 @@ export class GameRoom extends DurableObject<Env> {
     // make sure it's showing, without re-sending it on every unrelated
     // private message.
     if (p.status !== "alive" && p.role) { await this.tg.sendMessage(userId, fa.myRoleDead(p.role, p.independentRole), { reply_markup: mainReplyKeyboard() }); return; }
-    const mates = p.team === "mafia" ? game.players.filter((x) => x.team === "mafia") : [];
-    await this.tg.sendPhoto(userId, roleImageFor(p), fa.roleCard(p, mates), { reply_markup: mainReplyKeyboard() });
+    // BUGFIX (no early mafia reveal): teammates are only known to the
+    // player once Night 1 has actually started (game.nightNumber >= 1) —
+    // during lobby/intro/pre-night-1, /myrole must not leak them either.
+    const mates = p.team === "mafia" && game.nightNumber >= 1 ? game.players.filter((x) => x.team === "mafia") : [];
+    // Same split as sendRoleCards: photo (no caption) then the role card
+    // text as its own message, so long descriptions never hit Telegram's
+    // caption length cap.
+    await this.tg.callSafe("sendPhoto", { chat_id: userId, photo: roleImageFor(p) });
+    await this.tg.sendMessage(userId, fa.roleCard(p, mates), { reply_markup: mainReplyKeyboard() });
   }
 
   // Runs the Lecter->Godfather succession check and — if it fired — tells
@@ -6546,7 +6940,10 @@ export class GameRoom extends DurableObject<Env> {
 
     const nightActions: NightAction[] = nightActionRows.map((r: NightActionRow) => ({
       actorId: r.actor_id,
-      type: r.action_type as NightActionType,
+      // "heal2" is the doctor's second night-1 heal (see persistNightAction) —
+      // stored under a distinct action_type only so it survives D1's
+      // per-(actor, night, action_type) unique key; it's really just "heal".
+      type: (r.action_type === "heal2" ? "heal" : r.action_type) as NightActionType,
       targetId: r.target_id,
       targetRole: (r.target_role as GuessableRoleId | null) ?? null,
       nightNumber: r.night_number,
@@ -6646,6 +7043,14 @@ export class GameRoom extends DurableObject<Env> {
       pendingInquiryDeaths: null,
       accusedUserId: null,
       temporaryCourtAdminUserId: null,
+      // Not persisted to D1 as an ongoing session; if a game is somehow
+      // cold-recovered mid-intro (rare — intro is a short, transient phase
+      // right after game start), it just resumes as if intro had already
+      // finished rather than crashing, same as the other gaps noted above.
+      introOrder: [],
+      introIndex: 0,
+      introAdminUserId: null,
+      introAdminWasPromotedByBot: false,
       silencedUserIds: [],
       blockedUserIds: [],
       escortBlockedUserIds: [],
@@ -6654,7 +7059,7 @@ export class GameRoom extends DurableObject<Env> {
       detectiveChecked,
       godfatherRevealed,
       natoChancesLeft: 2,
-      paranoidAlertLeft: 2,
+      paranoidAlertLeft: paranoidAlertsFor(players.length),
       bomberMarkedTargets,
       invincibleShieldHits: {},
       gunnerGuns: {},

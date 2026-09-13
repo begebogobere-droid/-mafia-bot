@@ -159,6 +159,18 @@ async function ensureSchema(db: D1Database): Promise<void> {
     night_actions: {
       target_role: "TEXT",
     },
+    // Production already had an older bot_settings table (from an earlier,
+    // never-fully-shipped attempt at this same feature) with a different
+    // column layout — CREATE TABLE IF NOT EXISTS silently no-ops against an
+    // existing table, so `updated_at` (and possibly `value`) never got
+    // added on their own; setBotOff/isBotOff then failed with "no column
+    // named updated_at" on every call, which is why /off and /on appeared
+    // to do nothing (the error was caught and logged, never shown to the
+    // user). Migrated the same way as every other table above.
+    bot_settings: {
+      value: "TEXT NOT NULL DEFAULT '0'",
+      updated_at: "INTEGER NOT NULL DEFAULT 0",
+    },
   };
   for (const [table, columns] of Object.entries(tableMigrations)) {
     try {
@@ -1258,7 +1270,7 @@ export function statsMainKeyboard(): InlineKeyboard {
   return [
     [{ text: "🎭 آنالیز نقش‌ها", callback_data: "ST:roles:0", style: "primary" }],
     [{ text: "📈 درصدها و رکوردها", callback_data: "ST:records", style: "primary" }],
-    [{ text: "🏆 لیدربورد", callback_data: "ST:leaderboard", style: "primary" }],
+    [{ text: "🏆 لیدربرد", callback_data: "ST:leaderboard", style: "primary" }],
   ];
 }
 
@@ -3248,7 +3260,7 @@ export const fa = {
   },
 
   leaderboard(entries: LeaderboardEntry[], viewerRank: number | null, viewerInTop: boolean, minGames: number): string {
-    const lines = ["🏆 <b>لیدربورد (بر اساس Win Rate)</b>", ""];
+    const lines = ["🏆 <b>لیدربرد (بر اساس Win Rate)</b>", ""];
     if (entries.length === 0) {
       lines.push(`❕ هنوز هیچ بازیکنی به حداقل ${minGames} بازی نرسیده است.`);
     } else {
@@ -3561,10 +3573,22 @@ export async function isBotOff(db: D1Database): Promise<boolean> {
 }
 
 export async function setBotOff(db: D1Database, off: boolean): Promise<void> {
-  await db
-    .prepare("INSERT INTO bot_settings (key, value, updated_at) VALUES ('bot_off', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
-    .bind(off ? "1" : "0", Date.now())
-    .run();
+  try {
+    await db
+      .prepare("INSERT INTO bot_settings (key, value, updated_at) VALUES ('bot_off', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+      .bind(off ? "1" : "0", Date.now())
+      .run();
+  } catch (err) {
+    // Fallback for the pre-existing production table (see the
+    // ensureSchema migration note above): if its "key" column somehow
+    // isn't the primary key/unique constraint the ON CONFLICT clause
+    // needs, delete-then-insert works regardless of that table's exact
+    // original constraints, as long as a "key" column exists (which the
+    // migration guarantees).
+    console.error("setBotOff: upsert failed, falling back to delete+insert", err);
+    await db.prepare("DELETE FROM bot_settings WHERE key = 'bot_off'").run();
+    await db.prepare("INSERT INTO bot_settings (key, value, updated_at) VALUES ('bot_off', ?, ?)").bind(off ? "1" : "0", Date.now()).run();
+  }
 }
 
 // =============================================================================
@@ -3954,6 +3978,31 @@ export async function recordFinishStats(
   if (statements.length) await db.batch(statements);
 }
 
+// One-time backfill for accounts whose games_lost is stale from before that
+// column existed (see the tableMigrations entry for "users": games_lost was
+// added via ALTER TABLE, so any game recorded before that migration never
+// incremented it — games_played and games_won from that era are still
+// accurate, since those two columns always existed). Since every game
+// recorded by recordFinishStats gives each participant EXACTLY one of
+// win/loss (see the "won ? 0 : 1" pairing above — never both, never
+// neither), losses = played - won is not a guess, it's the same arithmetic
+// recordFinishStats itself would have produced for those games if the
+// column had existed at the time. Only touches rows that are actually
+// wrong (games_lost != games_played - games_won), so it's safe to re-run
+// and never overwrites a row that's already correct for some other reason.
+// Returns how many rows were corrected, for the admin command to report.
+export async function backfillGamesLost(db: D1Database): Promise<number> {
+  const res = await db
+    .prepare(
+      `UPDATE users
+       SET games_lost = games_played - games_won, updated_at = ?
+       WHERE games_lost != games_played - games_won`,
+    )
+    .bind(Date.now())
+    .run();
+  return res.meta?.changes ?? 0;
+}
+
 export interface PlayerStatistics {
   totalGames: number;
   wins: number;
@@ -4020,7 +4069,7 @@ export interface LeaderboardEntry {
 // Ties (equal win rate) broken by more total games, then more wins, so the
 // ordering is fully deterministic rather than depending on SQL's arbitrary
 // tie-break.
-const LEADERBOARD_MIN_GAMES = 10;
+const LEADERBOARD_MIN_GAMES = 50;
 
 export async function getLeaderboard(db: D1Database, limit = 10): Promise<LeaderboardEntry[]> {
   const rows = await db
@@ -7466,13 +7515,42 @@ async function dispatch(update: TgUpdate, env: Env): Promise<void> {
       const parsed = parseCommand(text);
       if (parsed && (parsed.cmd === "off" || parsed.cmd === "on")) {
         if (from.id !== SUPER_KILL_ADMIN_ID) return; // silent no-op for anyone else, on or off
-        await setBotOff(env.DB, parsed.cmd === "off");
         const tg = new Telegram(env.BOT_TOKEN);
-        await tg.callSafe("sendMessage", { chat_id: update.message!.chat.id, text: parsed.cmd === "off" ? "🔴 ربات خاموش شد." : "🟢 ربات روشن شد." });
+        try {
+          await setBotOff(env.DB, parsed.cmd === "off");
+          await tg.callSafe("sendMessage", { chat_id: update.message!.chat.id, text: parsed.cmd === "off" ? "🔴 ربات خاموش شد." : "🟢 ربات روشن شد." });
+        } catch (err) {
+          // /off and /on are the super admin's only lever to control the
+          // whole bot, so a failure here must never fail silently the way
+          // the outer catch below does for everything else — always tell
+          // the admin something went wrong, with enough detail to debug.
+          console.error("dispatch: /off or /on failed", err);
+          await tg.callSafe("sendMessage", { chat_id: update.message!.chat.id, text: `⚠️ خطا در اجرای دستور: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      if (parsed && parsed.cmd === "fixstats") {
+        if (from.id !== SUPER_KILL_ADMIN_ID) return; // silent no-op for anyone else
+        const tg = new Telegram(env.BOT_TOKEN);
+        try {
+          const fixed = await backfillGamesLost(env.DB);
+          await tg.callSafe("sendMessage", { chat_id: update.message!.chat.id, text: `✅ ${fixed} حساب اصلاح شد (games_lost = games_played - games_won).` });
+        } catch (err) {
+          console.error("dispatch: /fixstats failed", err);
+          await tg.callSafe("sendMessage", { chat_id: update.message!.chat.id, text: `⚠️ خطا در اجرای دستور: ${err instanceof Error ? err.message : String(err)}` });
+        }
         return;
       }
     }
-    if (await isBotOff(env.DB)) return;
+    let botOff = false;
+    try {
+      botOff = await isBotOff(env.DB);
+    } catch (err) {
+      // Never let a bad bot_settings read take down every other command —
+      // fail open (bot stays usable) and just log it.
+      console.error("dispatch: isBotOff check failed, continuing as if on", err);
+    }
+    if (botOff) return;
 
     const groupId = resolveGroupChatId(update);
     if (groupId !== null) { await callRoom(env, groupId, update); return; }
@@ -7624,6 +7702,12 @@ async function handleStatsCallback(env: Env, tg: Telegram, cq: TgCallbackQuery):
     const entries = await getLeaderboard(env.DB, 10);
     const viewerInTop = entries.some((e) => e.userId === userId);
     const viewerRank = viewerInTop ? null : await getLeaderboardRank(env.DB, userId);
+    if (viewerRank === null && !viewerInTop) {
+      // Diagnostic only — helps tell "genuinely under the games threshold"
+      // apart from "something is actually wrong" the next time someone
+      // reports this, without needing another round of blind guessing.
+      console.error("ST:leaderboard: viewer got null rank", userId, JSON.stringify(stats));
+    }
     await tg.editMessageText(
       chatId, messageId,
       fa.leaderboard(entries, viewerRank, viewerInTop, LEADERBOARD_MIN_GAMES),

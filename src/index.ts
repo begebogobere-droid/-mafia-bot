@@ -103,6 +103,11 @@ CREATE TABLE IF NOT EXISTS kill_admins (
   added_by INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bot_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 `;
 
 async function ensureSchema(db: D1Database): Promise<void> {
@@ -814,6 +819,10 @@ export interface InlineKeyboardButton {
   text: string;
   callback_data?: string;
   url?: string;
+  // Bot API 9.4+ (Feb 9, 2026): visual color of the button. "primary" =
+  // blue, "success" = green, "danger" = red. Omit for the client's default
+  // (neutral) styling.
+  style?: "primary" | "success" | "danger";
 }
 
 export type InlineKeyboard = InlineKeyboardButton[][];
@@ -1190,16 +1199,18 @@ export function mainReplyKeyboard(): ReplyKeyboardMarkup {
 export function playerButtons(
   players: Player[],
   prefix: string,
-  extra?: { text: string; data: string }[],
+  extra?: { text: string; data: string; style?: "primary" | "success" | "danger" }[],
+  style: "primary" | "success" | "danger" = "primary",
 ): InlineKeyboard {
   const alive = players.filter((p) => p.status === "alive");
-  const buttons = alive.map((p) => ({
+  const buttons: InlineKeyboardButton[] = alive.map((p) => ({
     text: p.displayName.slice(0, 28),
     callback_data: `${prefix}${p.userId}`,
+    style,
   }));
   const rows = chunk(buttons, 2);
   if (extra?.length) {
-    rows.push(extra.map((e) => ({ text: e.text, callback_data: e.data })));
+    rows.push(extra.map((e) => ({ text: e.text, callback_data: e.data, style: e.style })));
   }
   return rows;
 }
@@ -1215,18 +1226,18 @@ export function lobbyKeyboard(botUsername: string | null, chatId: number): Inlin
     ]);
   }
   rows.push([
-    { text: "▶️ شروع بازی", callback_data: "L:s" },
-    { text: "🚪 خروج", callback_data: "L:l" },
+    { text: "▶️ شروع بازی", callback_data: "L:s", style: "success" },
+    { text: "🚪 خروج", callback_data: "L:l", style: "danger" },
   ]);
-  rows.push([{ text: "✖ لغو لابی", callback_data: "L:c" }]);
+  rows.push([{ text: "✖ لغو لابی", callback_data: "L:c", style: "danger" }]);
   return rows;
 }
 
 export function dayHostKeyboard(): InlineKeyboard {
   return [
     [
-      { text: "⏱ تمدید بحث", callback_data: "L:x" },
-      { text: "⏭ پایان مرحله", callback_data: "L:k" },
+      { text: "⏱ تمدید بحث", callback_data: "L:x", style: "primary" },
+      { text: "⏭ پایان مرحله", callback_data: "L:k", style: "danger" },
     ],
   ];
 }
@@ -1245,8 +1256,9 @@ export const STATS_CB_PREFIX = "ST:";
 
 export function statsMainKeyboard(): InlineKeyboard {
   return [
-    [{ text: "🎭 آنالیز نقش‌ها", callback_data: "ST:roles:0" }],
-    [{ text: "📈 درصدها و رکوردها", callback_data: "ST:records" }],
+    [{ text: "🎭 آنالیز نقش‌ها", callback_data: "ST:roles:0", style: "primary" }],
+    [{ text: "📈 درصدها و رکوردها", callback_data: "ST:records", style: "primary" }],
+    [{ text: "🏆 لیدربورد", callback_data: "ST:leaderboard", style: "primary" }],
   ];
 }
 
@@ -1254,17 +1266,21 @@ export function statsRolesKeyboard(page: number, totalPages: number): InlineKeyb
   const rows: InlineKeyboard = [];
   if (totalPages > 1) {
     rows.push([
-      { text: "◀️", callback_data: `ST:roles:${Math.max(0, page - 1)}` },
-      { text: `${page + 1}/${totalPages}`, callback_data: `ST:roles:${page}` },
-      { text: "▶️", callback_data: `ST:roles:${Math.min(totalPages - 1, page + 1)}` },
+      { text: "◀️", callback_data: `ST:roles:${Math.max(0, page - 1)}`, style: "primary" },
+      { text: `${page + 1}/${totalPages}`, callback_data: `ST:roles:${page}`, style: "primary" },
+      { text: "▶️", callback_data: `ST:roles:${Math.min(totalPages - 1, page + 1)}`, style: "primary" },
     ]);
   }
-  rows.push([{ text: "🔙 بازگشت به آنالیز", callback_data: "ST:main" }]);
+  rows.push([{ text: "🔙 بازگشت به آنالیز", callback_data: "ST:main", style: "primary" }]);
   return rows;
 }
 
 export function statsRecordsKeyboard(): InlineKeyboard {
-  return [[{ text: "🔙 بازگشت به آنالیز", callback_data: "ST:main" }]];
+  return [[{ text: "🔙 بازگشت به آنالیز", callback_data: "ST:main", style: "primary" }]];
+}
+
+export function statsLeaderboardKeyboard(): InlineKeyboard {
+  return [[{ text: "🔙 بازگشت به آنالیز", callback_data: "ST:main", style: "primary" }]];
 }
 
 // Roles with at least one game, in a stable order: most games first, ties
@@ -1285,16 +1301,19 @@ export const STATS_ROLES_PAGE_SIZE = 5;
 
 export function nominationKeyboard(players: Player[], voterId: number, dayNumber: number): InlineKeyboard {
   const candidates = players.filter((p) => p.status === "alive" && p.userId !== voterId);
-  return playerButtons(candidates, `T${dayNumber}:`, [
-    { text: "⏭ رأی ممتنع", data: `T${dayNumber}:0` },
-  ]);
+  return playerButtons(
+    candidates,
+    `T${dayNumber}:`,
+    [{ text: "⏭ رأی ممتنع", data: `T${dayNumber}:0`, style: "primary" }],
+    "danger", // nominating someone starts a trial that can end in their execution
+  );
 }
 
 export function verdictKeyboard(dayNumber: number): InlineKeyboard {
   return [
     [
-      { text: "⚖️ گناهکار", callback_data: `J${dayNumber}:1` },
-      { text: "🕊 بی‌گناه", callback_data: `J${dayNumber}:0` },
+      { text: "⚖️ گناهکار", callback_data: `J${dayNumber}:1`, style: "danger" },
+      { text: "🕊 بی‌گناه", callback_data: `J${dayNumber}:0`, style: "success" },
     ],
   ];
 }
@@ -1302,8 +1321,8 @@ export function verdictKeyboard(dayNumber: number): InlineKeyboard {
 export function inquiryKeyboard(dayNumber: number): InlineKeyboard {
   return [
     [
-      { text: "✅ بله", callback_data: `INQ${dayNumber}:1` },
-      { text: "❌ خیر", callback_data: `INQ${dayNumber}:0` },
+      { text: "✅ بله", callback_data: `INQ${dayNumber}:1`, style: "success" },
+      { text: "❌ خیر", callback_data: `INQ${dayNumber}:0`, style: "danger" },
     ],
   ];
 }
@@ -1345,9 +1364,28 @@ export function nightTargetsFor(
 // paranoid_alert handling in resolveNight. Only the keyboard changes.
 export function paranoidDecisionKeyboard(actorId: number, nightNumber: number): InlineKeyboard {
   return [
-    [{ text: "🛡 امشب هوشیار می‌مانم", callback_data: `N${nightNumber}:paranoid_alert:${actorId}` }],
-    [{ text: "❌ نمی‌خواهم امشب هوشیار باشم", callback_data: `N${nightNumber}:paranoid_alert:0` }],
+    [{ text: "🛡 امشب هوشیار می‌مانم", callback_data: `N${nightNumber}:paranoid_alert:${actorId}`, style: "success" }],
+    [{ text: "❌ نمی‌خواهم امشب هوشیار باشم", callback_data: `N${nightNumber}:paranoid_alert:0`, style: "danger" }],
   ];
+}
+
+// Target-button color follows the actual nature of each night action, not a
+// blanket color for every picker: lethal actions read as danger (red),
+// protective ones as success (green), and pure information-gathering as
+// primary (blue) — same spirit as the skip buttons (always danger) and the
+// paranoid/verdict/inquiry decisions colored earlier.
+function styleForNightAction(action: string): "primary" | "success" | "danger" {
+  switch (action) {
+    case "mafia_kill":
+    case "snipe":
+    case "johnny_kill":
+      return "danger";
+    case "heal":
+    case "escort_block":
+      return "success";
+    default:
+      return "primary"; // investigate, and anything else informational/neutral
+  }
 }
 
 export function nightTargetKeyboard(
@@ -1358,9 +1396,12 @@ export function nightTargetKeyboard(
   opts?: { includeSelf?: boolean; skipLabel?: string },
 ): InlineKeyboard {
   const targets = nightTargetsFor(players, actorId, action, opts);
-  return playerButtons(targets, `N${nightNumber}:${action}:`, [
-    { text: opts?.skipLabel ?? "⏭ رد کردن این شب", data: `N${nightNumber}:${action}:0` },
-  ]);
+  return playerButtons(
+    targets,
+    `N${nightNumber}:${action}:`,
+    [{ text: opts?.skipLabel ?? "⏭ رد کردن این شب", data: `N${nightNumber}:${action}:0`, style: "danger" }],
+    styleForNightAction(action),
+  );
 }
 
 // NATO's player-selection step is a two-stage flow (player -> role), handled by the
@@ -1373,9 +1414,12 @@ export function natoTargetKeyboard(
   nightNumber: number,
 ): InlineKeyboard {
   const targets = nightTargetsFor(players, actorId, "nato_guess");
-  return playerButtons(targets, `NG${nightNumber}:`, [
-    { text: "⏭ رد کردن این شب", data: `N${nightNumber}:nato_guess:0` },
-  ]);
+  return playerButtons(
+    targets,
+    `NG${nightNumber}:`,
+    [{ text: "⏭ رد کردن این شب", data: `N${nightNumber}:nato_guess:0`, style: "danger" }],
+    "primary", // guessing a role is informational, not lethal
+  );
 }
 
 // Gunner's war-gun step: any living player except the gunner. Has a skip
@@ -1387,9 +1431,12 @@ export function gunnerWarKeyboard(
   nightNumber: number,
 ): InlineKeyboard {
   const targets = players.filter((p) => p.userId !== gunnerId);
-  return playerButtons(targets, `GW${nightNumber}:`, [
-    { text: "⏭ امشب نمی‌خواهم تفنگ بدهم", data: `GW${nightNumber}:0` },
-  ]);
+  return playerButtons(
+    targets,
+    `GW${nightNumber}:`,
+    [{ text: "⏭ امشب نمی‌خواهم تفنگ بدهم", data: `GW${nightNumber}:0`, style: "danger" }],
+    "primary", // handing over a gun is a transfer, not the kill itself
+  );
 }
 
 // Gunner's black-gun step: any living player except the gunner AND except
@@ -1402,7 +1449,7 @@ export function gunnerBlackKeyboard(
   nightNumber: number,
 ): InlineKeyboard {
   const targets = players.filter((p) => p.userId !== gunnerId && p.userId !== warRecipientId);
-  return playerButtons(targets, `GB${nightNumber}:`);
+  return playerButtons(targets, `GB${nightNumber}:`, undefined, "primary");
 }
 
 
@@ -3200,6 +3247,27 @@ export const fa = {
     return lines.join("\n");
   },
 
+  leaderboard(entries: LeaderboardEntry[], viewerRank: number | null, viewerInTop: boolean, minGames: number): string {
+    const lines = ["🏆 <b>لیدربورد (بر اساس Win Rate)</b>", ""];
+    if (entries.length === 0) {
+      lines.push(`❕ هنوز هیچ بازیکنی به حداقل ${minGames} بازی نرسیده است.`);
+    } else {
+      const medals = ["🥇", "🥈", "🥉"];
+      entries.forEach((e, i) => {
+        const rankLabel = medals[i] ?? `${i + 1}.`;
+        lines.push(`${rankLabel} ${esc(e.displayName)} — ${winRatePct(e.wins, e.totalGames)}٪ (${e.wins}/${e.totalGames})`);
+      });
+    }
+    lines.push("");
+    if (viewerRank === null) {
+      lines.push(`❕ رتبه‌ی شما: هنوز به حداقل ${minGames} بازی نرسیده‌اید.`);
+    } else if (!viewerInTop) {
+      lines.push(`📍 رتبه‌ی شما: #${viewerRank}`);
+    }
+    lines.push("", `— بر اساس حداقل ${minGames} بازی`);
+    return lines.join("\n");
+  },
+
   helpGroup: [
     "🎭 <b>دستورهای گروه</b>",
     "/new — ساخت لابی",
@@ -3477,6 +3545,26 @@ export async function addKillAdmin(db: D1Database, userId: number, addedBy: numb
 export async function removeKillAdmin(db: D1Database, userId: number): Promise<boolean> {
   const res = await db.prepare("DELETE FROM kill_admins WHERE user_id = ?").bind(userId).run();
   return (res.meta?.changes ?? 0) > 0;
+}
+
+// Global bot on/off switch. Deliberately as isolated and simple as the
+// kill-admin system above: a single key/value row in D1, checked at the
+// very top of dispatch() before ANY other routing (group or private, any
+// command) — while off, every update is dropped silently with no state
+// change and no reply, anywhere. Only SUPER_KILL_ADMIN_ID (the same fixed
+// constant used above, not stored, so it can never be edited away) may
+// flip it, and /off and /on themselves always work for that one ID
+// regardless of the bot's current on/off state.
+export async function isBotOff(db: D1Database): Promise<boolean> {
+  const row = await db.prepare("SELECT value FROM bot_settings WHERE key = 'bot_off'").first<{ value: string }>();
+  return row?.value === "1";
+}
+
+export async function setBotOff(db: D1Database, off: boolean): Promise<void> {
+  await db
+    .prepare("INSERT INTO bot_settings (key, value, updated_at) VALUES ('bot_off', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+    .bind(off ? "1" : "0", Date.now())
+    .run();
 }
 
 // =============================================================================
@@ -3917,6 +4005,63 @@ export async function getPlayerStatistics(db: D1Database, userId: number): Promi
 export function winRatePct(wins: number, total: number): string {
   if (!total) return "0";
   return (Math.round((wins / total) * 1000) / 10).toString();
+}
+
+export interface LeaderboardEntry {
+  userId: number;
+  displayName: string;
+  wins: number;
+  totalGames: number;
+}
+
+// Global (all groups combined) top-10 by win rate, minimum 10 games played
+// — the minimum keeps a lucky 1-2 game player from topping the list. Same
+// users table already populated by recordFinishStats, no new data needed.
+// Ties (equal win rate) broken by more total games, then more wins, so the
+// ordering is fully deterministic rather than depending on SQL's arbitrary
+// tie-break.
+const LEADERBOARD_MIN_GAMES = 10;
+
+export async function getLeaderboard(db: D1Database, limit = 10): Promise<LeaderboardEntry[]> {
+  const rows = await db
+    .prepare(
+      `SELECT telegram_id, username, first_name, last_name, games_played, games_won
+       FROM users
+       WHERE games_played >= ?
+       ORDER BY (CAST(games_won AS REAL) / games_played) DESC, games_played DESC, games_won DESC
+       LIMIT ?`,
+    )
+    .bind(LEADERBOARD_MIN_GAMES, limit)
+    .all<{ telegram_id: number; username: string | null; first_name: string | null; last_name: string | null; games_played: number; games_won: number }>();
+  return (rows.results ?? []).map((r: { telegram_id: number; username: string | null; first_name: string | null; last_name: string | null; games_played: number; games_won: number }) => ({
+    userId: r.telegram_id,
+    displayName: displayOf({ first_name: r.first_name ?? undefined, last_name: r.last_name ?? undefined, username: r.username ?? undefined, id: r.telegram_id }),
+    wins: r.games_won,
+    totalGames: r.games_played,
+  }));
+}
+
+// This user's own rank on the same leaderboard (1-based), or null if they
+// don't meet the minimum-games threshold at all. A plain COUNT of
+// strictly-better rows — small table, runs once per button press, no
+// window-function portability concerns on D1/SQLite.
+export async function getLeaderboardRank(db: D1Database, userId: number): Promise<number | null> {
+  const self = await db.prepare(`SELECT games_played, games_won FROM users WHERE telegram_id = ?`).bind(userId).first<{ games_played: number; games_won: number }>();
+  if (!self || self.games_played < LEADERBOARD_MIN_GAMES) return null;
+  const selfRate = self.games_won / self.games_played;
+  const better = await db
+    .prepare(
+      `SELECT COUNT(*) as cnt FROM users
+       WHERE games_played >= ?
+         AND (
+           (CAST(games_won AS REAL) / games_played) > ?
+           OR ((CAST(games_won AS REAL) / games_played) = ? AND games_played > ?)
+           OR ((CAST(games_won AS REAL) / games_played) = ? AND games_played = ? AND games_won > ?)
+         )`,
+    )
+    .bind(LEADERBOARD_MIN_GAMES, selfRate, selfRate, self.games_played, selfRate, self.games_played, self.games_won)
+    .first<{ cnt: number }>();
+  return (better?.cnt ?? 0) + 1;
 }
 
 export async function deleteLobbyPlayersNotIn(db: D1Database, gameId: string, userIds: number[]): Promise<void> {
@@ -5219,7 +5364,7 @@ export class GameRoom extends DurableObject<Env> {
 
   private gunnerKeyboard(game: GameState, player: Player): InlineKeyboard {
     const targets = game.players.filter((p) => p.status === "alive" && p.userId !== player.userId);
-    return playerButtons(targets, `GU${game.dayNumber}:`);
+    return playerButtons(targets, `GU${game.dayNumber}:`, undefined, "primary");
   }
 
   // Second-save panel for the doctor's Night 1 double-save (see
@@ -5230,9 +5375,12 @@ export class GameRoom extends DurableObject<Env> {
   // the button list so the doctor can't "double-save" the same person.
   private doctorSecondSaveKeyboard(game: GameState, player: Player, firstTargetId: number): InlineKeyboard {
     const targets = game.players.filter((p) => p.status === "alive" && p.userId !== firstTargetId);
-    return playerButtons(targets, `N${game.nightNumber}:heal:`, [
-      { text: "⏭ رد کردن نجات دوم", data: `N${game.nightNumber}:heal:0` },
-    ]);
+    return playerButtons(
+      targets,
+      `N${game.nightNumber}:heal:`,
+      [{ text: "⏭ رد کردن نجات دوم", data: `N${game.nightNumber}:heal:0`, style: "danger" }],
+      "success", // this panel is always a heal, same as styleForNightAction("heal")
+    );
   }
 
   private async enterNomination(): Promise<void> {
@@ -5682,6 +5830,7 @@ export class GameRoom extends DurableObject<Env> {
     // (town/mafia/independent) or other path led here, since every route to
     // game over passes through this one function.
     await this.unpinAllBotPins(game.chatId);
+    game.status = "finished";
     game.phase = "finished";
     game.winner = winner;
     game.finishedAt = now();
@@ -5881,6 +6030,7 @@ export class GameRoom extends DurableObject<Env> {
     const roleButtons = guessableRoles.map(({ id, emoji, name }) => ({
       text: `${emoji} ${name}`,
       callback_data: `NR${nightNumber}:${targetId}:${id}`,
+      style: "primary" as const,
     }));
     const keyboard: InlineKeyboard = chunk(roleButtons, 2);
 
@@ -6321,12 +6471,12 @@ export class GameRoom extends DurableObject<Env> {
     const rows: InlineKeyboard = [];
     const markTargets = nightTargetsFor(game.players, player.userId, "bomber_mark");
     if (markTargets.length > 0) {
-      rows.push(...chunk(markTargets.map(p => ({ text: `💣 علامت‌گذاری: ${p.displayName}`, callback_data: `N${game.nightNumber}:bm:${p.userId}` })), 2));
+      rows.push(...chunk(markTargets.map(p => ({ text: `💣 علامت‌گذاری: ${p.displayName}`, callback_data: `N${game.nightNumber}:bm:${p.userId}`, style: "danger" as const })), 2));
     }
     if (game.bomberMarkedTargets.length > 0) {
-      rows.push([{ text: "💥 منفجر کردن بمب‌ها", callback_data: `N${game.nightNumber}:be:${player.userId}` }]);
+      rows.push([{ text: "💥 منفجر کردن بمب‌ها", callback_data: `N${game.nightNumber}:be:${player.userId}`, style: "danger" }]);
     }
-    rows.push([{ text: "⏭ رد کردن این شب", callback_data: `N${game.nightNumber}:bm:0` }]);
+    rows.push([{ text: "⏭ رد کردن این شب", callback_data: `N${game.nightNumber}:bm:0`, style: "danger" }]);
     return rows;
   }
 
@@ -7303,6 +7453,27 @@ export default {
 
 async function dispatch(update: TgUpdate, env: Env): Promise<void> {
   try {
+    // Global on/off switch — checked before ANY other routing (group or
+    // private, any command/update type). While off, every update is
+    // dropped completely and silently: no reply, no state change, nothing
+    // persisted. /off and /on themselves are the only things that ever get
+    // through regardless of the current state, and only for
+    // SUPER_KILL_ADMIN_ID — checked here, before the switch is even read,
+    // so that ID can always turn the bot back on no matter what.
+    const from = update.message?.from;
+    const text = update.message?.text;
+    if (from && text) {
+      const parsed = parseCommand(text);
+      if (parsed && (parsed.cmd === "off" || parsed.cmd === "on")) {
+        if (from.id !== SUPER_KILL_ADMIN_ID) return; // silent no-op for anyone else, on or off
+        await setBotOff(env.DB, parsed.cmd === "off");
+        const tg = new Telegram(env.BOT_TOKEN);
+        await tg.callSafe("sendMessage", { chat_id: update.message!.chat.id, text: parsed.cmd === "off" ? "🔴 ربات خاموش شد." : "🟢 ربات روشن شد." });
+        return;
+      }
+    }
+    if (await isBotOff(env.DB)) return;
+
     const groupId = resolveGroupChatId(update);
     if (groupId !== null) { await callRoom(env, groupId, update); return; }
     await routePrivate(update, env);
@@ -7445,6 +7616,19 @@ async function handleStatsCallback(env: Env, tg: Telegram, cq: TgCallbackQuery):
 
   if (data === "ST:records") {
     await tg.editMessageText(chatId, messageId, fa.statsRecords(displayName, stats), { reply_markup: { inline_keyboard: statsRecordsKeyboard() } });
+    await tg.answerCallbackQuery(cq.id);
+    return;
+  }
+
+  if (data === "ST:leaderboard") {
+    const entries = await getLeaderboard(env.DB, 10);
+    const viewerInTop = entries.some((e) => e.userId === userId);
+    const viewerRank = viewerInTop ? null : await getLeaderboardRank(env.DB, userId);
+    await tg.editMessageText(
+      chatId, messageId,
+      fa.leaderboard(entries, viewerRank, viewerInTop, LEADERBOARD_MIN_GAMES),
+      { reply_markup: { inline_keyboard: statsLeaderboardKeyboard() } },
+    );
     await tg.answerCallbackQuery(cq.id);
     return;
   }

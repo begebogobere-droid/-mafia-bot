@@ -692,7 +692,13 @@ function entrySide(entry: GuessableRoleId): Team {
   if ((["johnny", "joker", "bomber", "lonewolf"] as const).includes(entry as IndependentRoleId)) {
     return "independent";
   }
-  return ROLES[entry as RoleId].team;
+  // BUGFIX: `entry` comes from a player's persisted recent_roles history in
+  // D1, which can outlive a role being renamed/removed from ROLES. Reading
+  // .team off an undefined lookup crashed cmdStartGame entirely (see
+  // "Cannot read properties of undefined (reading 'team')"). Fall back to
+  // "town" — a neutral default that only affects fairness weighting, never
+  // real game logic — instead of throwing.
+  return ROLES[entry as RoleId]?.team ?? "town";
 }
 
 export function randomId(prefix = "g"): string {
@@ -1676,6 +1682,18 @@ export const INDEPENDENT_ROLES: Record<IndependentRoleId, IndependentRoleDef> = 
   },
 };
 
+// BUGFIX: recent_roles and role_stats_json in D1 persist role ids
+// indefinitely across app versions. If a role is ever renamed or removed,
+// old rows keep referencing the dead id forever, and every lookup against
+// ROLES/INDEPENDENT_ROLES for that id returns undefined — this is what was
+// crashing both cmdStartGame (via entrySide) and the stats screen (via
+// roleLabel). Used below to filter stale ids back out when reading that
+// data, so corrupt/legacy entries get dropped instead of propagating.
+const VALID_GUESSABLE_ROLE_IDS = new Set<string>([
+  ...(Object.keys(ROLES) as RoleId[]),
+  ...(Object.keys(INDEPENDENT_ROLES) as IndependentRoleId[]),
+]);
+
 // =============================================================================
 // ROLE DISTRIBUTION
 // =============================================================================
@@ -1817,12 +1835,18 @@ export function assignRoles(players: Player[], roleHistory: Record<number, Guess
 export function roleLabel(role: RoleId | null): string {
   if (!role) return "نامشخص";
   const def = ROLES[role];
+  // BUGFIX: role can come from persisted stats/history data (role_stats_json,
+  // recent_roles) referencing a role id that was since renamed/removed from
+  // ROLES. That previously crashed on .emoji of undefined (e.g. in the
+  // stats screen). Fall back to the "unknown" label instead.
+  if (!def) return "نامشخص";
   return `${def.emoji} ${def.name}`;
 }
 
 export function independentRoleLabel(role: IndependentRoleId | null): string {
   if (!role) return "";
   const def = INDEPENDENT_ROLES[role];
+  if (!def) return "";
   return `${def.emoji} ${def.name}`;
 }
 
@@ -3710,7 +3734,13 @@ export async function getRoleHistory(db: D1Database, userIds: number[]): Promise
   const map: Record<number, GuessableRoleId[]> = {};
   for (const row of rows.results ?? []) {
     try {
-      map[row.telegram_id] = row.recent_roles ? (JSON.parse(row.recent_roles) as GuessableRoleId[]) : [];
+      const parsed = row.recent_roles ? (JSON.parse(row.recent_roles) as unknown[]) : [];
+      // BUGFIX: drop any stale/legacy id that no longer exists in
+      // ROLES/INDEPENDENT_ROLES (see VALID_GUESSABLE_ROLE_IDS) so it can't
+      // crash entrySide/sideWeight during role assignment.
+      map[row.telegram_id] = parsed.filter(
+        (r): r is GuessableRoleId => typeof r === "string" && VALID_GUESSABLE_ROLE_IDS.has(r),
+      );
     } catch {
       map[row.telegram_id] = [];
     }
@@ -3959,7 +3989,15 @@ export async function recordFinishStats(
   const existingMap = new Map<number, RoleStatsMap>();
   for (const row of existingRows) {
     try {
-      existingMap.set(row.telegram_id, row.role_stats_json ? (JSON.parse(row.role_stats_json) as RoleStatsMap) : {});
+      const parsed = row.role_stats_json ? (JSON.parse(row.role_stats_json) as Record<string, RoleStatEntry>) : {};
+      // BUGFIX: drop any stale/legacy role key (see VALID_GUESSABLE_ROLE_IDS)
+      // so it doesn't get carried forward forever and crash the stats screen
+      // (roleLabel/.emoji) the next time someone views it.
+      const cleaned: RoleStatsMap = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (VALID_GUESSABLE_ROLE_IDS.has(k)) cleaned[k as StatRoleKey] = v;
+      }
+      existingMap.set(row.telegram_id, cleaned);
     } catch {
       existingMap.set(row.telegram_id, {});
     }
@@ -4073,7 +4111,14 @@ export async function getPlayerStatistics(db: D1Database, userId: number): Promi
   }
   let roles: RoleStatsMap = {};
   try {
-    roles = row.role_stats_json ? (JSON.parse(row.role_stats_json) as RoleStatsMap) : {};
+    const parsed = row.role_stats_json ? (JSON.parse(row.role_stats_json) as Record<string, RoleStatEntry>) : {};
+    // BUGFIX: same stale-role-key filtering as recordFinishStats — this is
+    // what was crashing statsRecords/statsRolesPage with "Cannot read
+    // properties of undefined (reading 'emoji')" whenever a viewed player's
+    // saved stats contained a role id no longer in ROLES/INDEPENDENT_ROLES.
+    for (const [k, v] of Object.entries(parsed)) {
+      if (VALID_GUESSABLE_ROLE_IDS.has(k)) roles[k as StatRoleKey] = v;
+    }
   } catch {
     roles = {};
   }

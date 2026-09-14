@@ -263,7 +263,8 @@ export type DeathReason =
   | "host"
   | "joker"
   | "admin_kill"
-  | "investigation";
+  | "investigation"
+  | "mayor_no_choice";
 
 export type NightActionType =
   | "mafia_kill"
@@ -360,6 +361,20 @@ export interface Player {
   // cleared as soon as the note is captured). Not meaningful once the game
   // ends and never displayed anywhere.
   awaitingNote?: boolean;
+  // MAYOR REWORK: which of the two powers the mayor locked in during Intro
+  // (before Night 1) — null/undefined means "not chosen yet". Once set, it
+  // never changes for the rest of the game (see applyMayorPowerChoice).
+  mayorPower?: "reveal" | "watcher" | null;
+  // MAYOR REWORK: true once a "reveal" mayor has pressed the one-time
+  // "افشای نقش" button. From this point voteWeight() gives them 2 votes
+  // for the rest of the game (see voteWeight) and they become eligible to
+  // use their one-time court-override power (see mayorCourtPowerUsed).
+  mayorRevealed?: boolean;
+  // MAYOR REWORK: true once a revealed mayor has spent their single
+  // lifetime court-override (forcing a nomination target + a verdict
+  // result) — permanently disables that power afterward, but never
+  // affects the permanent double-vote from mayorRevealed above.
+  mayorCourtPowerUsed?: boolean;
 }
 
 export interface NightAction {
@@ -424,6 +439,20 @@ export interface GameState {
   pendingInquiryDeaths: DeathRecord[] | null;
   accusedUserId: number | null;
   temporaryCourtAdminUserId: number | null;
+  // MAYOR REWORK: tracks the mayor's one-time court-override session, which
+  // always spans exactly one nomination phase + the trial it produces.
+  // mayorCourtOverrideDay is the dayNumber the override was engaged on (set
+  // the moment a revealed, not-yet-used mayor casts a real nomination
+  // vote); mayorCourtOverrideTargetId is who that override sends straight
+  // to trial regardless of the normal tally; mayorCourtOverrideGuilty is
+  // set once the mayor casts their verdict vote in that same trial and
+  // decides the outcome regardless of everyone else's votes. All three are
+  // reset to null once that trial's verdict resolves (see
+  // resolveVerdictPhase), which is also when mayorCourtPowerUsed is
+  // permanently set on the mayor's Player record.
+  mayorCourtOverrideDay: number | null;
+  mayorCourtOverrideTargetId: number | null;
+  mayorCourtOverrideGuilty: boolean | null;
   // Intro (pre-Night-1 player-by-player self-introduction). introOrder is
   // fixed once at intro start; introIndex points at whose turn it currently
   // is. introAdminUserId mirrors temporaryCourtAdminUserId's ownership
@@ -1567,7 +1596,7 @@ export const ROLES: Record<RoleId, RoleDef> = {
     name: "شهردار",
     emoji: "🏛",
     title: "شهردار",
-    description: "رأی روزانه شما دو برابر محاسبه می‌شود. شب‌ها اقدامی ندارید.",
+    description: "در معارفه باید بین دو قدرت «افشای نقش» یا «مشاهده کامل رأی‌ها» یکی را انتخاب کنید؛ جزئیات هر دو برایتان در پیوی ارسال می‌شود. اگر تا شروع شب اول انتخاب نکنید، ابتدای روز بعد از بازی حذف می‌شوید. شب‌ها اقدامی ندارید.",
     nightAction: null,
     nightOptional: true,
   },
@@ -2156,8 +2185,15 @@ export function hasFinishedVerdict(game: GameState): boolean {
   );
 }
 
+// MAYOR REWORK: the old unconditional "mayor always votes double" power is
+// gone. A mayor's vote is worth 1 like everyone else's until (and unless)
+// they've chosen the "افشای نقش" power AND actually pressed the reveal
+// button (mayorRevealed) — from that moment on it's permanently 2, for the
+// rest of the game, regardless of the separate one-time court-override
+// power (mayorCourtPowerUsed) being spent later.
 export function voteWeight(player: Player): number {
-  return player.role === "mayor" && player.team === "town" ? 2 : 1;
+  if (player.role === "mayor" && player.mayorPower === "reveal" && player.mayorRevealed) return 2;
+  return 1;
 }
 
 
@@ -3022,6 +3058,7 @@ export const fa = {
   reasonJoker: "حذف جوکر (برد)",
   reasonAdminKill: "حذف توسط مدیریت",
   reasonInvestigation: "استعلام",
+  reasonMayorNoChoice: "انتخاب نکردن اثرگذاری نقش",
 
   gunnerReceivedGun: "🔫 شما یک تفنگ دریافت کردید.",
   gunnerDistributionAnnounce: "🔫 تفنگدار تفنگ‌هایی را بین اعضای بازی توزیع کرده است.\nلطفاً برای مشاهده اینکه آیا تفنگ دریافت کرده‌اید یا خیر، پیام خصوصی ربات را بررسی کنید.",
@@ -3147,6 +3184,74 @@ export const fa = {
     } else {
       lines.push(`🕊 ${mention(userId, name)} تبرئه شد و به بازی برمی‌گردد.`);
     }
+    return lines.join("\n");
+  },
+
+  // MAYOR REWORK ------------------------------------------------------------
+
+  mayorPowerChoicePrompt(): string {
+    return [
+      "🏛 شما <b>شهردار</b> بازی هستید و باید یکی از دو قدرت زیر را انتخاب کنید:",
+      "",
+      "1️⃣ <b>افشای نقش</b>",
+      "در هر زمان دلخواه (تا پایان بازی) می‌توانید نقش خود را در گروه افشا کنید. از آن لحظه رأی شما دو رأی محسوب می‌شود. همچنین فقط یک‌بار در کل بازی می‌توانید در یک رأی‌گیری و دادگاه، رأی خودتان را بر رأی بقیه اولویت بدهید (هم برای فرستادن کسی به دادگاه، هم برای تعیین نتیجهٔ همان دادگاه).",
+      "",
+      "2️⃣ <b>مشاهده کامل رأی‌ها</b>",
+      "رأی شما همیشه فقط یک رأی می‌ماند، اما بعد از هر رأی‌گیری و هر دادگاه، گزارش کامل و دقیق رأی‌ها (شامل اسم تک‌تک رأی‌دهندگان) فقط برای شما در پیوی ارسال می‌شود.",
+      "",
+      "⚠️ تا قبل از شروع شب اول باید انتخاب کنید، وگرنه ابتدای روز بعد از بازی حذف می‌شوید.",
+    ].join("\n");
+  },
+
+  mayorPowerKeyboardReveal: "1️⃣ افشای نقش",
+  mayorPowerKeyboardWatcher: "2️⃣ مشاهده کامل رأی‌ها",
+
+  mayorPowerAlreadyChosen: "شما قبلاً یکی از قدرت‌ها را انتخاب کرده‌اید و دیگر قابل تغییر نیست.",
+  mayorPowerTooLate: "دیگر مهلت انتخاب قدرت شهردار تمام شده است.",
+
+  mayorPowerChosenReveal: "✅ قدرت «افشای نقش» را انتخاب کردید. هر زمان بخواهید می‌توانید با دکمه‌ای که در مرحلهٔ رأی‌گیری برایتان ارسال می‌شود، نقش خود را افشا کنید.",
+  mayorPowerChosenWatcher: "✅ قدرت «مشاهده کامل رأی‌ها» را انتخاب کردید. از این پس بعد از هر رأی‌گیری و دادگاه، گزارش کامل برایتان ارسال می‌شود.",
+
+  mayorNoChoicePublic(name: string, userId: number): string {
+    return `⚠️ ${mention(userId, name)} (شهردار بازی) به علت انتخاب نکردن اثرگذاری نقش از بازی حذف شد.`;
+  },
+
+  mayorRevealButtonPrompt: "🏛 در صورت تمایل، همین الان می‌توانید نقش خود را به‌عنوان شهردار افشا کنید:",
+  mayorRevealButtonLabel: "📢 افشای نقش",
+  mayorRevealAlreadyUsed: "شما قبلاً نقش خود را افشا کرده‌اید.",
+  mayorRevealNotEligible: "شما این قدرت را انتخاب نکرده‌اید.",
+
+  mayorRevealAnnounce(name: string, userId: number): string {
+    return ["📢 شهردار بازی هویت خود را افشا کرد.", "", `شهردار بازی: ${mention(userId, name)}`].join("\n");
+  },
+
+  mayorRevealConfirm: "📢 هویت شما به‌عنوان شهردار در گروه افشا شد. از این پس رأی شما دو رأی محسوب می‌شود.",
+
+  mayorCourtOverrideNominationAnnounce(mayorName: string, targetName: string): string {
+    return `⚖️ شهردار بازی (${esc(mayorName)}) با اختیار ویژهٔ خود، ${esc(targetName)} را مستقیم به دادگاه فرستاد.`;
+  },
+
+  mayorCourtOverrideVerdictAnnounce(mayorName: string): string {
+    return `⚖️ شهردار بازی (${esc(mayorName)}) با اختیار ویژهٔ خود، نتیجهٔ همین دادگاه را رأساً تعیین کرد. این اختیار برای همیشه مصرف شد.`;
+  },
+
+  mayorWatchNominationReport(tallies: Array<{ userId: number | null; votes: number; names: string[] }>, players: Player[]): string {
+    const buckets = tallies.filter((t) => t.votes > 0);
+    if (buckets.length === 0) return "🗳 <b>نتیجه رأی‌گیری</b>\n\nهیچ رأیی ثبت نشد.";
+    const blocks = buckets.map((t) => {
+      const label = t.userId === null ? "امتناع" : esc(players.find((p) => p.userId === t.userId)?.displayName || "؟");
+      return [`${label}: ${t.votes} رأی`, "رأی‌دهندگان:", ...t.names.map((n) => esc(n))].join("\n");
+    });
+    return ["🗳 <b>نتیجه رأی‌گیری</b>", "", blocks.join("\n---\n")].join("\n");
+  },
+
+  mayorWatchVerdictReport(guiltyNames: string[], innocentNames: string[]): string {
+    const lines = ["🗳 <b>نتیجه دادگاه</b>", ""];
+    lines.push("گناه دادند:");
+    lines.push(...(guiltyNames.length ? guiltyNames.map((n) => esc(n)) : ["—"]));
+    lines.push("");
+    lines.push("بی‌گناه دادند:");
+    lines.push(...(innocentNames.length ? innocentNames.map((n) => esc(n)) : ["—"]));
     return lines.join("\n");
   },
 
@@ -4662,6 +4767,23 @@ export class GameRoom extends DurableObject<Env> {
         return;
       }
 
+      // MAYOR REWORK — power choice (Intro, before Night 1)
+      const mayorPowerChoice = /^MPW:(reveal|watch)$/.exec(data);
+      if (mayorPowerChoice) {
+        const power = mayorPowerChoice[1] === "reveal" ? "reveal" : "watcher";
+        const result = await this.applyMayorPowerChoice(user.id, power);
+        await this.tg.answerCallbackQuery(cq.id, result.alert ? result.text : undefined, result.alert);
+        return;
+      }
+
+      // MAYOR REWORK — one-time reveal button (sent alongside the
+      // nomination-phase voting panel, see sendMayorRevealPanelIfEligible)
+      if (data === "MPRV") {
+        const result = await this.applyMayorReveal(user.id);
+        await this.tg.answerCallbackQuery(cq.id, result.alert ? result.text : undefined, result.alert);
+        return;
+      }
+
       await this.tg.answerCallbackQuery(cq.id);
     } catch (err) {
       console.error("callback", err);
@@ -4788,6 +4910,7 @@ export class GameRoom extends DurableObject<Env> {
       alarmKind: "phase_end", players: [host], nightActions: [], votes: [], verdictVotes: [],
       inquiryVotes: [], cityInquiryCount: CITY_INQUIRY_TOTAL, pendingInquiryDeaths: null,
       accusedUserId: null, temporaryCourtAdminUserId: null,
+      mayorCourtOverrideDay: null, mayorCourtOverrideTargetId: null, mayorCourtOverrideGuilty: null,
       introOrder: [], introIndex: 0, introAdminUserId: null, introAdminWasPromotedByBot: false,
       silencedUserIds: [], blockedUserIds: [],
       escortBlockedUserIds: [], doctorSelfHealUsedBy: [], sniperShotsLeft: {}, investigationChecked: {}, homshahriKainUsed: false,
@@ -5244,7 +5367,60 @@ export class GameRoom extends DurableObject<Env> {
     await this.relockAllPlayers();
     await this.lockGroup();
     await this.persist(true);
+    await this.sendMayorPowerChoicePrompt();
     await this.advanceIntroTurn();
+  }
+
+  // MAYOR REWORK: sent once, right when Intro begins (the deadline being
+  // "قبل از شروع شب اول" — before Night 1 — and Intro is exactly the phase
+  // that runs before Night 1). Only relevant if a mayor exists this game
+  // (mayor only enters the role pool at 7+ players) and hasn't chosen yet —
+  // guards against ever re-sending this if enterIntro were somehow re-run.
+  private async sendMayorPowerChoicePrompt(): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    const mayor = game.players.find((p) => p.role === "mayor" && p.status === "alive");
+    if (!mayor || mayor.mayorPower != null) return;
+    const keyboard: InlineKeyboard = [
+      [{ text: fa.mayorPowerKeyboardReveal, callback_data: "MPW:reveal", style: "primary" }],
+      [{ text: fa.mayorPowerKeyboardWatcher, callback_data: "MPW:watch", style: "primary" }],
+    ];
+    await this.pm(mayor.userId, fa.mayorPowerChoicePrompt(), keyboard);
+  }
+
+  // MAYOR REWORK: locks in the mayor's one-time power choice. Only valid
+  // during Intro (the literal "قبل از شروع شب اول" deadline — once Night 1
+  // starts, game.status is no longer "intro" and this always rejects) and
+  // only once (mayorPower can never be reassigned after it's first set).
+  private async applyMayorPowerChoice(userId: number, power: "reveal" | "watcher"): Promise<{ text: string; alert: boolean }> {
+    const game = this.game;
+    if (!game || game.status !== "intro") return { text: fa.mayorPowerTooLate, alert: true };
+    const player = findPlayer(game.players, userId);
+    if (!player || player.role !== "mayor" || player.status !== "alive") return { text: fa.actionForbidden, alert: true };
+    if (player.mayorPower != null) return { text: fa.mayorPowerAlreadyChosen, alert: true };
+    player.mayorPower = power;
+    await this.persist(true);
+    await this.pm(userId, power === "reveal" ? fa.mayorPowerChosenReveal : fa.mayorPowerChosenWatcher);
+    return { text: "ثبت شد", alert: false };
+  }
+
+  // MAYOR REWORK: the one-time "افشای نقش" button, only ever offered to a
+  // mayor who chose the "reveal" power and hasn't used it yet (see
+  // sendMayorRevealPanelIfEligible — the panel simply stops being sent once
+  // mayorRevealed is true, which is how the "پس از استفاده برای همیشه حذف
+  // شود" requirement is satisfied without needing to edit old messages).
+  private async applyMayorReveal(userId: number): Promise<{ text: string; alert: boolean }> {
+    const game = this.game;
+    if (!game) return { text: fa.staleAction, alert: true };
+    const player = findPlayer(game.players, userId);
+    if (!player || player.role !== "mayor" || player.status !== "alive") return { text: fa.actionForbidden, alert: true };
+    if (player.mayorPower !== "reveal") return { text: fa.mayorRevealNotEligible, alert: true };
+    if (player.mayorRevealed) return { text: fa.mayorRevealAlreadyUsed, alert: true };
+    player.mayorRevealed = true;
+    await this.persist(true);
+    await this.group(fa.mayorRevealAnnounce(player.displayName, player.userId));
+    await this.pm(userId, fa.mayorRevealConfirm);
+    return { text: "افشا شد", alert: false };
   }
 
   // Advances to the next player's intro turn, or — once every player has
@@ -5455,6 +5631,17 @@ export class GameRoom extends DurableObject<Env> {
     const game = this.game;
     if (!game) return;
     if (await this.checkAndHandleWin(resolutionText)) return;
+
+    // MAYOR REWORK: enforce the mayor's power-choice deadline. Checked here
+    // — right at the start of the very first day (dayNumber === 1 is
+    // exactly "روز بعد" relative to the deadline, which was "قبل از شروع
+    // شب اول") — rather than during Night 1 itself, so this removal never
+    // interacts with heal/shield/escort or any other night mechanic
+    // ("این مرگ قابل جلوگیری نباشد" — applied directly, completely outside
+    // night resolution).
+    if (game.dayNumber === 1 && (await this.applyMayorNoChoiceDeathIfNeeded())) {
+      if (await this.checkAndHandleWin(resolutionText)) return;
+    }
 
     // FIX #7: Schedule a fallback alarm BEFORE we start the (potentially-failing)
     // day phase. If anything below throws (rate-limited Telegram call to
@@ -5904,6 +6091,7 @@ export class GameRoom extends DurableObject<Env> {
       case "joker": return fa.reasonJoker;
       case "host": return "حذف توسط میزبان";
       case "investigation": return fa.reasonInvestigation;
+      case "mayor_no_choice": return fa.reasonMayorNoChoice;
       default: return reason;
     }
   }
@@ -5919,6 +6107,27 @@ export class GameRoom extends DurableObject<Env> {
     await this.persist(true);
     await addEvent(this.env.DB, game.id, "nomination_resolved", res);
     await this.group(fa.nominationResult(res, game.players));
+    await this.sendMayorNominationWatchReport(res);
+
+    // MAYOR REWORK: an active court-override for this exact day sends
+    // whoever the mayor voted for straight to trial, regardless of the
+    // tally above (still computed/shown as usual for everyone else). Only
+    // takes effect if the override target is still alive — if not, the
+    // override never actually happened this session, so it's cleared here
+    // and the normal tally-based result below decides the day as usual.
+    const overrideMayor = game.players.find(
+      (p) => p.role === "mayor" && p.mayorPower === "reveal" && !p.mayorCourtPowerUsed && game.mayorCourtOverrideDay === game.dayNumber,
+    );
+    if (overrideMayor) {
+      const overrideTarget = game.mayorCourtOverrideTargetId != null ? findPlayer(game.players, game.mayorCourtOverrideTargetId) : null;
+      if (overrideTarget && overrideTarget.status === "alive") {
+        await this.group(fa.mayorCourtOverrideNominationAnnounce(overrideMayor.displayName, overrideTarget.displayName));
+        await this.enterDefense(overrideTarget.userId);
+        return;
+      }
+      game.mayorCourtOverrideDay = null;
+      game.mayorCourtOverrideTargetId = null;
+    }
 
     if (res.tied || !res.eliminated) { await this.group(fa.noOneOnTrial); await this.enterNight(); return; }
 
@@ -5929,6 +6138,17 @@ export class GameRoom extends DurableObject<Env> {
     // verdict is "guilty" (executed). If acquitted there, no win is
     // recorded and the game continues normally.
     await this.enterDefense(res.eliminated.userId);
+  }
+
+  // MAYOR REWORK: PMs the full per-target voter breakdown to a "watcher"
+  // mayor (the other power) after every nomination resolves. No-op if
+  // there's no living mayor who chose that power.
+  private async sendMayorNominationWatchReport(res: VoteResolution): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    const watcher = game.players.find((p) => p.role === "mayor" && p.mayorPower === "watcher" && p.status === "alive");
+    if (!watcher) return;
+    await this.pm(watcher.userId, fa.mayorWatchNominationReport(res.tallies, game.players));
   }
 
   private async resolveDefensePhase(): Promise<void> {
@@ -5949,8 +6169,38 @@ export class GameRoom extends DurableObject<Env> {
     const accusedId = game.accusedUserId;
     await this.removeTemporaryCourtAdmin(accusedId);
     const accused = findPlayer(game.players, accusedId);
-    const res = resolveVerdict(game.verdictVotes, game.dayNumber);
+    const tally = resolveVerdict(game.verdictVotes, game.dayNumber);
     const stillAlive = accused?.status === "alive";
+
+    // MAYOR REWORK: if this trial is the mayor's active court-override
+    // session (engaged this same day, in the nomination phase — see
+    // applyNominationSerialized/resolveNominationPhase), their verdict
+    // vote — if they cast one — decides the outcome outright, regardless
+    // of everyone else's votes. tally.guilty/innocent are still the real
+    // counts and are shown as usual either way; only which `result` wins
+    // is overridden.
+    const overrideMayor = game.players.find(
+      (p) => p.role === "mayor" && p.mayorPower === "reveal" && !p.mayorCourtPowerUsed && game.mayorCourtOverrideDay === game.dayNumber,
+    );
+    const overrideDecided = !!overrideMayor && game.mayorCourtOverrideGuilty !== null;
+    const res: VerdictResolution = overrideDecided
+      ? { guilty: tally.guilty, innocent: tally.innocent, result: game.mayorCourtOverrideGuilty ? "guilty" : "innocent" }
+      : tally;
+
+    if (overrideMayor) {
+      if (overrideDecided) await this.group(fa.mayorCourtOverrideVerdictAnnounce(overrideMayor.displayName));
+      // This trial concludes the mayor's one-time court-override session
+      // either way — permanently spent now, whether they actually cast an
+      // override verdict vote or not (see the mayorCourtOverrideDay
+      // field comment on GameState). Never touches mayorRevealed/the
+      // permanent double-vote, which stays in effect for the rest of the
+      // game regardless.
+      const freshMayor = findPlayer(game.players, overrideMayor.userId);
+      if (freshMayor) freshMayor.mayorCourtPowerUsed = true;
+      game.mayorCourtOverrideDay = null;
+      game.mayorCourtOverrideTargetId = null;
+      game.mayorCourtOverrideGuilty = null;
+    }
 
     if (accused && stillAlive && res.result === "guilty") {
       // Check Joker win
@@ -5976,9 +6226,24 @@ export class GameRoom extends DurableObject<Env> {
     await this.persist(true);
     await addEvent(this.env.DB, game.id, "verdict_resolved", res);
     if (accused && stillAlive) await this.group(fa.verdictResult(accused.displayName, accused.userId, res, accused.team));
+    await this.sendMayorVerdictWatchReport();
 
     if (await this.checkAndHandleWin()) return;
     await this.enterNight();
+  }
+
+  // MAYOR REWORK: PMs the full guilty/innocent voter breakdown to a
+  // "watcher" mayor after every verdict resolves. No-op if there's no
+  // living mayor who chose that power.
+  private async sendMayorVerdictWatchReport(): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    const watcher = game.players.find((p) => p.role === "mayor" && p.mayorPower === "watcher" && p.status === "alive");
+    if (!watcher) return;
+    const dayVotes = game.verdictVotes.filter((v) => v.dayNumber === game.dayNumber);
+    const guiltyNames = dayVotes.filter((v) => v.guilty).map((v) => findPlayer(game.players, v.voterId)?.displayName || "؟");
+    const innocentNames = dayVotes.filter((v) => !v.guilty).map((v) => findPlayer(game.players, v.voterId)?.displayName || "؟");
+    await this.pm(watcher.userId, fa.mayorWatchVerdictReport(guiltyNames, innocentNames));
   }
 
   // Central win check used after every death/kill/elimination point in the
@@ -6501,6 +6766,22 @@ export class GameRoom extends DurableObject<Env> {
     const weight = voteWeight(player);
     game.votes = game.votes.filter((v) => !(v.voterId === userId && v.dayNumber === dayNumber));
     game.votes.push({ voterId: userId, targetId: normalizedTargetId, weight, dayNumber, at: now() });
+
+    // MAYOR REWORK: an eligible mayor's nomination vote engages (or, on
+    // abstain, cancels) the one-time court-override session for this day.
+    // Tracks their CURRENT vote, same as the vote itself — if they change
+    // their mind before the phase ends, the override target/cancellation
+    // follows the latest vote, just like the vote record above.
+    if (player.role === "mayor" && player.mayorPower === "reveal" && player.mayorRevealed && !player.mayorCourtPowerUsed) {
+      if (normalizedTargetId !== null) {
+        game.mayorCourtOverrideDay = dayNumber;
+        game.mayorCourtOverrideTargetId = normalizedTargetId;
+      } else if (game.mayorCourtOverrideDay === dayNumber) {
+        game.mayorCourtOverrideDay = null;
+        game.mayorCourtOverrideTargetId = null;
+      }
+    }
+
     await this.persist();
     await persistVote(this.env.DB, game.id, dayNumber, userId, normalizedTargetId, weight);
     const label = targetId > 0 ? findPlayer(game.players, targetId)?.displayName || "بازیکن" : "ممتنع";
@@ -6524,6 +6805,19 @@ export class GameRoom extends DurableObject<Env> {
     const weight = voteWeight(player);
     game.verdictVotes = game.verdictVotes.filter((v) => !(v.voterId === userId && v.dayNumber === dayNumber));
     game.verdictVotes.push({ voterId: userId, guilty, weight, dayNumber, at: now() });
+
+    // MAYOR REWORK: if this trial IS the mayor's active override session
+    // (engaged during this same day's nomination phase — see
+    // applyNominationSerialized), their verdict vote decides the outcome
+    // outright. Tracks their current vote, same "follows the latest vote"
+    // behavior as the override target above.
+    if (
+      player.role === "mayor" && player.mayorPower === "reveal" && player.mayorRevealed &&
+      !player.mayorCourtPowerUsed && game.mayorCourtOverrideDay === dayNumber
+    ) {
+      game.mayorCourtOverrideGuilty = guilty;
+    }
+
     await this.persist();
     // BUGFIX: this write to the dedicated verdict_votes table was missing,
     // so verdict votes only ever lived inside the state_json snapshot. If
@@ -6682,6 +6976,23 @@ export class GameRoom extends DurableObject<Env> {
       if (game.silencedUserIds.includes(p.userId)) { await this.pm(p.userId, fa.silencedCannotVote); continue; }
       await this.pm(p.userId, fa.nominationPv(game.config.voteSeconds), nominationKeyboard(game.players, p.userId, game.dayNumber));
     }
+    await this.sendMayorRevealPanelIfEligible();
+  }
+
+  // MAYOR REWORK: "علاوه بر پنل رأی‌گیری، یک پنل جداگانه" — a second,
+  // separate PM (not merged into the nomination keyboard above), sent every
+  // nomination phase for as long as the mayor picked "reveal" and hasn't
+  // used it yet. Once mayorRevealed flips true this simply stops being
+  // sent — satisfies "پس از استفاده برای همیشه حذف شود" without needing to
+  // edit any previously-sent message.
+  private async sendMayorRevealPanelIfEligible(): Promise<void> {
+    const game = this.game;
+    if (!game) return;
+    const mayor = game.players.find((p) => p.role === "mayor" && p.status === "alive");
+    if (!mayor || mayor.mayorPower !== "reveal" || mayor.mayorRevealed) return;
+    if (game.silencedUserIds.includes(mayor.userId)) return;
+    const keyboard: InlineKeyboard = [[{ text: fa.mayorRevealButtonLabel, callback_data: "MPRV", style: "danger" }]];
+    await this.pm(mayor.userId, fa.mayorRevealButtonPrompt, keyboard);
   }
 
   private async sendVerdictPrompts(): Promise<void> {
@@ -6850,8 +7161,31 @@ export class GameRoom extends DurableObject<Env> {
     await this.checkAndHandleWin();
   }
 
-  // ===========================================================================
-  // KILL ADMIN — independent moderation feature (see module-level helpers
+  // MAYOR REWORK: called only from enterDay() at the start of Day 1. If the
+  // mayor never chose a power during Intro, removes them here —
+  // unpreventable, administrative, and deliberately outside applyDeaths'
+  // usual night-resolution/heal-protection path (same pattern as
+  // eliminate()/cmdKill() above). Returns true iff a removal actually
+  // happened, so the caller knows to re-run the win check before
+  // continuing to set up the day.
+  private async applyMayorNoChoiceDeathIfNeeded(): Promise<boolean> {
+    const game = this.game;
+    if (!game) return false;
+    const mayor = game.players.find((p) => p.role === "mayor" && p.status === "alive");
+    if (!mayor || mayor.mayorPower != null) return false;
+    game.players = applyDeaths(
+      game.players,
+      [{ userId: mayor.userId, reason: "mayor_no_choice", revealedRole: mayor.role!, revealedIndependentRole: mayor.independentRole ?? undefined }],
+      "day",
+      game.dayNumber,
+    );
+    await this.notifyLecterSuccession([{ userId: mayor.userId, reason: "mayor_no_choice", revealedRole: mayor.role! }]);
+    await this.publishNotes([{ userId: mayor.userId, reason: "mayor_no_choice", revealedRole: mayor.role! }]);
+    await this.mutePlayer(mayor.userId);
+    await this.persist(true);
+    await this.group(fa.mayorNoChoicePublic(mayor.displayName, mayor.userId));
+    return true;
+  }
   // isKillAdmin/addKillAdmin above). Intentionally kept separate from every
   // Role/NightAction/Vote code path:
   //   - Permission is checked purely against msg.from.id (Telegram numeric
@@ -7514,6 +7848,15 @@ export class GameRoom extends DurableObject<Env> {
       pendingInquiryDeaths: null,
       accusedUserId: null,
       temporaryCourtAdminUserId: null,
+      // MAYOR REWORK: not persisted to D1 as an ongoing session — same
+      // unavoidable cold-recovery gap as verdictVotes/inquiryVotes above.
+      // Worst case, a mayor mid-override-session loses that specific
+      // session on a cold recovery (rare) but keeps mayorCourtPowerUsed/
+      // mayorRevealed/mayorPower, which DO live on the Player row via
+      // state_json in the normal (non-legacy) recovery path.
+      mayorCourtOverrideDay: null,
+      mayorCourtOverrideTargetId: null,
+      mayorCourtOverrideGuilty: null,
       // Not persisted to D1 as an ongoing session; if a game is somehow
       // cold-recovered mid-intro (rare — intro is a short, transient phase
       // right after game start), it just resumes as if intro had already

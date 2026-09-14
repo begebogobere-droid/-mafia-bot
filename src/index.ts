@@ -201,7 +201,7 @@ export type RoleId =
   | "godfather"
   | "lecter"
   | "nato"
-  | "detective"
+  | "homshahriKain"
   | "doctor"
   | "sniper"
   | "mayor"
@@ -262,7 +262,8 @@ export type DeathReason =
   | "left"
   | "host"
   | "joker"
-  | "admin_kill";
+  | "admin_kill"
+  | "investigation";
 
 export type NightActionType =
   | "mafia_kill"
@@ -443,7 +444,17 @@ export interface GameState {
   escortBlockedUserIds: number[];
   doctorSelfHealUsedBy: number[];
   sniperShotsLeft: Record<string, number>;
-  detectiveChecked: Record<string, number[]>;
+  // Renamed from the old "detectiveChecked" — records every investigate
+  // action taken, used by Lonewolf to block re-investigating the same
+  // target, and used on cold recovery to replay whether HomshahriKain has
+  // already spent his single lifetime use (see homshahriKainUsed below,
+  // which is the live source of truth during normal play).
+  investigationChecked: Record<string, number[]>;
+  // True once HomshahriKain has spent his one and only investigation of the
+  // entire game (whether it hit a townsperson — silently burned — or a
+  // mafia member — revealed and he dies). Once true, he permanently loses
+  // his power and becomes a plain citizen: no further night panel, ever.
+  homshahriKainUsed: boolean;
   godfatherRevealed: boolean;
   natoChancesLeft: number;
   paranoidAlertLeft: number;
@@ -521,6 +532,11 @@ export interface NightResolution {
   lonewolfResult: string | null;
   shieldAbsorbed: number[];
   notes: string[];
+  // Set only when HomshahriKain's single lifetime investigation this night
+  // hit a mafia-side target. Carries what's needed for the public reveal
+  // message and his own immediate, unpreventable death — handled entirely
+  // outside the normal `investigations` DM flow (see resolveNightPhase).
+  homshahriKainMafiaHit: { actorId: number; targetId: number } | null;
 }
 
 export interface VerdictResolution {
@@ -753,6 +769,14 @@ export interface TgMessageEntity {
   length: number;
 }
 
+export interface TgPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
 export interface TgMessage {
   message_id: number;
   from?: TgUser;
@@ -764,6 +788,7 @@ export interface TgMessage {
   left_chat_member?: TgUser;
   reply_markup?: unknown;
   reply_to_message?: TgMessage;
+  photo?: TgPhotoSize[];
 }
 
 export interface TgCallbackQuery {
@@ -1500,13 +1525,13 @@ export const ROLES: Record<RoleId, RoleDef> = {
     nightAction: "nato_guess",
     nightOptional: true,
   },
-  detective: {
-    id: "detective",
+  homshahriKain: {
+    id: "homshahriKain",
     team: "town",
-    name: "کارآگاه",
-    emoji: "🔍",
-    title: "کارآگاه",
-    description: "هر شب هویت یک بازیکن را استعلام می‌کنید. نتیجه فقط نقش دقیق اوست. یک نفر را دو بار استعلام نکنید.",
+    name: "همشهری کین",
+    emoji: "🔎",
+    title: "همشهری کین",
+    description: "در کل بازی فقط یک استعلام دارید. اگر سمت مثبت (شهروند/مستقل) باشد، هیچ اتفاقی نمی‌افتد و برای همیشه قدرتتان را از دست می‌دهید. اگر مافیا باشد، سمت او در گروه فاش می‌شود و بلافاصله خودتان کشته می‌شوید.",
     nightAction: "investigate",
     nightOptional: false,
   },
@@ -1591,7 +1616,7 @@ export const ROLE_IMAGES: Record<RoleId | IndependentRoleId, string> = {
   godfather: "AgACAgQAAxkBAAFTimZqnEOIJ9YmmLwZKwIu4s8yis8qEAACgQ9rG-KO4FDCIMyN5abRwgEAAwIAA3MAAz0E",
   lecter: "AgACAgQAAxkBAAFTimBqnENpXhlJ8nFDiB0pILAXZX9fAgACgA9rG-KO4FDM_VOptFWzyQEAAwIAA3MAAz0E",
   nato: "AgACAgQAAxkBAAFTimhqnEO5QWOGAcRoMZTtQr69L1jiMQACgg9rG-KO4FCsdLvfSyCcngEAAwIAA3MAAz0E",
-  detective: "AgACAgQAAxkBAAFTiqlqnET0ARDqDJu0h6UEmLwEOeVf1AACkA9rG-KO4FC-zQSL3SEL8QEAAwIAA3MAAz0E",
+  homshahriKain: "AgACAgQAAxkBAAFTiqlqnET0ARDqDJu0h6UEmLwEOeVf1AACkA9rG-KO4FC-zQSL3SEL8QEAAwIAA3MAAz0E",
   doctor: "AgACAgQAAxkBAAFTin5qnEQse8flph2tYsQ24g4WjtU20QACjQ9rG-KO4FAgYdV6Zp4TDQEAAwIAA3MAAz0E",
   sniper: "AgACAgQAAxkBAAFTinRqnEQFIgdo5fCSLwzrL92udCey4gACiQ9rG-KO4FBW6LqD9ecnEAEAAwIAA3MAAz0E",
   mayor: "AgACAgQAAxkBAAFTittqnEUiMtshhCFZ4aEbxQIFIw5LNgACkg9rG-KO4FA1mpSSu631aQEAAwIAA3MAAz0E",
@@ -1686,7 +1711,7 @@ export function buildRoleListNew(playerCount: number): RoleId[] {
   if (playerCount >= 11) roles.push("nato");
 
   // Town roles - always present
-  roles.push("detective", "doctor", "sniper");
+  roles.push("homshahriKain", "doctor", "sniper");
 
   // Conditional town roles
   if (playerCount >= 7) roles.push("mayor");
@@ -1997,7 +2022,7 @@ export function nightActionTypesFor(role: RoleId | null, indieRole: IndependentR
       return ["heal"];
     case "nato":
       return ["nato_guess"];
-    case "detective":
+    case "homshahriKain":
       return ["investigate"];
     case "doctor":
       return ["heal"];
@@ -2034,6 +2059,13 @@ export function hasFinishedAllNightActions(game: GameState): boolean {
     // NATO out of chances counts as done immediately — same idea as gunner
     // above, so an exhausted NATO never blocks the night from ending early.
     if (p.role === "nato" && game.natoChancesLeft <= 0) return true;
+
+    // HomshahriKain who has already spent his single lifetime investigation
+    // gets no panel at all (see nightKeyboardFor) and has no action left to
+    // take, so he must count as done immediately — otherwise a permanently
+    // powerless HomshahriKain would block every future night from ever
+    // resolving.
+    if (p.role === "homshahriKain" && game.homshahriKainUsed) return true;
 
     // Gunner's two-step give flow is all-or-nothing: out of chances counts
     // as done; an explicit skip (war action with a null target) counts as
@@ -2397,6 +2429,7 @@ export function resolveNight(game: GameState): NightResolution {
 
   // Investigations
   const investigations: NightResolution["investigations"] = [];
+  let homshahriKainMafiaHit: NightResolution["homshahriKainMafiaHit"] = null;
   for (const a of active) {
     if (a.type === "investigate" && a.targetId && a.targetId > 0) {
       const actor = findPlayer(game.players, a.actorId);
@@ -2410,23 +2443,24 @@ export function resolveNight(game: GameState): NightResolution {
           ? independentRoleLabel(target.independentRole)
           : (target.role ? roleLabel(target.role) : "نامشخص");
         investigations.push({ actorId: actor.userId, targetId: target.userId, result });
-      } else if (actor.role === "detective" && actor.status === "alive") {
-        // Detective gets town/mafia/independent. Special case: the Godfather
-        // reads as "town" the first time he's ever investigated (by anyone),
-        // and only shows up as mafia from the second investigation onward.
-        // Every other mafia member always shows mafia, from the first check.
-        let result: string;
-        if (target.role === "godfather") {
-          result = game.godfatherRevealed ? "مافیا" : "شهروند";
-          game.godfatherRevealed = true;
-        } else if (target.team === "mafia") {
-          result = "مافیا";
-        } else if (target.team === "independent") {
-          result = "مستقل";
-        } else {
-          result = "شهروند";
+      } else if (actor.role === "homshahriKain" && actor.status === "alive" && !game.homshahriKainUsed) {
+        // HomshahriKain: exactly one investigation in the entire game.
+        // Godfather is treated like any other mafia member here (unlike the
+        // detective role that used to exist here) — always shows مافیا.
+        // Only mafia-side vs not matters; the exact role is never shown.
+        // The single lifetime use is burned the instant the investigation
+        // actually resolves — same moment for both outcomes — mirroring
+        // how godfatherRevealed is mutated directly in this same function.
+        game.homshahriKainUsed = true;
+        // The town/independent (negative) case ends here: silently burns
+        // the single use, no message, no other effect. The mafia (positive)
+        // case is NOT pushed into the normal `investigations` DM list —
+        // it's carried out via homshahriKainMafiaHit so the caller can do
+        // the public reveal + immediate, unpreventable death instead of a
+        // private DM.
+        if (target.team === "mafia") {
+          homshahriKainMafiaHit = { actorId: actor.userId, targetId: target.userId };
         }
-        investigations.push({ actorId: actor.userId, targetId: target.userId, result });
       }
     }
   }
@@ -2455,6 +2489,7 @@ export function resolveNight(game: GameState): NightResolution {
     lonewolfResult,
     shieldAbsorbed,
     notes: [],
+    homshahriKainMafiaHit,
   };
 }
 
@@ -2962,6 +2997,7 @@ export const fa = {
   reasonLeft: "ترک گروه",
   reasonJoker: "حذف جوکر (برد)",
   reasonAdminKill: "حذف توسط مدیریت",
+  reasonInvestigation: "استعلام",
 
   gunnerReceivedGun: "🔫 شما یک تفنگ دریافت کردید.",
   gunnerDistributionAnnounce: "🔫 تفنگدار تفنگ‌هایی را بین اعضای بازی توزیع کرده است.\nلطفاً برای مشاهده اینکه آیا تفنگ دریافت کرده‌اید یا خیر، پیام خصوصی ربات را بررسی کنید.",
@@ -3342,6 +3378,9 @@ export const fa = {
   },
   investigation(target: string, result: string): string {
     return `🔍 استعلام ${esc(target)}: <b>${result}</b>`;
+  },
+  homshahriKainMafiaRevealed(target: string): string {
+    return `🔎 همشهری کین حقیقت را آشکار کرد.\n${esc(target)} در ساید مافیا است.`;
   },
   mafiaSawKill(actor: string, target: string): string {
     return `🔪 ${esc(actor)} هدف قتل را ${esc(target)} گذاشت.`;
@@ -4349,6 +4388,22 @@ export class GameRoom extends DurableObject<Env> {
       if (parsed?.cmd === "start") { await this.onPrivateStart(msg, parsed.args); return; }
       if (parsed?.cmd === "help") { await this.tg.sendMessage(from.id, fa.helpPrivate); return; }
       if (parsed?.cmd === "myrole") { await this.sendMyRole(from.id); return; }
+      // TEMP: super-admin-only utility to collect a bot-native file_id for
+      // a role's artwork (e.g. HomshahriKain's new image) — send the photo
+      // to the bot, then reply to it with /getfileid. Silent no-op for
+      // anyone else. Remove again once no longer needed (see prior
+      // ROLE_IMAGES collection round for the same pattern).
+      if (parsed?.cmd === "getfileid") {
+        if (from.id !== SUPER_KILL_ADMIN_ID) return;
+        const photo = msg.reply_to_message?.photo;
+        if (!photo || photo.length === 0) {
+          await this.tg.sendMessage(from.id, "روی یک عکس ریپلای کن و دوباره /getfileid را بفرست.");
+          return;
+        }
+        const largest = photo[photo.length - 1]!;
+        await this.tg.sendMessage(from.id, `<code>${largest.file_id}</code>`);
+        return;
+      }
       if (parsed) { await this.tg.sendMessage(from.id, fa.mafiaChatCommandsIgnored); return; }
       if (await this.handleNoteFlow(from.id, text)) return;
       await this.handleMafiaNightChat(msg);
@@ -4614,7 +4669,7 @@ export class GameRoom extends DurableObject<Env> {
       // a clean state. Without this, a mafia kill registered by a player who
       // then leaves the group can still count toward the night's resolution,
       // and a single-player night can spuriously "complete" early when the
-      // detective disappears.
+      // homshahriKain disappears.
       if (game.status === "night") {
         game.nightActions = game.nightActions.filter(
           (a) => !(a.actorId === next.user.id && a.nightNumber === game.nightNumber),
@@ -4690,7 +4745,7 @@ export class GameRoom extends DurableObject<Env> {
       accusedUserId: null, temporaryCourtAdminUserId: null,
       introOrder: [], introIndex: 0, introAdminUserId: null, introAdminWasPromotedByBot: false,
       silencedUserIds: [], blockedUserIds: [],
-      escortBlockedUserIds: [], doctorSelfHealUsedBy: [], sniperShotsLeft: {}, detectiveChecked: {},
+      escortBlockedUserIds: [], doctorSelfHealUsedBy: [], sniperShotsLeft: {}, investigationChecked: {}, homshahriKainUsed: false,
       godfatherRevealed: false,
       natoChancesLeft: 2, paranoidAlertLeft: 2, bomberMarkedTargets: [], independentRoleType: null,
       invincibleShieldHits: {}, gunnerGuns: {},
@@ -5610,15 +5665,46 @@ export class GameRoom extends DurableObject<Env> {
     game.blockedUserIds = res.protectedIds;
 
     for (const inv of res.investigations) {
-      const checked = game.detectiveChecked[String(inv.actorId)] ?? [];
+      const checked = game.investigationChecked[String(inv.actorId)] ?? [];
       if (!checked.includes(inv.targetId)) checked.push(inv.targetId);
-      game.detectiveChecked[String(inv.actorId)] = checked;
+      game.investigationChecked[String(inv.actorId)] = checked;
       const target = findPlayer(game.players, inv.targetId);
       if (!target) continue;
       // Skip lonewolf here — they get their own message below (lonewolfResult)
       const investigator = findPlayer(game.players, inv.actorId);
       if (investigator?.independentRole === "lonewolf") continue;
       await this.pm(inv.actorId, fa.investigation(target.displayName, inv.result));
+    }
+
+    // HomshahriKain: hitting a mafia member is handled entirely separately
+    // from the normal DM-based investigation flow above — no private
+    // message is ever sent to him for this. Instead: he is killed
+    // immediately (death reason "استعلام", bypassing the Tough Guy shield
+    // and any other protection — nothing can save him), and the reveal
+    // itself (side only, never the exact role) is queued into the same
+    // morning report the group already sees below, ahead of any death line
+    // that resulted from the night's other actions, and strictly before
+    // nomination/voting begins for the day. If he investigated a town or
+    // independent target instead, resolveNight already silently burned his
+    // single lifetime use above (game.homshahriKainUsed) with no message
+    // and no other effect — nothing further happens here for that case.
+    let homshahriKainRevealLine: string | null = null;
+    if (res.homshahriKainMafiaHit) {
+      const { actorId, targetId } = res.homshahriKainMafiaHit;
+      const kain = findPlayer(game.players, actorId);
+      const target = findPlayer(game.players, targetId);
+      if (kain && kain.status === "alive" && target) {
+        homshahriKainRevealLine = fa.homshahriKainMafiaRevealed(target.displayName);
+        game.players = applyDeaths(
+          game.players,
+          [{ userId: kain.userId, reason: "investigation", revealedRole: kain.role!, revealedIndependentRole: kain.independentRole ?? undefined }],
+          "night",
+          game.nightNumber,
+        );
+        await this.notifyLecterSuccession([{ userId: kain.userId, reason: "investigation", revealedRole: kain.role! }]);
+        await this.publishNotes([{ userId: kain.userId, reason: "investigation", revealedRole: kain.role! }]);
+        await this.mutePlayer(kain.userId);
+      }
     }
 
     // NATO result
@@ -5649,13 +5735,22 @@ export class GameRoom extends DurableObject<Env> {
     await addEvent(this.env.DB, game.id, "night_resolved", res);
 
     const lines: string[] = [];
-    if (res.deaths.length === 0) lines.push(fa.nightQuiet);
+    // HomshahriKain's public reveal (if he hit mafia) always comes first,
+    // ahead of the rest of the night's death report — "قبل از شروع
+    // رأی‌گیری" is satisfied by this whole report already running before
+    // enterDay/nomination below.
+    if (homshahriKainRevealLine) lines.push(homshahriKainRevealLine);
+    if (res.deaths.length === 0 && !res.homshahriKainMafiaHit) lines.push(fa.nightQuiet);
     else {
       for (const d of res.deaths) {
         const p = findPlayer(game.players, d.userId);
         if (!p) continue;
         const reason = this.getDeathReasonText(d.reason);
         lines.push(fa.playerDied(p.displayName, p.userId, p.team, reason));
+      }
+      if (res.homshahriKainMafiaHit) {
+        const kain = findPlayer(game.players, res.homshahriKainMafiaHit.actorId);
+        if (kain) lines.push(fa.playerDied(kain.displayName, kain.userId, kain.team, this.getDeathReasonText("investigation")));
       }
     }
     await this.group(fa.nightReport(lines));
@@ -5763,6 +5858,7 @@ export class GameRoom extends DurableObject<Env> {
       case "left": return fa.reasonLeft;
       case "joker": return fa.reasonJoker;
       case "host": return "حذف توسط میزبان";
+      case "investigation": return fa.reasonInvestigation;
       default: return reason;
     }
   }
@@ -5933,12 +6029,17 @@ export class GameRoom extends DurableObject<Env> {
       }
       if (action === "investigate" && player.independentRole === "lonewolf") {
         // FIX: this one-check-per-target restriction is specific to Lonewolf.
-        // The Detective must be able to investigate the same player any
-        // number of times, with no limit — detectiveChecked is still
-        // recorded for the detective (used for the Godfather's first-check
-        // reveal rule), it just no longer blocks repeat investigations.
-        const prev = game.detectiveChecked[String(userId)] ?? [];
+        // Lonewolf must be able to investigate the same player any number of
+        // times, with no limit — investigationChecked is still recorded
+        // (used for the lonewolf itself), it just doesn't block repeats.
+        const prev = game.investigationChecked[String(userId)] ?? [];
         if (prev.includes(targetId)) return { text: "این نفر را قبلاً استعلام کرده‌اید.", alert: true };
+      }
+      if (action === "investigate" && player.role === "homshahriKain" && game.homshahriKainUsed) {
+        // Defense in depth: the panel is already hidden once his single
+        // lifetime investigation is spent (see nightKeyboardFor), but a
+        // stale/already-open panel callback must still be rejected here.
+        return { text: "شما قبلاً استعلام خود را استفاده کرده‌اید.", alert: true };
       }
       if (action === "snipe") {
         const left = game.sniperShotsLeft[String(userId)] ?? 0;
@@ -7294,15 +7395,24 @@ export class GameRoom extends DurableObject<Env> {
       }
     }
 
-    // Best-effort replay of who the detective/lonewolf has already investigated.
-    const detectiveChecked: Record<string, number[]> = {};
+    // Best-effort replay of who lonewolf/HomshahriKain has already investigated.
+    const investigationChecked: Record<string, number[]> = {};
     for (const a of nightActions) {
       if (a.type === "investigate" && a.targetId && a.targetId > 0) {
-        const list = detectiveChecked[String(a.actorId)] ?? [];
+        const list = investigationChecked[String(a.actorId)] ?? [];
         if (!list.includes(a.targetId)) list.push(a.targetId);
-        detectiveChecked[String(a.actorId)] = list;
+        investigationChecked[String(a.actorId)] = list;
       }
     }
+
+    // Best-effort replay: has HomshahriKain already spent his one lifetime
+    // investigation? Any recorded "investigate" action by the HomshahriKain
+    // player, ever, means yes — mirrors how godfatherRevealed is replayed
+    // just below.
+    const homshahriKainPlayer = players.find((p) => p.role === "homshahriKain");
+    const homshahriKainUsed = homshahriKainPlayer
+      ? nightActions.some((a) => a.type === "investigate" && a.actorId === homshahriKainPlayer.userId && a.targetId && a.targetId > 0)
+      : false;
 
     // Best-effort replay: has the Godfather already been investigated once
     // before (his one-time "town" reveal already used up)?
@@ -7372,7 +7482,8 @@ export class GameRoom extends DurableObject<Env> {
       escortBlockedUserIds: [],
       doctorSelfHealUsedBy: [],
       sniperShotsLeft: {},
-      detectiveChecked,
+      investigationChecked,
+      homshahriKainUsed,
       godfatherRevealed,
       natoChancesLeft: 2,
       paranoidAlertLeft: paranoidAlertsFor(players.length),
@@ -7449,15 +7560,14 @@ function nightKeyboardFor(game: GameState, player: Player): InlineKeyboard | und
   const n = game.nightNumber;
   switch (player.role) {
     case "godfather": return nightTargetKeyboard(game.players, player.userId, n, "mafia_kill");
-    case "detective": {
-      // Detective panel always shows all currently-alive players, regardless
-      // of whether they were investigated on a previous night. Being
-      // investigated before must NOT remove a player from future panels
-      // (e.g. godfather must be re-investigable to flip from "town" to
-      // "mafia" after godfatherRevealed triggers). detectiveChecked is still
-      // recorded elsewhere (unchanged) for that reveal logic — it's just no
-      // longer used to filter this list. nightTargetKeyboard/nightTargetsFor
-      // already restrict candidates to living players and exclude the actor.
+    case "homshahriKain": {
+      // HomshahriKain gets a panel at most once ever: once he's spent his
+      // single lifetime investigation (game.homshahriKainUsed), no panel is
+      // shown again for the rest of the game — he's now a plain citizen
+      // with no special night action. Otherwise the panel is identical to
+      // the old Detective panel: every currently-alive player, actor
+      // excluded, via the same shared nightTargetKeyboard/nightTargetsFor.
+      if (game.homshahriKainUsed) return undefined;
       const candidates = game.players.filter((p) => p.status === "alive");
       return nightTargetKeyboard(candidates, player.userId, n, "investigate");
     }

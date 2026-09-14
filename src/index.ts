@@ -7776,6 +7776,23 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   if (targetChat === null) { const active = await findActiveGameForUser(env.DB, from.id); if (active) targetChat = active.chat_id; }
   if (targetChat !== null) { await callRoom(env, targetChat, update); return; }
   if (cq) { await tg.answerCallbackQuery(cq.id, "بازی فعالی پیدا نشد.", true); return; }
+  // TEMP: super-admin-only utility to collect a bot-native file_id for a
+  // role's artwork — reply to a photo with /getfileid. Handled here too
+  // (not just inside GameRoom.onMessage) because routePrivate only forwards
+  // into a GameRoom when the user has an active game; with no active game
+  // it never reaches that code at all and would otherwise fall through to
+  // the generic fa.privateStart message below.
+  if (parsed?.cmd === "getfileid") {
+    if (from.id !== SUPER_KILL_ADMIN_ID) return;
+    const photo = msg?.reply_to_message?.photo;
+    if (!photo || photo.length === 0) {
+      await tg.sendMessage(from.id, "روی یک عکس ریپلای کن و دوباره /getfileid را بفرست.");
+      return;
+    }
+    const largest = photo[photo.length - 1]!;
+    await tg.sendMessage(from.id, `<code>${largest.file_id}</code>`);
+    return;
+  }
   if (parsed?.cmd === "help") { await tg.sendMessage(from.id, fa.helpPrivate, { reply_markup: mainReplyKeyboard() }); return; }
   if (parsed?.cmd === "myrole") { await tg.sendMessage(from.id, fa.notPlaying, { reply_markup: mainReplyKeyboard() }); return; }
   await tg.sendMessage(from.id, fa.privateStart, { reply_markup: mainReplyKeyboard() });

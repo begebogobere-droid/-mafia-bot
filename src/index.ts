@@ -152,6 +152,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
       keyboard_shown: "INTEGER NOT NULL DEFAULT 0",
       // CARD SHOP: coins earned per game (1/win, 2 win or 0.5 elim for independent).
       coins: "REAL NOT NULL DEFAULT 0",
+      // CARD SHOP: permanent backpack capacity (how many cards can be
+      // carried at once), upgraded with coins — 1/2/3, default 1.
+      backpack_capacity: "INTEGER NOT NULL DEFAULT 1",
     },
     games: {
       state_json: "TEXT",
@@ -856,6 +859,8 @@ export interface TgMessage {
   reply_markup?: unknown;
   reply_to_message?: TgMessage;
   photo?: TgPhotoSize[];
+  // CARD SHOP: only used by /relodbkp (reply to the /backup file).
+  document?: { file_id: string; file_name?: string };
 }
 
 export interface TgCallbackQuery {
@@ -1341,9 +1346,11 @@ export function lobbyKeyboard(botUsername: string | null, chatId: number): Inlin
 // joinFromPrivate). Sides shown as 3 tabs purely for UI grouping — buying
 // is never role-gated (role isn't known yet).
 const SIDE_LABEL: Record<CardSide, string> = { town: "🏘 شهر", mafia: "🔪 مافیا", independent: "🎭 مستقل" };
+const BACKPACK_UPGRADE_PRICE: Record<2 | 3, number> = { 2: 15, 3: 30 };
 
-export function shopSideKeyboard(activeSide: CardSide, ownedCardId: CardId | null, coins: number): InlineKeyboard {
+export function shopSideKeyboard(activeSide: CardSide, ownedCardIds: CardId[], coins: number, capacity: number): InlineKeyboard {
   const rows: InlineKeyboard = [];
+  rows.push([{ text: `🎒 بک‌پک: ${ownedCardIds.length}/${capacity} — ارتقا`, callback_data: "Shop:backpack" }]);
   rows.push(
     (["town", "mafia", "independent"] as CardSide[]).map((side) => ({
       text: side === activeSide ? `• ${SIDE_LABEL[side]} •` : SIDE_LABEL[side],
@@ -1351,8 +1358,9 @@ export function shopSideKeyboard(activeSide: CardSide, ownedCardId: CardId | nul
       style: side === activeSide ? "primary" : undefined,
     })),
   );
+  const ownedOnThisSide = ownedCardIds.find((id) => CARD_CATALOG.find((c) => c.id === id)?.side === activeSide) ?? null;
   for (const card of cardsForSide(activeSide)) {
-    const owned = card.id === ownedCardId;
+    const owned = card.id === ownedOnThisSide;
     const affordable = coins >= card.price;
     rows.push([
       {
@@ -1363,6 +1371,25 @@ export function shopSideKeyboard(activeSide: CardSide, ownedCardId: CardId | nul
     ]);
   }
   rows.push([{ text: "✅ تایید و ورود به لابی", callback_data: "Shop:confirm" }]);
+  return rows;
+}
+
+// CARD SHOP: backpack/upgrade view — "مکان بک‌پک" tapped from the top row
+// of shopSideKeyboard. Upgrade is permanent (stored on the user profile,
+// like coins), so once capacity 3 is bought there's nothing left to show
+// here except the current state.
+export function backpackKeyboard(capacity: number, coins: number): InlineKeyboard {
+  const rows: InlineKeyboard = [];
+  rows.push([{ text: `ظرفیت فعلی: ${capacity}/3 (دائمی)`, callback_data: "Shop:noop" }]);
+  if (capacity < 2) {
+    const price = BACKPACK_UPGRADE_PRICE[2];
+    rows.push([{ text: `⬆️ ارتقا به ظرفیت ۲ — ${price} سکه`, callback_data: "Shop:upgrade:2", style: coins >= price ? "primary" : "danger" }]);
+  }
+  if (capacity < 3) {
+    const price = BACKPACK_UPGRADE_PRICE[3];
+    rows.push([{ text: `⬆️ ارتقا به ظرفیت ۳ — ${price} سکه`, callback_data: "Shop:upgrade:3", style: coins >= price ? "primary" : "danger" }]);
+  }
+  rows.push([{ text: "◀️ برگشت به شاپ", callback_data: "Shop:tab:town" }]);
   return rows;
 }
 
@@ -3960,6 +3987,19 @@ export async function getCoins(db: D1Database, userId: number): Promise<number> 
 export async function addCoins(db: D1Database, userId: number, delta: number): Promise<void> {
   await db.prepare(`UPDATE users SET coins = coins + ?, updated_at = ? WHERE telegram_id = ?`)
     .bind(delta, Date.now(), userId).run();
+}
+
+export async function getBackpackCapacity(db: D1Database, userId: number): Promise<number> {
+  const row = await db.prepare(`SELECT backpack_capacity FROM users WHERE telegram_id = ?`).bind(userId).first<{ backpack_capacity: number }>();
+  return row?.backpack_capacity ?? 1;
+}
+
+// Permanent — sets it directly rather than incrementing, since capacity
+// tiers aren't additive (buying "capacity 3" replaces "capacity 2", it's
+// not +1 on top of it).
+export async function setBackpackCapacity(db: D1Database, userId: number, capacity: number): Promise<void> {
+  await db.prepare(`UPDATE users SET backpack_capacity = ?, updated_at = ? WHERE telegram_id = ?`)
+    .bind(capacity, Date.now(), userId).run();
 }
 
 interface PendingSelection { chatId: number; cardIds: CardId[]; side: CardSide }
@@ -8341,6 +8381,125 @@ async function forceCloseAllGamesForUser(env: Env, userId: number): Promise<numb
   return chatIds.length;
 }
 
+// =============================================================================
+// SHOP ADMIN COMMANDS ("/givecoin", "/delcoin", "/backup", "/relodbkp",
+// "/resetuser") — SUPER_KILL_ADMIN_ID only, PM only, completely silent
+// no-op for anyone else (see every other SUPER_KILL_ADMIN_ID check in this
+// file for the same pattern). Placed BEFORE the targetChat/callRoom forward
+// below on purpose: that forward is the "PM command lock" — if the admin
+// has an active game, everything after it never runs (control goes into
+// that GameRoom DO instead). These must work regardless of whether the
+// admin happens to be in a game right now.
+// =============================================================================
+
+async function sendShopBackup(env: Env, tg: Telegram, chatId: number): Promise<void> {
+  const userRows = (await env.DB.prepare(`SELECT telegram_id, coins, backpack_capacity FROM users`).all<{ telegram_id: number; coins: number; backpack_capacity: number }>()).results ?? [];
+  const pendingRows = (await env.DB.prepare(`SELECT user_id, card_ids FROM pending_card_selection`).all<{ user_id: number; card_ids: string }>()).results ?? [];
+  const pendingByUser = new Map(pendingRows.map((r) => [r.user_id, r.card_ids]));
+  const users = userRows.map((u) => ({
+    telegram_id: u.telegram_id,
+    coins: u.coins,
+    backpack_capacity: u.backpack_capacity,
+    // "کارتایی که به‌صورت فعلی داره" — currently selected/pending cards
+    // (bought, not yet locked into a lobby). Raw JSON string from D1,
+    // kept as-is here and re-parsed on restore.
+    pending_card_ids: pendingByUser.get(u.telegram_id) ?? null,
+  }));
+  const payload = JSON.stringify({ kind: "mafia-shop-backup", created_at: Date.now(), users }, null, 2);
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("document", new Blob([payload], { type: "application/json" }), `shop-backup-${Date.now()}.json`);
+  form.append("caption", `📦 بکاپ شاپ — ${users.length} کاربر`);
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendDocument`, { method: "POST", body: form });
+  if (!res.ok) await tg.sendMessage(chatId, "❌ ارسال بکاپ ناموفق بود.");
+}
+
+async function restoreShopBackup(env: Env, tg: Telegram, chatId: number, fileId: string): Promise<void> {
+  const fileInfo = await tg.callSafe<{ file_path: string }>("getFile", { file_id: fileId });
+  if (!fileInfo.ok) { await tg.sendMessage(chatId, "❌ گرفتن فایل ناموفق بود."); return; }
+  const fileRes = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${fileInfo.result.file_path}`);
+  if (!fileRes.ok) { await tg.sendMessage(chatId, "❌ دانلود فایل ناموفق بود."); return; }
+  let parsed: { users?: { telegram_id: number; coins: number; backpack_capacity: number; pending_card_ids?: string | null }[] };
+  try {
+    parsed = JSON.parse(await fileRes.text());
+  } catch {
+    await tg.sendMessage(chatId, "❌ فایل معتبر نیست (JSON خراب).");
+    return;
+  }
+  const users = parsed.users;
+  if (!Array.isArray(users)) { await tg.sendMessage(chatId, "❌ فرمت فایل شناخته‌شده نیست."); return; }
+  let restored = 0;
+  for (const u of users) {
+    if (typeof u.telegram_id !== "number") continue;
+    await env.DB.prepare(`UPDATE users SET coins = ?, backpack_capacity = ?, updated_at = ? WHERE telegram_id = ?`)
+      .bind(u.coins ?? 0, u.backpack_capacity ?? 1, Date.now(), u.telegram_id).run();
+    if (u.pending_card_ids) {
+      await env.DB.prepare(
+        `INSERT INTO pending_card_selection (user_id, card_ids, selected_at) VALUES (?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET card_ids = excluded.card_ids, selected_at = excluded.selected_at`,
+      ).bind(u.telegram_id, u.pending_card_ids, Date.now()).run();
+    } else {
+      await env.DB.prepare(`DELETE FROM pending_card_selection WHERE user_id = ?`).bind(u.telegram_id).run();
+    }
+    restored++;
+  }
+  await tg.sendMessage(chatId, `✅ اطلاعات شاپ ${restored} کاربر بازگردانی شد (سکه، بک‌پک، کارت‌های فعلی).`);
+}
+
+async function handleShopAdminCommand(env: Env, tg: Telegram, from: { id: number }, msg: TgMessage, cmd: string, args: string): Promise<boolean> {
+  if (from.id !== SUPER_KILL_ADMIN_ID) return false; // silent no-op — caller just falls through as if nothing matched
+
+  if (cmd === "givecoin" || cmd === "delcoin") {
+    const [idStr, amountStr] = args.split(/\s+/);
+    const targetId = Number(idStr);
+    const amount = Number(amountStr);
+    if (!Number.isFinite(targetId) || !Number.isFinite(amount) || amount <= 0) {
+      await tg.sendMessage(from.id, `فرمت درست: /${cmd} <آیدی عددی> <تعداد>`);
+      return true;
+    }
+    const current = await getCoins(env.DB, targetId);
+    if (cmd === "delcoin" && current < amount) {
+      await tg.sendMessage(from.id, `❌ موجودیش کافی نیست. موجودی فعلی: ${current} سکه.`);
+      return true;
+    }
+    await addCoins(env.DB, targetId, cmd === "givecoin" ? amount : -amount);
+    const newBalance = current + (cmd === "givecoin" ? amount : -amount);
+    await tg.sendMessage(from.id, `✅ ${cmd === "givecoin" ? "اضافه شد" : "کم شد"}. موجودی جدید ${targetId}: ${newBalance} سکه.`);
+    return true;
+  }
+
+  if (cmd === "backup") {
+    await sendShopBackup(env, tg, from.id);
+    return true;
+  }
+
+  if (cmd === "relodbkp") {
+    const doc = msg.reply_to_message?.document;
+    if (!doc) {
+      await tg.sendMessage(from.id, "روی فایل بکاپ (خروجی /backup) ریپلای کن و دوباره /relodbkp رو بفرست.");
+      return true;
+    }
+    await restoreShopBackup(env, tg, from.id, doc.file_id);
+    return true;
+  }
+
+  if (cmd === "resetuser") {
+    const targetId = Number(args.trim());
+    if (!Number.isFinite(targetId)) {
+      await tg.sendMessage(from.id, "فرمت درست: /resetuser <آیدی عددی>");
+      return true;
+    }
+    // "اطلاعات شاپ" only: pending selection + backpack capacity. Coins and
+    // every other user field (stats, games_played, ...) are untouched.
+    await clearPendingSelection(env.DB, targetId);
+    await setBackpackCapacity(env.DB, targetId, 1);
+    await tg.sendMessage(from.id, `✅ اطلاعات شاپ ${targetId} ریست شد (کارت انتخابی + ظرفیت بک‌پک).`);
+    return true;
+  }
+
+  return false;
+}
+
 async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
   const msg = update.message;
   const cq = update.callback_query;
@@ -8403,6 +8562,17 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
     return;
   }
 
+  // CARD SHOP ADMIN: silent no-op for anyone but SUPER_KILL_ADMIN_ID — no
+  // reply at all (not even the generic fallback further down), so these
+  // command names leak nothing to non-admins. Deliberately BEFORE the
+  // targetChat/callRoom forward below — that forward is the PM "command
+  // lock": these must keep working even while the admin has an active
+  // game/lobby of their own.
+  if (msg && parsed && ["givecoin", "delcoin", "backup", "relodbkp", "resetuser"].includes(parsed.cmd)) {
+    if (from.id === SUPER_KILL_ADMIN_ID) await handleShopAdminCommand(env, tg, from, msg, parsed.cmd, parsed.args);
+    return;
+  }
+
   // Intercept the join deep-link BEFORE it reaches callRoom: send the shop
   // first instead of joining immediately. If the user already has a
   // finished-but-unconsumed pending selection for this exact chat (e.g. they
@@ -8456,9 +8626,9 @@ async function openShop(env: Env, tg: Telegram, from: { id: number; username?: s
     await savePendingSelection(env.DB, from.id, sel);
   }
   const coins = await getCoins(env.DB, from.id);
-  const owned = sel.cardIds.find((id) => CARD_CATALOG.find((c) => c.id === id)?.side === sel!.side) ?? null;
-  await tg.sendMessage(from.id, `🛒 <b>شاپ حرکت آخر</b>\nسکه‌های تو: ${coins}\n\nحداکثر ۲ کارت (از ۲ ساید متفاوت) می‌تونی انتخاب کنی. بعد ورود به لابی دیگه نمی‌تونی عوضش کنی.`, {
-    reply_markup: { inline_keyboard: shopSideKeyboard(sel.side, owned, coins) },
+  const capacity = await getBackpackCapacity(env.DB, from.id);
+  await tg.sendMessage(from.id, `🛒 <b>شاپ حرکت آخر</b>\nسکه‌های تو: ${coins}\n\nحداکثر ${capacity} کارت (هرکدوم از یک ساید متفاوت) می‌تونی انتخاب کنی. بعد ورود به لابی دیگه نمی‌تونی عوضش کنی.`, {
+    reply_markup: { inline_keyboard: shopSideKeyboard(sel.side, sel.cardIds, coins, capacity) },
   });
 }
 
@@ -8480,11 +8650,40 @@ async function handleShopCallback(env: Env, tg: Telegram, cq: TgCallbackQuery): 
 
   const rerender = async (updated: PendingSelection) => {
     const coins = await getCoins(env.DB, userId);
-    const owned = updated.cardIds.find((id) => CARD_CATALOG.find((c) => c.id === id)?.side === updated.side) ?? null;
-    await tg.editMessageText(chatId, messageId, `🛒 <b>شاپ حرکت آخر</b>\nسکه‌های تو: ${coins}\n\nحداکثر ۲ کارت (از ۲ ساید متفاوت) می‌تونی انتخاب کنی. بعد ورود به لابی دیگه نمی‌تونی عوضش کنی.`, {
-      reply_markup: { inline_keyboard: shopSideKeyboard(updated.side, owned, coins) },
+    const capacity = await getBackpackCapacity(env.DB, userId);
+    await tg.editMessageText(chatId, messageId, `🛒 <b>شاپ حرکت آخر</b>\nسکه‌های تو: ${coins}\n\nحداکثر ${capacity} کارت (هرکدوم از یک ساید متفاوت) می‌تونی انتخاب کنی. بعد ورود به لابی دیگه نمی‌تونی عوضش کنی.`, {
+      reply_markup: { inline_keyboard: shopSideKeyboard(updated.side, updated.cardIds, coins, capacity) },
     });
   };
+
+  if (data === "Shop:noop") { await tg.answerCallbackQuery(cq.id); return; }
+
+  if (data === "Shop:backpack") {
+    const coins = await getCoins(env.DB, userId);
+    const capacity = await getBackpackCapacity(env.DB, userId);
+    await tg.editMessageText(chatId, messageId, `🎒 <b>بک‌پک</b>\nسکه‌های تو: ${coins}\n\nارتقای ظرفیت دائمیه — همیشه رو پروفایلت می‌مونه، مخصوص این بازی نیست.`, {
+      reply_markup: { inline_keyboard: backpackKeyboard(capacity, coins) },
+    });
+    await tg.answerCallbackQuery(cq.id);
+    return;
+  }
+
+  if (data.startsWith("Shop:upgrade:")) {
+    const target = Number(data.slice("Shop:upgrade:".length)) as 2 | 3;
+    const price = target === 2 ? 15 : 30;
+    const capacity = await getBackpackCapacity(env.DB, userId);
+    if (capacity >= target) { await tg.answerCallbackQuery(cq.id); return; }
+    const coins = await getCoins(env.DB, userId);
+    if (coins < price) { await tg.answerCallbackQuery(cq.id, "سکه‌ات کافی نیست.", true); return; }
+    await addCoins(env.DB, userId, -price);
+    await setBackpackCapacity(env.DB, userId, target);
+    const newCoins = coins - price;
+    await tg.editMessageText(chatId, messageId, `🎒 <b>بک‌پک</b>\nسکه‌های تو: ${newCoins}\n\nارتقای ظرفیت دائمیه — همیشه رو پروفایلت می‌مونه، مخصوص این بازی نیست.`, {
+      reply_markup: { inline_keyboard: backpackKeyboard(target, newCoins) },
+    });
+    await tg.answerCallbackQuery(cq.id, `ظرفیت بک‌پک به ${target} رسید.`);
+    return;
+  }
 
   if (data.startsWith("Shop:tab:")) {
     const side = data.slice("Shop:tab:".length) as CardSide;
@@ -8499,8 +8698,9 @@ async function handleShopCallback(env: Env, tg: Telegram, cq: TgCallbackQuery): 
     const cardId = data.slice("Shop:buy:".length) as CardId;
     const card = CARD_CATALOG.find((c) => c.id === cardId);
     if (!card) { await tg.answerCallbackQuery(cq.id); return; }
-    if (sel.cardIds.length >= 2) {
-      await tg.answerCallbackQuery(cq.id, "حداکثر ۲ کارت می‌تونی داشته باشی.", true); return;
+    const capacity = await getBackpackCapacity(env.DB, userId);
+    if (sel.cardIds.length >= capacity) {
+      await tg.answerCallbackQuery(cq.id, `حداکثر ${capacity} کارت می‌تونی داشته باشی. از بک‌پک ارتقا بخر.`, true); return;
     }
     if (sel.cardIds.some((id) => CARD_CATALOG.find((c) => c.id === id)?.side === card.side)) {
       await tg.answerCallbackQuery(cq.id, "از این ساید فقط ۱ کارت می‌تونی بخری.", true); return;

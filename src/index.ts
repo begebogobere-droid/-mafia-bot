@@ -1,4 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
+import {
+  CARD_CATALOG, type CardId, type CardSide,
+  cardsForSide, resolveLastMoveCard, type LastMoveOutcome,
+} from "./cards";
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS users (
@@ -108,6 +112,18 @@ CREATE TABLE IF NOT EXISTS bot_settings (
   value TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pending_card_selection (
+  user_id INTEGER PRIMARY KEY,
+  card_ids TEXT NOT NULL,
+  selected_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS card_purchase_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  card_id TEXT NOT NULL,
+  price INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `;
 
 async function ensureSchema(db: D1Database): Promise<void> {
@@ -134,6 +150,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
       night_deaths: "INTEGER NOT NULL DEFAULT 0",
       role_stats_json: "TEXT",
       keyboard_shown: "INTEGER NOT NULL DEFAULT 0",
+      // CARD SHOP: coins earned per game (1/win, 2 win or 0.5 elim for independent).
+      coins: "REAL NOT NULL DEFAULT 0",
     },
     games: {
       state_json: "TEXT",
@@ -264,7 +282,8 @@ export type DeathReason =
   | "joker"
   | "admin_kill"
   | "investigation"
-  | "mayor_no_choice";
+  | "mayor_no_choice"
+  | "card_revenge"; // CARD SHOP: انتقام از رأی‌دهنده
 
 export type NightActionType =
   | "mafia_kill"
@@ -345,6 +364,9 @@ export interface Player {
   deathRound?: number;
   originalMember: SavedMember | null;
   joinedAt: number;
+  // CARD SHOP: chosen pre-lobby, locked once inside the lobby (see
+  // openShopKeyboard / addPlayer). Max 2, one-time-use on lynch death.
+  activeCards?: CardId[];
   // Set only by checkLecterSuccession when this player is promoted to
   // Godfather mid-game (their `.role` becomes "godfather" at that point).
   // Purely for end-game report text ("پدرخوانده (دکتر لکتر سابق)" /
@@ -473,6 +495,16 @@ export interface GameState {
   escortBlockedUserIds: number[];
   doctorSelfHealUsedBy: number[];
   sniperShotsLeft: Record<string, number>;
+  // CARD SHOP additions. pendingCardSilenceUserIds: set by
+  // silence_next_day/hostage outcomes in resolveVerdictPhase, merged into
+  // silencedUserIds at the START of the next day (see enterDay/startDay)
+  // then cleared — kept separate from silencedUserIds so it survives the
+  // `game.silencedUserIds = []` reset that already happens at the end of
+  // resolveVerdictPhase for THIS trial. graveVoterUserIds: dead players who
+  // get exactly one more vote (vote_from_grave) — consumed (removed from
+  // this list) the moment they cast that vote; see livingVoters.
+  pendingCardSilenceUserIds?: number[];
+  graveVoterUserIds?: number[];
   // Renamed from the old "detectiveChecked" — records every investigate
   // action taken, used by Lonewolf to block re-investigating the same
   // target, and used on cold recovery to replay whether HomshahriKain has
@@ -1303,6 +1335,40 @@ export function lobbyKeyboard(botUsername: string | null, chatId: number): Inlin
   ]);
   rows.push([{ text: "✖ لغو لابی", callback_data: "L:c", style: "danger" }]);
   return rows;
+}
+
+// CARD SHOP: shown in PM before a player's join is finalized (see
+// joinFromPrivate). Sides shown as 3 tabs purely for UI grouping — buying
+// is never role-gated (role isn't known yet).
+const SIDE_LABEL: Record<CardSide, string> = { town: "🏘 شهر", mafia: "🔪 مافیا", independent: "🎭 مستقل" };
+
+export function shopSideKeyboard(activeSide: CardSide, ownedCardId: CardId | null, coins: number): InlineKeyboard {
+  const rows: InlineKeyboard = [];
+  rows.push(
+    (["town", "mafia", "independent"] as CardSide[]).map((side) => ({
+      text: side === activeSide ? `• ${SIDE_LABEL[side]} •` : SIDE_LABEL[side],
+      callback_data: `Shop:tab:${side}`,
+      style: side === activeSide ? "primary" : undefined,
+    })),
+  );
+  for (const card of cardsForSide(activeSide)) {
+    const owned = card.id === ownedCardId;
+    const affordable = coins >= card.price;
+    rows.push([
+      {
+        text: `${owned ? "✅ " : ""}${card.name} — ${card.price} سکه`,
+        callback_data: owned ? `Shop:deselect:${card.id}` : `Shop:buy:${card.id}`,
+        style: owned ? "success" : affordable ? "primary" : "danger",
+      },
+    ]);
+  }
+  rows.push([{ text: "✅ تایید و ورود به لابی", callback_data: "Shop:confirm" }]);
+  return rows;
+}
+
+export function shopCardDescription(id: CardId): string {
+  const c = CARD_CATALOG.find((c) => c.id === id);
+  return c ? `<b>${c.name}</b>\n${c.description}` : "";
 }
 
 export function dayHostKeyboard(): InlineKeyboard {
@@ -2163,7 +2229,16 @@ export function hasFinishedAllNightActions(game: GameState): boolean {
 
 export function livingVoters(game: GameState): Player[] {
   const silenced = new Set(game.silencedUserIds);
-  return living(game.players).filter((p) => !silenced.has(p.userId));
+  const base = living(game.players).filter((p) => !silenced.has(p.userId));
+  // CARD SHOP: "رأی از گور" grants a one-time nomination vote to an
+  // otherwise-dead player. Included here (not in living()) so it only
+  // affects vote eligibility/hasFinishedVotes, never win-condition checks
+  // elsewhere that rely on living().
+  const graveIds = game.graveVoterUserIds ?? [];
+  const graveExtra = graveIds.length
+    ? game.players.filter((p) => p.status !== "alive" && graveIds.includes(p.userId))
+    : [];
+  return [...base, ...graveExtra];
 }
 
 export function hasFinishedVotes(game: GameState): boolean {
@@ -3873,6 +3948,48 @@ export async function saveRoleHistory(
   await db.batch(statements);
 }
 
+// =============================================================================
+// CARD SHOP D1 HELPERS
+// =============================================================================
+
+export async function getCoins(db: D1Database, userId: number): Promise<number> {
+  const row = await db.prepare(`SELECT coins FROM users WHERE telegram_id = ?`).bind(userId).first<{ coins: number }>();
+  return row?.coins ?? 0;
+}
+
+export async function addCoins(db: D1Database, userId: number, delta: number): Promise<void> {
+  await db.prepare(`UPDATE users SET coins = coins + ?, updated_at = ? WHERE telegram_id = ?`)
+    .bind(delta, Date.now(), userId).run();
+}
+
+interface PendingSelection { chatId: number; cardIds: CardId[]; side: CardSide }
+
+async function getPendingSelection(db: D1Database, userId: number): Promise<PendingSelection | null> {
+  const row = await db.prepare(`SELECT card_ids FROM pending_card_selection WHERE user_id = ?`)
+    .bind(userId).first<{ card_ids: string }>();
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.card_ids) as PendingSelection;
+    return parsed;
+  } catch { return null; }
+}
+
+async function savePendingSelection(db: D1Database, userId: number, sel: PendingSelection): Promise<void> {
+  await db.prepare(
+    `INSERT INTO pending_card_selection (user_id, card_ids, selected_at) VALUES (?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET card_ids = excluded.card_ids, selected_at = excluded.selected_at`,
+  ).bind(userId, JSON.stringify(sel), Date.now()).run();
+}
+
+async function clearPendingSelection(db: D1Database, userId: number): Promise<void> {
+  await db.prepare(`DELETE FROM pending_card_selection WHERE user_id = ?`).bind(userId).run();
+}
+
+// -----------------------------------------------------------------------------
+// SHOP UI — invoked from routePrivate (see openShop / handleShopCallback below,
+// defined near the bottom of the file alongside handleStatsCallback)
+// -----------------------------------------------------------------------------
+
 export async function findActiveGameForUser(db: D1Database, userId: number): Promise<{ game_id: string; chat_id: number; status: string } | null> {
   return (await db.prepare(
     `SELECT g.id as game_id, g.chat_id, g.status
@@ -4133,6 +4250,12 @@ export async function recordFinishStats(
       };
     }
 
+    // CARD SHOP: coin award per user's spec — 1 coin/win for town & mafia,
+    // independent gets 2 on a win but 0.5 just for being eliminated (dying
+    // doesn't need to be a lynch specifically — independent is hard enough
+    // that any elimination counts). Non-independent losers get 0.
+    const coinDelta = p.team === "independent" ? (won ? 2 : 0.5) : (won ? 1 : 0);
+
     statements.push(
       db.prepare(
         `UPDATE users SET
@@ -4143,6 +4266,7 @@ export async function recordFinishStats(
            vote_executions = vote_executions + ?,
            night_deaths = night_deaths + ?,
            role_stats_json = ?,
+           coins = coins + ?,
            updated_at = ?
          WHERE telegram_id = ?`,
       ).bind(
@@ -4152,6 +4276,7 @@ export async function recordFinishStats(
         isVoteExecution ? 1 : 0,
         isNightDeath ? 1 : 0,
         JSON.stringify(roleMap),
+        coinDelta,
         ts,
         p.userId,
       ),
@@ -5018,15 +5143,21 @@ export class GameRoom extends DurableObject<Env> {
 
   private async cmdJoin(msg: TgMessage): Promise<void> {
     if (!msg.from) return;
+    // CARD SHOP GAP: in-group /join bypasses the PM shop entirely (unlike
+    // the "ورود به بازی" deep-link button, which routes through
+    // routePrivate's Shop:* flow first). Not resolved — needs a product
+    // decision: either disable /join in-group entirely and force the
+    // button, or redirect /join to DM the user "اول برو شاپ" before
+    // falling back to a no-card join.
     await this.addPlayer(msg.from, msg.chat.id, msg.chat.id);
   }
 
-  private async joinFromPrivate(from: { id: number; username?: string; first_name: string; last_name?: string }, chatId: number): Promise<void> {
+  private async joinFromPrivate(from: { id: number; username?: string; first_name: string; last_name?: string }, chatId: number, activeCards?: CardId[]): Promise<void> {
     const member = await this.tg.callSafe<TgChatMember>("getChatMember", { chat_id: chatId, user_id: from.id });
     if (!member.ok || member.result.status === "left" || member.result.status === "kicked") {
       await this.tg.sendMessage(from.id, fa.notInGroup); return;
     }
-    const result = await this.addPlayer(from, chatId, from.id);
+    const result = await this.addPlayer(from, chatId, from.id, activeCards);
     if (result === "ok") await this.tg.sendMessage(from.id, "✅ وارد لابی شدید.\nبعد از شروع بازی، نقش و اقدام‌ها همین‌جا می‌آید.");
     else if (result === "already") await this.tg.sendMessage(from.id, fa.alreadyJoined);
     else if (result === "full") await this.tg.sendMessage(from.id, fa.tooMany);
@@ -5034,7 +5165,22 @@ export class GameRoom extends DurableObject<Env> {
     else if (result === "nogame") await this.tg.sendMessage(from.id, fa.noGame);
   }
 
-  private async addPlayer(from: { id: number; username?: string; first_name: string; last_name?: string }, chatId: number, notifyChatId: number): Promise<"ok" | "already" | "full" | "nogame" | "busy" | "notlobby"> {
+  // CARD SHOP: RPC entry point called directly by routePrivate's Shop:confirm
+  // handler (env.DB-only shop logic lives outside this DO — see routePrivate
+  // / handleShopCallback — this is the one moment shop state hands off into
+  // actual game state). Deliberately bypasses handleUpdate/webhook parsing
+  // since the "update" here is synthetic (the real trigger was a Shop:
+  // callback, already answered by routePrivate).
+  async joinWithCards(
+    chatId: number,
+    from: { id: number; username?: string; first_name: string; last_name?: string },
+    activeCards: CardId[],
+  ): Promise<void> {
+    if (!this.game || this.game.chatId !== chatId) await this.recoverFromD1(chatId);
+    await this.joinFromPrivate(from, chatId, activeCards);
+  }
+
+  private async addPlayer(from: { id: number; username?: string; first_name: string; last_name?: string }, chatId: number, notifyChatId: number, activeCards?: CardId[]): Promise<"ok" | "already" | "full" | "nogame" | "busy" | "notlobby"> {
     // FIX #6: Before declaring "no game", try one more recovery. This handles
     // the case where DO storage was lost (this.game === null) but D1 still
     // has an active lobby for this chat. Without this, every /join after a
@@ -5065,6 +5211,7 @@ export class GameRoom extends DurableObject<Env> {
       userId: from.id, username: from.username ?? null, firstName: from.first_name,
       displayName: displayOf(from), role: null, team: null, independentRole: null,
       status: "alive", originalMember: null, joinedAt: now(),
+      activeCards: activeCards && activeCards.length > 0 ? activeCards : undefined,
     };
     game.players.push(newPlayer);
     const already = await findActiveGameForUser(this.env.DB, from.id);
@@ -5654,6 +5801,15 @@ export class GameRoom extends DurableObject<Env> {
     game.status = "day";
     game.phase = "day";
     game.accusedUserId = null;
+    // CARD SHOP: merge in any silence owed from yesterday's "سکوت اجباری" /
+    // "گروگان‌گیری" card outcomes (kept separate from silencedUserIds until
+    // now specifically so it survives the `silencedUserIds = []` reset that
+    // already runs at the end of resolveVerdictPhase for the trial that
+    // triggered it).
+    if (game.pendingCardSilenceUserIds?.length) {
+      game.silencedUserIds = [...new Set([...game.silencedUserIds, ...game.pendingCardSilenceUserIds])];
+      game.pendingCardSilenceUserIds = [];
+    }
     const secs = dayDurationSeconds(game);
     game.phaseEndsAt = now() + secs * 1000;
     game.dayPhaseMaxEndsAt = now() + game.config.daySecondsMax * 1000;
@@ -6183,9 +6339,26 @@ export class GameRoom extends DurableObject<Env> {
       (p) => p.role === "mayor" && p.mayorPower === "reveal" && !p.mayorCourtPowerUsed && game.mayorCourtOverrideDay === game.dayNumber,
     );
     const overrideDecided = !!overrideMayor && game.mayorCourtOverrideGuilty !== null;
-    const res: VerdictResolution = overrideDecided
+    let res: VerdictResolution = overrideDecided
       ? { guilty: tally.guilty, innocent: tally.innocent, result: game.mayorCourtOverrideGuilty ? "guilty" : "innocent" }
       : tally;
+
+    // CARD SHOP ("حرکت آخر"): only fires on a genuine lynch elimination —
+    // never when the mayor's court-override already decided the trial (that
+    // isn't really "the vote" from the accused's perspective) and never for
+    // a Joker win (that's a win condition for them, not an elimination).
+    // "وارونگی رأی" must run here, BEFORE the guilty check below, since it
+    // can flip whether an execution happens at all.
+    let lastMoveOutcome: LastMoveOutcome = { kind: "none" };
+    if (accused && stillAlive && !overrideDecided && accused.independentRole !== "joker") {
+      const guiltyVoterIds = game.verdictVotes
+        .filter((v) => v.dayNumber === game.dayNumber && v.guilty)
+        .map((v) => v.voterId);
+      lastMoveOutcome = resolveLastMoveCard(accused.activeCards, { accusedId, guiltyVoterIds, dayNumber: game.dayNumber });
+      if (lastMoveOutcome.kind === "invert_vote_result") {
+        res = { guilty: res.innocent, innocent: res.guilty, result: res.innocent > res.guilty ? "guilty" : "innocent" };
+      }
+    }
 
     if (overrideMayor) {
       if (overrideDecided) await this.group(fa.mayorCourtOverrideVerdictAnnounce(overrideMayor.displayName));
@@ -6203,29 +6376,85 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     if (accused && stillAlive && res.result === "guilty") {
-      // Check Joker win
-      if (accused.independentRole === "joker") {
-        game.players = applyDeaths(game.players, [{ userId: accusedId, reason: "joker", revealedRole: accused.role!, revealedIndependentRole: "joker" }], "verdict", game.dayNumber);
-        await this.notifyLecterSuccession([{ userId: accusedId, reason: "joker", revealedRole: accused.role! }]);
-        await this.publishNotes([{ userId: accusedId, reason: "joker", revealedRole: accused.role! }]);
-        await this.mutePlayer(accusedId);
-        await this.persist(true);
-        await this.group(fa.jokerWins(accused.displayName));
-        await this.finish("independent");
-        return;
+      // CARD SHOP: "طلسم انتقال" (execution_transfer) redirects WHO actually
+      // gets executed — the card holder survives, and one of their guilty
+      // voters dies instead. Everything below (Joker-win check, applyDeaths,
+      // succession, notes, mute) must act on the final target, not the
+      // original accused.
+      const finalTargetId = lastMoveOutcome.kind === "redirect_execution" ? lastMoveOutcome.newTargetId : accusedId;
+      const finalTarget = finalTargetId === accusedId ? accused : findPlayer(game.players, finalTargetId);
+
+      if (finalTarget && finalTargetId !== accusedId) {
+        await this.group(`🔀 با کارت «طلسم انتقال»، اعدام از ${accused.displayName} به ${finalTarget.displayName} منتقل شد.`);
       }
 
-      game.players = applyDeaths(game.players, [{ userId: accusedId, reason: "lynch", revealedRole: accused.role!, revealedIndependentRole: accused.independentRole ?? undefined }], "verdict", game.dayNumber);
-      await this.notifyLecterSuccession([{ userId: accusedId, reason: "lynch", revealedRole: accused.role! }]);
-      await this.publishNotes([{ userId: accusedId, reason: "lynch", revealedRole: accused.role! }]);
-      await this.mutePlayer(accusedId);
+      if (finalTarget) {
+        // Check Joker win (now checked against whoever actually dies)
+        if (finalTarget.independentRole === "joker") {
+          game.players = applyDeaths(game.players, [{ userId: finalTarget.userId, reason: "joker", revealedRole: finalTarget.role!, revealedIndependentRole: "joker" }], "verdict", game.dayNumber);
+          await this.notifyLecterSuccession([{ userId: finalTarget.userId, reason: "joker", revealedRole: finalTarget.role! }]);
+          await this.publishNotes([{ userId: finalTarget.userId, reason: "joker", revealedRole: finalTarget.role! }]);
+          await this.mutePlayer(finalTarget.userId);
+          await this.persist(true);
+          await this.group(fa.jokerWins(finalTarget.displayName));
+          await this.finish("independent");
+          return;
+        }
+
+        game.players = applyDeaths(game.players, [{ userId: finalTarget.userId, reason: "lynch", revealedRole: finalTarget.role!, revealedIndependentRole: finalTarget.independentRole ?? undefined }], "verdict", game.dayNumber);
+        await this.notifyLecterSuccession([{ userId: finalTarget.userId, reason: "lynch", revealedRole: finalTarget.role! }]);
+        await this.publishNotes([{ userId: finalTarget.userId, reason: "lynch", revealedRole: finalTarget.role! }]);
+        await this.mutePlayer(finalTarget.userId);
+
+        // CARD SHOP: remaining "حرکت آخر" outcomes — all fire off the
+        // ORIGINAL card holder (accused), even when execution was
+        // redirected, since the card belonged to them.
+        if (lastMoveOutcome.kind === "kill_extra") {
+          const extraTarget = findPlayer(game.players, lastMoveOutcome.targetId);
+          if (extraTarget?.status === "alive") {
+            game.players = applyDeaths(game.players, [{ userId: extraTarget.userId, reason: "card_revenge", revealedRole: extraTarget.role!, revealedIndependentRole: extraTarget.independentRole ?? undefined }], "verdict", game.dayNumber);
+            await this.notifyLecterSuccession([{ userId: extraTarget.userId, reason: "card_revenge", revealedRole: extraTarget.role! }]);
+            await this.mutePlayer(extraTarget.userId);
+            await this.group(`🗡 با کارت «انتقام از رأی‌دهنده»، ${extraTarget.displayName} هم همراه ${accused.displayName} حذف شد.`);
+          }
+        } else if (lastMoveOutcome.kind === "reveal_voters") {
+          const names = lastMoveOutcome.voterIds
+            .map((id: number) => findPlayer(game.players, id)?.displayName)
+            .filter((n: string | undefined): n is string => !!n);
+          if (names.length) await this.group(`🔍 با کارت «افشاگر رأی‌دهندگان»: ${names.join("، ")} به ${accused.displayName} رأی گناه داده بودند.`);
+        } else if (lastMoveOutcome.kind === "silence_next_day" || lastMoveOutcome.kind === "hostage") {
+          // NOTE: hostage is currently implemented identically to
+          // forced_silence (mute + blocked from next day's vote). A true
+          // "sits out the whole round, no night action either" version
+          // needs a proper temporary player status, which touches night-
+          // phase eligibility checks throughout the file — not done here.
+          const target = findPlayer(game.players, lastMoveOutcome.targetId);
+          if (target && target.status === "alive" && !game.silencedUserIds.includes(target.userId)) {
+            game.pendingCardSilenceUserIds = [...(game.pendingCardSilenceUserIds ?? []), target.userId];
+            const label = lastMoveOutcome.kind === "hostage" ? "گروگان‌گیری" : "سکوت اجباری";
+            await this.group(`🤐 با کارت «${label}»، ${target.displayName} فردا نمی‌تواند رأی بدهد.`);
+          }
+        } else if (lastMoveOutcome.kind === "extra_vote_next_round") {
+          game.graveVoterUserIds = [...(game.graveVoterUserIds ?? []), accused.userId];
+          await this.group(`🗳 با کارت «رأی از گور»، ${accused.displayName} فردا هم یک رأی خواهد داشت.`);
+        } else if (lastMoveOutcome.kind === "fake_role_reveal") {
+          // Handled below at the fa.verdictResult call — overrides which
+          // team is shown to the group, not the internal game state.
+        }
+      }
     }
 
     game.accusedUserId = null;
     game.silencedUserIds = [];
     await this.persist(true);
     await addEvent(this.env.DB, game.id, "verdict_resolved", res);
-    if (accused && stillAlive) await this.group(fa.verdictResult(accused.displayName, accused.userId, res, accused.team));
+    if (accused && stillAlive) {
+      // CARD SHOP: "فریب پسا-مرگ" disguises the TEAM shown in this public
+      // announcement (the only place a team/role gets revealed to the
+      // group on lynch) — mafia shows as town instead of their real team.
+      const displayTeam = lastMoveOutcome.kind === "fake_role_reveal" ? "town" : accused.team;
+      await this.group(fa.verdictResult(accused.displayName, accused.userId, res, displayTeam));
+    }
     await this.sendMayorVerdictWatchReport();
 
     if (await this.checkAndHandleWin()) return;
@@ -6750,7 +6979,7 @@ export class GameRoom extends DurableObject<Env> {
     if (!game || game.status !== "nomination" || game.dayNumber !== dayNumber) return { text: fa.staleAction, alert: true };
     const player = findPlayer(game.players, userId);
     if (!player) return { text: fa.actionForbidden, alert: true };
-    if (player.status !== "alive") return { text: fa.deadCannotAct, alert: true };
+    if (player.status !== "alive" && !(game.graveVoterUserIds ?? []).includes(userId)) return { text: fa.deadCannotAct, alert: true };
     if (game.silencedUserIds.includes(userId)) return { text: fa.silencedCannotVote, alert: true };
     if (targetId > 0) {
       const target = findPlayer(game.players, targetId);
@@ -6766,6 +6995,12 @@ export class GameRoom extends DurableObject<Env> {
     const weight = voteWeight(player);
     game.votes = game.votes.filter((v) => !(v.voterId === userId && v.dayNumber === dayNumber));
     game.votes.push({ voterId: userId, targetId: normalizedTargetId, weight, dayNumber, at: now() });
+
+    // CARD SHOP: "رأی از گور" is one-time — consume it the moment this dead
+    // player successfully casts a vote.
+    if (game.graveVoterUserIds?.includes(userId)) {
+      game.graveVoterUserIds = game.graveVoterUserIds.filter((id) => id !== userId);
+    }
 
     // MAYOR REWORK: an eligible mayor's nomination vote engages (or, on
     // abstain, cancels) the one-time court-override session for this day.
@@ -8159,8 +8394,25 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
     return;
   }
 
+  // CARD SHOP: handled entirely here (env.DB only), same reasoning as
+  // STATS_CB_PREFIX above — shop state (pending_card_selection, users.coins)
+  // isn't per-game, so it never needs to go through a GameRoom DO except at
+  // the final "Shop:confirm" step, which hands off via joinWithCards RPC.
+  if (cq?.data?.startsWith("Shop:")) {
+    await handleShopCallback(env, tg, cq);
+    return;
+  }
+
+  // Intercept the join deep-link BEFORE it reaches callRoom: send the shop
+  // first instead of joining immediately. If the user already has a
+  // finished-but-unconsumed pending selection for this exact chat (e.g. they
+  // backgrounded the app and came back), skip straight to it.
+  if (parsed?.cmd === "start" && parsed.args.startsWith("join_")) {
+    const n = Number(parsed.args.slice(5));
+    if (Number.isFinite(n)) { await openShop(env, tg, from, n); return; }
+  }
+
   let targetChat: number | null = null;
-  if (parsed?.cmd === "start" && parsed.args.startsWith("join_")) { const n = Number(parsed.args.slice(5)); if (Number.isFinite(n)) targetChat = n; }
   if (targetChat === null) { const active = await findActiveGameForUser(env.DB, from.id); if (active) targetChat = active.chat_id; }
   if (targetChat !== null) { await callRoom(env, targetChat, update); return; }
   if (cq) { await tg.answerCallbackQuery(cq.id, "بازی فعالی پیدا نشد.", true); return; }
@@ -8191,6 +8443,103 @@ async function routePrivate(update: TgUpdate, env: Env): Promise<void> {
 // editMessageText on the original message so browsing never spams new
 // messages. The displayed data always belongs to cq.from.id — see the
 // STATS_CB_PREFIX comment for why that can't be spoofed via callback_data.
+// CARD SHOP: entry point from routePrivate when the user taps the group's
+// "ورود به بازی" deep-link button (start=join_{chatId}). Shows the shop
+// before any lobby join happens. Reuses an existing pending selection for
+// the SAME chat if one exists (e.g. user backgrounded Telegram mid-shop);
+// starts fresh (and overwrites any stale selection for a DIFFERENT chat —
+// a leftover from a lobby they never confirmed) otherwise.
+async function openShop(env: Env, tg: Telegram, from: { id: number; username?: string; first_name: string; last_name?: string }, chatId: number): Promise<void> {
+  let sel = await getPendingSelection(env.DB, from.id);
+  if (!sel || sel.chatId !== chatId) {
+    sel = { chatId, cardIds: [], side: "town" };
+    await savePendingSelection(env.DB, from.id, sel);
+  }
+  const coins = await getCoins(env.DB, from.id);
+  const owned = sel.cardIds.find((id) => CARD_CATALOG.find((c) => c.id === id)?.side === sel!.side) ?? null;
+  await tg.sendMessage(from.id, `🛒 <b>شاپ حرکت آخر</b>\nسکه‌های تو: ${coins}\n\nحداکثر ۲ کارت (از ۲ ساید متفاوت) می‌تونی انتخاب کنی. بعد ورود به لابی دیگه نمی‌تونی عوضش کنی.`, {
+    reply_markup: { inline_keyboard: shopSideKeyboard(sel.side, owned, coins) },
+  });
+}
+
+// CARD SHOP: all "Shop:" callback_data, handled outside any GameRoom DO
+// (see the routePrivate dispatch above) since shop state lives in D1 only,
+// keyed by user_id — never per-game in-memory state.
+async function handleShopCallback(env: Env, tg: Telegram, cq: TgCallbackQuery): Promise<void> {
+  const userId = cq.from.id;
+  const chatId = cq.message?.chat.id;
+  const messageId = cq.message?.message_id;
+  const data = cq.data ?? "";
+  if (!chatId || !messageId) { await tg.answerCallbackQuery(cq.id); return; }
+
+  const sel = await getPendingSelection(env.DB, userId);
+  if (!sel) {
+    await tg.answerCallbackQuery(cq.id, "این شاپ منقضی شده. دوباره روی دکمه ورود بزن.", true);
+    return;
+  }
+
+  const rerender = async (updated: PendingSelection) => {
+    const coins = await getCoins(env.DB, userId);
+    const owned = updated.cardIds.find((id) => CARD_CATALOG.find((c) => c.id === id)?.side === updated.side) ?? null;
+    await tg.editMessageText(chatId, messageId, `🛒 <b>شاپ حرکت آخر</b>\nسکه‌های تو: ${coins}\n\nحداکثر ۲ کارت (از ۲ ساید متفاوت) می‌تونی انتخاب کنی. بعد ورود به لابی دیگه نمی‌تونی عوضش کنی.`, {
+      reply_markup: { inline_keyboard: shopSideKeyboard(updated.side, owned, coins) },
+    });
+  };
+
+  if (data.startsWith("Shop:tab:")) {
+    const side = data.slice("Shop:tab:".length) as CardSide;
+    const updated: PendingSelection = { ...sel, side };
+    await savePendingSelection(env.DB, userId, updated);
+    await rerender(updated);
+    await tg.answerCallbackQuery(cq.id);
+    return;
+  }
+
+  if (data.startsWith("Shop:buy:")) {
+    const cardId = data.slice("Shop:buy:".length) as CardId;
+    const card = CARD_CATALOG.find((c) => c.id === cardId);
+    if (!card) { await tg.answerCallbackQuery(cq.id); return; }
+    if (sel.cardIds.length >= 2) {
+      await tg.answerCallbackQuery(cq.id, "حداکثر ۲ کارت می‌تونی داشته باشی.", true); return;
+    }
+    if (sel.cardIds.some((id) => CARD_CATALOG.find((c) => c.id === id)?.side === card.side)) {
+      await tg.answerCallbackQuery(cq.id, "از این ساید فقط ۱ کارت می‌تونی بخری.", true); return;
+    }
+    const coins = await getCoins(env.DB, userId);
+    if (coins < card.price) { await tg.answerCallbackQuery(cq.id, "سکه‌ات کافی نیست.", true); return; }
+    await addCoins(env.DB, userId, -card.price);
+    await env.DB.prepare(`INSERT INTO card_purchase_log (user_id, card_id, price, created_at) VALUES (?, ?, ?, ?)`)
+      .bind(userId, cardId, card.price, Date.now()).run();
+    const updated: PendingSelection = { ...sel, cardIds: [...sel.cardIds, cardId] };
+    await savePendingSelection(env.DB, userId, updated);
+    await rerender(updated);
+    await tg.answerCallbackQuery(cq.id, `${card.name} خریداری شد.`);
+    return;
+  }
+
+  if (data.startsWith("Shop:deselect:")) {
+    const cardId = data.slice("Shop:deselect:".length) as CardId;
+    const card = CARD_CATALOG.find((c) => c.id === cardId);
+    if (card) await addCoins(env.DB, userId, card.price); // refund — not locked in until Shop:confirm
+    const updated: PendingSelection = { ...sel, cardIds: sel.cardIds.filter((id) => id !== cardId) };
+    await savePendingSelection(env.DB, userId, updated);
+    await rerender(updated);
+    await tg.answerCallbackQuery(cq.id, card ? `${card.name} بازگردانده شد.` : undefined);
+    return;
+  }
+
+  if (data === "Shop:confirm") {
+    const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(`chat:${sel.chatId}`));
+    await (stub as DurableObjectStub<GameRoom>).joinWithCards(sel.chatId, cq.from, sel.cardIds);
+    await clearPendingSelection(env.DB, userId);
+    await tg.editMessageText(chatId, messageId, "✅ کارت‌هات ثبت شد. دیگه قابل تغییر نیست تا پایان این بازی.");
+    await tg.answerCallbackQuery(cq.id);
+    return;
+  }
+
+  await tg.answerCallbackQuery(cq.id);
+}
+
 async function handleStatsCallback(env: Env, tg: Telegram, cq: TgCallbackQuery): Promise<void> {
   const userId = cq.from.id;
   const chatId = cq.message?.chat.id;

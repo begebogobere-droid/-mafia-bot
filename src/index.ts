@@ -268,8 +268,8 @@ export interface AiBinding {
   baseUrl: string;
 }
 
-export const AI_DEFAULT_BASE_URL = "https://xingchiapi.com/v1";
-export const AI_DEFAULT_MODEL = "gpt-4o-mini"; // set AI_MODEL to a model your key supports
+export const AI_DEFAULT_BASE_URL = "https://api.xingchiapi.com/v1";
+export const AI_DEFAULT_MODEL = "gpt-6.1-sol";
 export const AI_MIN_CONFIDENCE = 75;
 
 export interface AiSuggestion {
@@ -329,22 +329,24 @@ export function isRoleRevealCandidate(text: string): boolean {
 
 async function runModel(ai: AiBinding, model: string, system: string, user: string, maxTokens: number): Promise<string | null> {
   try {
-    const res = await fetch(`${ai.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+    // OpenAI "Responses" API (wire_api = "responses" in xingchiapi's docs).
+    const res = await fetch(`${ai.baseUrl.replace(/\/+$/, "")}/responses`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}` },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        max_tokens: maxTokens,
-        temperature: 0.2,
-      }),
+      body: JSON.stringify({ model, instructions: system, input: user, max_output_tokens: maxTokens, store: false }),
     });
-    if (!res.ok) { console.error("ai http", res.status, (await res.text()).slice(0, 200)); return null; }
-    const j = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    return j.choices?.[0]?.message?.content ?? null;
+    if (!res.ok) { console.error("ai http", res.status, (await res.text()).slice(0, 300)); return null; }
+    const j = (await res.json()) as {
+      output_text?: string;
+      output?: { type?: string; content?: { type?: string; text?: string }[] }[];
+    };
+    if (typeof j.output_text === "string" && j.output_text) return j.output_text;
+    let text = "";
+    for (const item of j.output ?? []) {
+      if (item.type !== "message") continue;
+      for (const c of item.content ?? []) if (c.type === "output_text" && c.text) text += c.text;
+    }
+    return text || null;
   } catch (e) {
     console.error("ai run failed", e);
     return null;
@@ -1099,7 +1101,7 @@ export interface Env {
   BOT_TOKEN: string;
   WEBHOOK_SECRET: string;
   AI_API_KEY?: string; // secret — AI referee is a no-op without it
-  AI_BASE_URL?: string; // default https://xingchiapi.com/v1
+  AI_BASE_URL?: string; // default https://api.xingchiapi.com/v1
   AI_MODEL?: string;
 }
 

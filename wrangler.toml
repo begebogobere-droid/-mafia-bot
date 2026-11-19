@@ -2,6 +2,10 @@ name = "mafia-bot"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
+[vars]
+AI_BASE_URL = "https://api.xingchiapi.com/v1"
+AI_MODEL = "gpt-6.1-sol"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "mafia-bot-db"

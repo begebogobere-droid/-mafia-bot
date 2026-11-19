@@ -332,7 +332,7 @@ async function runModel(ai: AiBinding, model: string, system: string, user: stri
     // OpenAI "Responses" API (wire_api = "responses" in xingchiapi's docs).
     const res = await fetch(`${ai.baseUrl.replace(/\/+$/, "")}/responses`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}`, "x-openai-actor-authorization": "local-image-extension" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}`, "x-openai-actor-authorization": "local-image-extension", ...(new URL(ai.baseUrl).hostname.toLowerCase() === "api.xingchiapi.com" ? { "User-Agent": "opencode/1.19.6" } : {}) },
       body: JSON.stringify({ model, instructions: system, input: user, max_output_tokens: maxTokens, store: false }),
     });
     if (!res.ok) { console.error("ai http", res.status, (await res.text()).slice(0, 300)); return null; }
@@ -7068,7 +7068,7 @@ export class GameRoom extends DurableObject<Env> {
       try {
         const res = await fetch(`${ai.baseUrl.replace(/\/+$/, "")}/responses`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}`, "x-openai-actor-authorization": "local-image-extension" },
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}`, "x-openai-actor-authorization": "local-image-extension", ...(new URL(ai.baseUrl).hostname.toLowerCase() === "api.xingchiapi.com" ? { "User-Agent": "opencode/1.19.6" } : {}) },
           body: JSON.stringify({ model: this.aiModel(), input: "Reply with the single word: ok", max_output_tokens: 1000, store: false }),
         });
         const body = (await res.text()).slice(0, 300);

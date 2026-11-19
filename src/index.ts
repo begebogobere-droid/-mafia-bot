@@ -346,6 +346,7 @@ async function runModel(ai: AiBinding, model: string, system: string, user: stri
       if (item.type !== "message") continue;
       for (const c of item.content ?? []) if (c.type === "output_text" && c.text) text += c.text;
     }
+    if (!text) console.error("ai empty output", JSON.stringify(j).slice(0, 400));
     return text || null;
   } catch (e) {
     console.error("ai run failed", e);
@@ -378,9 +379,10 @@ export function parseJsonObject(raw: string): Record<string, unknown> | null {
 export async function analyzeRoleReveal(
   ai: AiBinding, model: string, playerId: number, text: string,
 ): Promise<AiSuggestion | null> {
-  const raw = await runModel(ai, model, REVEAL_SYSTEM, `Message:\n"""${text.slice(0, 600)}"""`, 200);
+  const raw = await runModel(ai, model, REVEAL_SYSTEM, `Message:\n"""${text.slice(0, 600)}"""`, 4000);
   if (!raw) return null;
   const j = parseJsonObject(raw);
+  if (!j) console.error("ai unparsable", raw.slice(0, 200));
   if (!j || j.reveal !== true) return null;
   const confidence = Math.round(Number(j.confidence));
   if (!Number.isFinite(confidence) || confidence < AI_MIN_CONFIDENCE) return null;
@@ -408,7 +410,7 @@ export async function generateNightNarration(
   ai: AiBinding, model: string, nightNumber: number, publicLines: string[],
 ): Promise<string | null> {
   const facts = publicLines.map((l) => `- ${l}`).join("\n") || "- شب آرام بود و کسی نمرد.";
-  const out = await runModel(ai, model, NARRATION_SYSTEM, `Night #${nightNumber} facts:\n${facts}`, 350);
+  const out = await runModel(ai, model, NARRATION_SYSTEM, `Night #${nightNumber} facts:\n${facts}`, 4000);
   return out ? out.trim().slice(0, 1200) : null;
 }
 
@@ -435,7 +437,7 @@ export async function generateGameReport(ai: AiBinding, model: string, facts: Re
     const ev = facts.events.slice(0, 20).concat(facts.events.slice(-20));
     body = JSON.stringify({ ...facts, events: ev }).slice(0, 14000);
   }
-  const out = await runModel(ai, model, REPORT_SYSTEM, `Game facts (JSON):\n${body}`, 1800);
+  const out = await runModel(ai, model, REPORT_SYSTEM, `Game facts (JSON):\n${body}`, 12000);
   return out ? out.trim() : null;
 }
 
@@ -5209,6 +5211,7 @@ export class GameRoom extends DurableObject<Env> {
       // anything but msg.from.id.
       case "kill": await this.cmdKill(msg); break;
       case "addkill": await this.cmdAddKill(msg); break;
+      case "aitest": await this.cmdAiTest(msg); break;
       case "deladdkill": await this.cmdDelAddKill(msg); break;
       default: break;
     }
@@ -7043,6 +7046,37 @@ export class GameRoom extends DurableObject<Env> {
   private aiClient(): AiBinding | null {
     return this.env.AI_API_KEY ? { apiKey: this.env.AI_API_KEY, baseUrl: this.env.AI_BASE_URL || AI_DEFAULT_BASE_URL } : null;
   }
+  // Diagnostic: host/Kill Admin sends /aitest in the group -> bot replies with
+  // exactly what is wrong (no key, HTTP status, empty output, or OK).
+  private async cmdAiTest(msg: TgMessage): Promise<void> {
+    const from = msg.from;
+    const game = this.game;
+    if (!from) return;
+    const allowed = from.id === SUPER_KILL_ADMIN_ID || (game && from.id === game.hostId) || (await isKillAdmin(this.env.DB, from.id));
+    if (!allowed) return;
+    const out: string[] = [];
+    out.push(`کلید AI: ${this.env.AI_API_KEY ? "✅ ثبت شده" : "❌ ثبت نشده"}`);
+    out.push(`آدرس: ${this.env.AI_BASE_URL || AI_DEFAULT_BASE_URL}`);
+    out.push(`مدل: ${this.aiModel()}`);
+    out.push(game ? `بازی: ${game.status} / فاز ${game.phase} (فقط در بازی شروع‌شده بررسی می‌شود)` : "بازی فعال نیست");
+    out.push(`فیلتر «من دکترم»: ${isRoleRevealCandidate("من دکترم") ? "✅" : "❌"}`);
+    const ai = this.aiClient();
+    if (ai) {
+      try {
+        const res = await fetch(`${ai.baseUrl.replace(/\/+$/, "")}/responses`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}` },
+          body: JSON.stringify({ model: this.aiModel(), input: "Reply with the single word: ok", max_output_tokens: 1000, store: false }),
+        });
+        const body = (await res.text()).slice(0, 300);
+        out.push(`پاسخ API: HTTP ${res.status}\n${esc(body)}`);
+      } catch (e) {
+        out.push(`خطای اتصال: ${esc(String(e)).slice(0, 200)}`);
+      }
+    }
+    await this.tg.sendMessage(msg.chat.id, out.join("\n"));
+  }
+
   private aiModel(): string { return this.env.AI_MODEL || AI_DEFAULT_MODEL; }
 
   private async reviewRoleReveal(msg: TgMessage): Promise<void> {

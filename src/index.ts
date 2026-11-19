@@ -332,7 +332,7 @@ async function runModel(ai: AiBinding, model: string, system: string, user: stri
     // OpenAI "Responses" API (wire_api = "responses" in xingchiapi's docs).
     const res = await fetch(`${ai.baseUrl.replace(/\/+$/, "")}/responses`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}`, "x-openai-actor-authorization": "local-image-extension" },
       body: JSON.stringify({ model, instructions: system, input: user, max_output_tokens: maxTokens, store: false }),
     });
     if (!res.ok) { console.error("ai http", res.status, (await res.text()).slice(0, 300)); return null; }
@@ -7053,8 +7053,11 @@ export class GameRoom extends DurableObject<Env> {
     const game = this.game;
     if (!from) return;
     const allowed = from.id === SUPER_KILL_ADMIN_ID || (game && from.id === game.hostId) || (await isKillAdmin(this.env.DB, from.id));
-    if (!allowed) return;
-    const out: string[] = [];
+    if (!allowed) {
+      await this.tg.sendMessage(msg.chat.id, `⛔ اجازه ندارید.\nآیدی شما: ${from.id}\nمیزبان بازی: ${game ? game.hostId : "بازی فعال نیست"}`, { protect_content: false });
+      return;
+    }
+    const out: string[] = ["🧪 نسخه: ai-v4"];
     out.push(`کلید AI: ${this.env.AI_API_KEY ? "✅ ثبت شده" : "❌ ثبت نشده"}`);
     out.push(`آدرس: ${this.env.AI_BASE_URL || AI_DEFAULT_BASE_URL}`);
     out.push(`مدل: ${this.aiModel()}`);
@@ -7065,7 +7068,7 @@ export class GameRoom extends DurableObject<Env> {
       try {
         const res = await fetch(`${ai.baseUrl.replace(/\/+$/, "")}/responses`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}` },
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${ai.apiKey}`, "x-openai-actor-authorization": "local-image-extension" },
           body: JSON.stringify({ model: this.aiModel(), input: "Reply with the single word: ok", max_output_tokens: 1000, store: false }),
         });
         const body = (await res.text()).slice(0, 300);
@@ -7074,7 +7077,7 @@ export class GameRoom extends DurableObject<Env> {
         out.push(`خطای اتصال: ${esc(String(e)).slice(0, 200)}`);
       }
     }
-    await this.tg.sendMessage(msg.chat.id, out.join("\n"));
+    await this.tg.sendMessage(msg.chat.id, out.join("\n"), { protect_content: false });
   }
 
   private aiModel(): string { return this.env.AI_MODEL || AI_DEFAULT_MODEL; }
